@@ -1,0 +1,35 @@
+# Environment & Secrets
+.env
+*.env
+*.enc
+*.key
+
+# Python Virtual Environment & Bytecode
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Database & Storage
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Backups & Archives
+backups/
+*.tar.gz
+*.zip
+*.bak
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+*.log
