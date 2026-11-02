@@ -5,14 +5,18 @@ An asynchronous, high-performance Telegram Bot built with Python (`python-telegr
 ## Features
 
 - **Multi-tier Role Architecture**:
-  - **Super Admin**: Full operational control, balance adjustments, database and client audits, plan pricing management.
-  - **Representatives (Resellers)**: Dedicated topic/DM management, client isolation, credit limits, automated invoicing.
-  - **End-Users**: Self-service subscription lookup, direct link access, usage status reporting.
+  - **Super Admin**: Full operational control, balance adjustments, database and client audits, plan pricing management, card-to-card receipt review (`[✅ Approve]` / `[❌ Reject]`).
+  - **Representatives (Resellers)**: Dedicated topic/DM management, client isolation, credit limits, automated invoicing, debt settlement via receipt submission.
+  - **End-Users**: Self-service subscription lookup, direct link access, usage status reporting, personal wallet top-up, and one-click subscription URL reset.
+- **Financial & Dual-Wallet Subsystem**:
+  - Card-to-card payment workflow with tracking codes and admin verification cards.
+  - Dual-wallet accounting: Representative balance/settlement & End-User personal wallet.
+  - Representative credit limit (`credit_limit_toman`) enforcement.
 - **Smart Queue & Reservation**:
   - Direct renewal vs. queued reserve packages.
   - Asynchronous background watchdog activating reserved plans when accounts hit traffic/time thresholds.
-- **Atomic Financial Ledger**:
-  - Full audit trail of credit/debit operations with transaction logging.
+- **Subscription Security & Identity Utilities**:
+  - Real-time subId regeneration to revoke compromised subscription links instantly.
 - **Zero Hardcoded Secrets**:
   - 100% generic codebase dynamically configured via `.env` and SQLite database tables.
 

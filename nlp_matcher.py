@@ -185,6 +185,9 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
         InlineKeyboardButton("📱 QR ساب", callback_data=f"deliv_qr:{account_code}"),
         InlineKeyboardButton("🔀 QR کانفیگ‌ها", callback_data=f"deliv_conf_qr:{account_code}")
     ])
+    keyboard.append([
+        InlineKeyboardButton("🔄 بازنشانی لینک ساب (ابطال قبلی)", callback_data=f"reset_sub:{account_code}")
+    ])
     
     return InlineKeyboardMarkup(keyboard)
 

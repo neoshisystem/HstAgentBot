@@ -148,7 +148,8 @@ def init_db():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS financial_ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rep_id INTEGER NOT NULL,
+            rep_id INTEGER DEFAULT NULL,
+            user_id INTEGER DEFAULT NULL,
             account_code TEXT,
             email TEXT,
             plan_code TEXT,
@@ -163,6 +164,7 @@ def init_db():
         )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_rep ON financial_ledger(rep_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user ON financial_ledger(user_id)")
         
         # 7. User Settings (e.g. On First Connect toggle per user/session)
         cur.execute("""
@@ -206,6 +208,51 @@ def init_db():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_reserved_status_acc ON reserved_packages(status, account_code)")
 
+        # 10. Card-to-Card System Settings
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS card_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            card_number TEXT NOT NULL,
+            card_holder TEXT NOT NULL,
+            bank_name TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        cur.execute("""
+        INSERT OR IGNORE INTO card_settings (id, card_number, card_holder, bank_name)
+        VALUES (1, '6037-9918-0000-0000', 'مدیریت حساب', 'بانک ملی')
+        """)
+
+        # 11. End-User Personal Wallets
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_wallets (
+            user_id INTEGER PRIMARY KEY,
+            balance_toman INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        # 12. Payment Receipts (Dual-role Card-to-Card verification queue)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS payment_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracking_code TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL, -- 'rep' or 'end_user'
+            rep_id INTEGER,
+            amount_toman INTEGER NOT NULL,
+            receipt_photo_id TEXT,
+            receipt_note TEXT,
+            status TEXT DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
+            rejection_reason TEXT,
+            reviewed_by INTEGER,
+            reviewed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (rep_id) REFERENCES representatives(id)
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_status ON payment_receipts(status)")
+
         # Migrations check
         cols_acc = [c[1] for c in cur.execute("PRAGMA table_info(accounts)").fetchall()]
         if "owner_tg_id" not in cols_acc:
@@ -214,6 +261,42 @@ def init_db():
         cols_rep = [c[1] for c in cur.execute("PRAGMA table_info(representatives)").fetchall()]
         if "balance_toman" not in cols_rep:
             cur.execute("ALTER TABLE representatives ADD COLUMN balance_toman INTEGER DEFAULT 0")
+        if "credit_limit_toman" not in cols_rep:
+            cur.execute("ALTER TABLE representatives ADD COLUMN credit_limit_toman INTEGER DEFAULT 5000000")
+
+        led_info = cur.execute("PRAGMA table_info(financial_ledger)").fetchall()
+        rep_col = next((c for c in led_info if c[1] == "rep_id"), None)
+        if rep_col and rep_col[3] == 1:  # notnull is set
+            cur.execute("""
+            CREATE TABLE financial_ledger_migration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rep_id INTEGER DEFAULT NULL,
+                user_id INTEGER DEFAULT NULL,
+                account_code TEXT,
+                email TEXT,
+                plan_code TEXT,
+                transaction_type TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                balance_after INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                actor_id INTEGER NOT NULL,
+                actor_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (rep_id) REFERENCES representatives(id)
+            )
+            """)
+            cur.execute("""
+            INSERT INTO financial_ledger_migration (id, rep_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name, created_at)
+            SELECT id, rep_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name, created_at FROM financial_ledger
+            """)
+            cur.execute("DROP TABLE financial_ledger")
+            cur.execute("ALTER TABLE financial_ledger_migration RENAME TO financial_ledger")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_rep ON financial_ledger(rep_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user ON financial_ledger(user_id)")
+        else:
+            cols_led = [c[1] for c in led_info]
+            if "user_id" not in cols_led:
+                cur.execute("ALTER TABLE financial_ledger ADD COLUMN user_id INTEGER DEFAULT NULL")
 
         # Seed default settings
         for s in DEFAULT_SETTINGS:
@@ -628,6 +711,21 @@ def register_rep_payment(rep_id, amount, description, actor_id, actor_name):
         actor_name=actor_name
     )
 
+record_payment = register_rep_payment
+
+def record_charge(rep_id, account_code, email, plan_code, amount, description, actor_id=0, actor_name="Admin"):
+    return record_ledger_entry(
+        rep_id=rep_id,
+        account_code=account_code,
+        email=email,
+        plan_code=plan_code,
+        tx_type="debit",
+        amount=amount,
+        description=description,
+        actor_id=actor_id,
+        actor_name=actor_name
+    )
+
 def get_rep_financial_summary(rep_id):
     with get_db() as conn:
         cur = conn.cursor()
@@ -645,6 +743,12 @@ def get_rep_financial_summary(rep_id):
             "total_credits": total_credits,
             "tx_count": tx_count
         }
+
+def get_rep_balance(rep_id: int) -> int:
+    with get_db() as conn:
+        cur = conn.cursor()
+        rep = cur.execute("SELECT balance_toman FROM representatives WHERE id = ?", (rep_id,)).fetchone()
+        return (rep["balance_toman"] or 0) if rep else 0
 
 def get_recent_ledger_entries(rep_id=None, limit=10):
     with get_db() as conn:
@@ -916,6 +1020,186 @@ def log_audit(rep_id, account_code, email, action, actor_id, actor_name, details
 
 def sync_all_active_reps():
     return sync_rep_accounts(None)
+
+# ==========================================
+# Phase 4: Financial & Dual-Wallet Operations
+# ==========================================
+
+def get_card_info() -> dict:
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute("SELECT card_number, card_holder, bank_name, updated_at FROM card_settings WHERE id = 1").fetchone()
+        if row:
+            return dict(row)
+    return {"card_number": "6037-9918-0000-0000", "card_holder": "مدیریت حساب", "bank_name": "بانک ملی"}
+
+def update_card_info(card_number: str, card_holder: str, bank_name: str):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO card_settings (id, card_number, card_holder, bank_name, updated_at)
+        VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET
+            card_number = excluded.card_number,
+            card_holder = excluded.card_holder,
+            bank_name = excluded.bank_name,
+            updated_at = CURRENT_TIMESTAMP
+        """, (card_number, card_holder, bank_name))
+        conn.commit()
+
+def get_user_wallet_balance(user_id: int) -> int:
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
+        return row["balance_toman"] if row else 0
+
+def record_user_payment(user_id: int, amount: int, description: str, actor_id: int, actor_name: str = "") -> int:
+    """Credits an end-user's wallet atomically and logs to financial_ledger."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO user_wallets (user_id, balance_toman, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            balance_toman = user_wallets.balance_toman + excluded.balance_toman,
+            updated_at = CURRENT_TIMESTAMP
+        """, (user_id, amount))
+        
+        row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
+        new_balance = row["balance_toman"] if row else amount
+
+        cur.execute("""
+        INSERT INTO financial_ledger (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
+        VALUES (NULL, ?, 'credit', ?, ?, ?, ?, ?)
+        """, (user_id, amount, new_balance, description, actor_id, actor_name))
+        conn.commit()
+        return new_balance
+
+def deduct_user_wallet(user_id: int, amount: int, description: str, plan_code: str = "", account_code: str = "", email: str = "") -> bool:
+    """Atomically deducts funds from an end-user's wallet if sufficient balance exists."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
+        curr_bal = row["balance_toman"] if row else 0
+        if curr_bal < amount:
+            return False
+
+        new_bal = curr_bal - amount
+        cur.execute("UPDATE user_wallets SET balance_toman = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?", (new_bal, user_id))
+        cur.execute("""
+        INSERT INTO financial_ledger (rep_id, user_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name)
+        VALUES (NULL, ?, ?, ?, ?, 'debit', ?, ?, ?, ?, 'User')
+        """, (user_id, account_code, email, plan_code, amount, new_bal, description, user_id))
+        conn.commit()
+        return True
+
+def create_payment_receipt(user_id: int, role: str, amount_toman: int, rep_id: int | None = None, photo_id: str | None = None, note: str | None = None) -> str:
+    import random, string
+    code = "RCP-" + "".join(random.choices(string.digits, k=6))
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO payment_receipts (tracking_code, user_id, role, rep_id, amount_toman, receipt_photo_id, receipt_note, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+        """, (code, user_id, role, rep_id, amount_toman, photo_id, note))
+        conn.commit()
+    return code
+
+def get_payment_receipt(receipt_id_or_code):
+    with get_db() as conn:
+        cur = conn.cursor()
+        if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+            row = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (int(receipt_id_or_code),)).fetchone()
+        else:
+            row = cur.execute("SELECT * FROM payment_receipts WHERE tracking_code = ?", (str(receipt_id_or_code),)).fetchone()
+        if row:
+            return dict(row)
+    return None
+
+def get_pending_payment_receipts():
+    with get_db() as conn:
+        cur = conn.cursor()
+        rows = cur.execute("SELECT * FROM payment_receipts WHERE status = 'pending' ORDER BY id ASC").fetchall()
+        return [dict(r) for r in rows]
+
+def approve_payment_receipt(receipt_id_or_code, admin_tg_id: int, admin_name: str = "Admin") -> dict:
+    rcp = get_payment_receipt(receipt_id_or_code)
+    if not rcp:
+        raise ValueError("Receipt not found")
+    if rcp["status"] != "pending":
+        return rcp
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        UPDATE payment_receipts
+        SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'pending'
+        """, (admin_tg_id, rcp["id"]))
+        if cur.rowcount == 0:
+            return get_payment_receipt(rcp["id"])
+        conn.commit()
+
+    if rcp["role"] == "rep" and rcp.get("rep_id"):
+        record_payment(
+            rep_id=rcp["rep_id"],
+            amount=rcp["amount_toman"],
+            description=f"تسویه فیش کارت‌به‌کارت {rcp['tracking_code']}",
+            actor_id=admin_tg_id,
+            actor_name=admin_name
+        )
+    else:
+        record_user_payment(
+            user_id=rcp["user_id"],
+            amount=rcp["amount_toman"],
+            description=f"شارژ کیف پول با فیش {rcp['tracking_code']}",
+            actor_id=admin_tg_id,
+            actor_name=admin_name
+        )
+
+    return get_payment_receipt(rcp["id"])
+
+def reject_payment_receipt(receipt_id_or_code, admin_tg_id: int, reason: str = "عدم تطابق با گردش حساب") -> dict:
+    rcp = get_payment_receipt(receipt_id_or_code)
+    if not rcp:
+        raise ValueError("Receipt not found")
+    if rcp["status"] != "pending":
+        return rcp
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        UPDATE payment_receipts
+        SET status = 'rejected', rejection_reason = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'pending'
+        """, (reason, admin_tg_id, rcp["id"]))
+        conn.commit()
+    return get_payment_receipt(rcp["id"])
+
+def get_rep_credit_limit(rep_id: int) -> int:
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute("SELECT credit_limit_toman FROM representatives WHERE id = ?", (rep_id,)).fetchone()
+        return row["credit_limit_toman"] if row and row["credit_limit_toman"] is not None else 5000000
+
+def update_rep_credit_limit(rep_id: int, credit_limit: int):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE representatives SET credit_limit_toman = ? WHERE id = ?", (credit_limit, rep_id))
+        conn.commit()
+
+def check_rep_credit_limit(rep_id: int, pending_charge: int) -> tuple[bool, int, int]:
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute("SELECT balance_toman, credit_limit_toman FROM representatives WHERE id = ?", (rep_id,)).fetchone()
+        if not row:
+            return False, 0, 0
+        curr_debt = row["balance_toman"] or 0
+        limit = row["credit_limit_toman"] if row["credit_limit_toman"] is not None else 5000000
+        if limit == 0:  # 0 indicates unlimited credit
+            return True, curr_debt, 0
+        is_allowed = (curr_debt + pending_charge) <= limit
+        return is_allowed, curr_debt, limit
 
 if __name__ == "__main__":
     init_db()
