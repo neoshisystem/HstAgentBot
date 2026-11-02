@@ -1201,6 +1201,264 @@ def check_rep_credit_limit(rep_id: int, pending_charge: int) -> tuple[bool, int,
         is_allowed = (curr_debt + pending_charge) <= limit
         return is_allowed, curr_debt, limit
 
+# ==========================================
+# Phase 4 v4.0.0-beta.2: Complete CRUD & Portal Queries
+# ==========================================
+
+def ensure_bot_user(user_id: int, username: str = "", full_name: str = "", role: str = "end_user", rep_id: int = None) -> dict:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO bot_users (telegram_id, role, rep_id, username, full_name, is_blocked)
+        VALUES (?, ?, ?, ?, ?, 0)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            username = CASE WHEN excluded.username != '' THEN excluded.username ELSE bot_users.username END,
+            full_name = CASE WHEN excluded.full_name != '' THEN excluded.full_name ELSE bot_users.full_name END
+        """, (user_id, role, rep_id, username or "", full_name or ""))
+        conn.commit()
+        row = cur.execute("SELECT * FROM bot_users WHERE telegram_id = ?", (user_id,)).fetchone()
+        return dict(row) if row else {}
+
+def is_user_blocked(user_id: int) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute("SELECT is_blocked FROM bot_users WHERE telegram_id = ?", (user_id,)).fetchone()
+        return bool(row["is_blocked"]) if row else False
+
+def toggle_user_block(user_id: int) -> int:
+    with get_db() as conn:
+        cur = conn.cursor()
+        user = cur.execute("SELECT is_blocked FROM bot_users WHERE telegram_id = ?", (user_id,)).fetchone()
+        new_val = 0 if (user and user["is_blocked"] == 1) else 1
+        cur.execute("""
+        INSERT INTO bot_users (telegram_id, is_blocked)
+        VALUES (?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET is_blocked = excluded.is_blocked
+        """, (user_id, new_val))
+        conn.commit()
+        return new_val
+
+def get_bot_user_by_tg_id(user_id: int) -> dict | None:
+    with get_db() as conn:
+        cur = conn.cursor()
+        u = cur.execute("""
+        SELECT u.*, r.name as rep_name, COUNT(a.id) as linked_accounts_count, COALESCE(w.balance_toman, 0) as wallet_balance
+        FROM bot_users u
+        LEFT JOIN representatives r ON u.rep_id = r.id
+        LEFT JOIN accounts a ON a.owner_tg_id = u.telegram_id
+        LEFT JOIN user_wallets w ON w.user_id = u.telegram_id
+        WHERE u.telegram_id = ?
+        GROUP BY u.telegram_id
+        """, (user_id,)).fetchone()
+        if u:
+            return dict(u)
+        
+        # Fallback if not yet in bot_users
+        w = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
+        acc_cnt = cur.execute("SELECT COUNT(*) FROM accounts WHERE owner_tg_id = ?", (user_id,)).fetchone()[0]
+        return {
+            "telegram_id": user_id,
+            "username": "",
+            "full_name": "ثبت نشده",
+            "role": "end_user",
+            "rep_name": None,
+            "is_blocked": 0,
+            "linked_accounts_count": acc_cnt,
+            "wallet_balance": w["balance_toman"] if w else 0
+        }
+
+def search_bot_users(query: str) -> list:
+    q = f"%{query.strip().lower()}%"
+    with get_db() as conn:
+        cur = conn.cursor()
+        rows = cur.execute("""
+        SELECT u.*, r.name as rep_name, COUNT(a.id) as linked_accounts_count, COALESCE(w.balance_toman, 0) as wallet_balance
+        FROM bot_users u
+        LEFT JOIN representatives r ON u.rep_id = r.id
+        LEFT JOIN accounts a ON a.owner_tg_id = u.telegram_id
+        LEFT JOIN user_wallets w ON w.user_id = u.telegram_id
+        WHERE CAST(u.telegram_id AS TEXT) LIKE ? OR LOWER(u.username) LIKE ? OR LOWER(u.full_name) LIKE ?
+        GROUP BY u.telegram_id
+        ORDER BY u.created_at DESC
+        LIMIT 20
+        """, (q, q, q)).fetchall()
+        return [dict(r) for r in rows]
+
+def update_user_wallet_manual(user_id: int, delta_amount: int, description: str, actor_id: int, actor_name: str = "Admin") -> int:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO user_wallets (user_id, balance_toman, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            balance_toman = user_wallets.balance_toman + excluded.balance_toman,
+            updated_at = CURRENT_TIMESTAMP
+        """, (user_id, delta_amount))
+        
+        row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
+        new_balance = row["balance_toman"] if row else delta_amount
+        tx_type = "credit" if delta_amount >= 0 else "debit"
+
+        cur.execute("""
+        INSERT INTO financial_ledger (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
+        VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, tx_type, abs(delta_amount), new_balance, description, actor_id, actor_name))
+        conn.commit()
+        return new_balance
+
+def unlink_account_owner(account_code_or_email: str) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        UPDATE accounts SET owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE LOWER(account_code) = ? OR LOWER(email) = ? OR LOWER(email) LIKE ?
+        """, (account_code_or_email.lower(), account_code_or_email.lower(), f"%{account_code_or_email.lower()}%"))
+        conn.commit()
+        return cur.rowcount > 0
+
+def change_user_tg_id(old_tg_id: int, new_tg_id: int) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE bot_users SET telegram_id = ? WHERE telegram_id = ?", (new_tg_id, old_tg_id))
+        cur.execute("UPDATE accounts SET owner_tg_id = ? WHERE owner_tg_id = ?", (new_tg_id, old_tg_id))
+        cur.execute("UPDATE user_wallets SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
+        cur.execute("UPDATE financial_ledger SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
+        cur.execute("UPDATE payment_receipts SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
+        conn.commit()
+        return True
+
+def delete_bot_user(tg_id: int) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE accounts SET owner_tg_id = NULL WHERE owner_tg_id = ?", (tg_id,))
+        cur.execute("DELETE FROM bot_users WHERE telegram_id = ?", (tg_id,))
+        conn.commit()
+        return True
+
+def toggle_rep_active(rep_id: int) -> int:
+    with get_db() as conn:
+        cur = conn.cursor()
+        rep = cur.execute("SELECT is_active FROM representatives WHERE id = ?", (rep_id,)).fetchone()
+        new_val = 0 if (rep and rep["is_active"] == 1) else 1
+        cur.execute("UPDATE representatives SET is_active = ? WHERE id = ?", (new_val, rep_id))
+        conn.commit()
+        return new_val
+
+def delete_rep(rep_id: int) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE accounts SET rep_id = NULL WHERE rep_id = ?", (rep_id,))
+        cur.execute("DELETE FROM representatives WHERE id = ?", (rep_id,))
+        conn.commit()
+        return True
+
+def update_rep_full(rep_id: int, name: str, rep_code: str, telegram_id: int, group_id: int, topic_id: int, scope_filter: str):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        UPDATE representatives
+        SET name = ?, rep_code = ?, telegram_id = ?, group_id = ?, topic_id = ?, scope_filter = ?
+        WHERE id = ?
+        """, (name, rep_code, telegram_id, group_id, topic_id, scope_filter, rep_id))
+        conn.commit()
+
+def toggle_plan_quick(plan_code: str) -> int:
+    with get_db() as conn:
+        cur = conn.cursor()
+        p = cur.execute("SELECT is_quick FROM pricing_plans WHERE plan_code = ?", (plan_code,)).fetchone()
+        new_val = 0 if (p and p["is_quick"] == 1) else 1
+        cur.execute("UPDATE pricing_plans SET is_quick = ? WHERE plan_code = ?", (new_val, plan_code))
+        conn.commit()
+        return new_val
+
+def update_plan_specs(plan_code: str, name: str, gb: float, days: int, rep_price: int = None, user_price: int = None):
+    with get_db() as conn:
+        cur = conn.cursor()
+        if rep_price is not None and user_price is not None:
+            cur.execute("""
+            UPDATE pricing_plans
+            SET name = ?, gb = ?, days = ?, rep_price = ?, user_price = ?
+            WHERE plan_code = ?
+            """, (name, gb, days, rep_price, user_price, plan_code))
+        else:
+            cur.execute("""
+            UPDATE pricing_plans
+            SET name = ?, gb = ?, days = ?
+            WHERE plan_code = ?
+            """, (name, gb, days, plan_code))
+        conn.commit()
+
+def get_rep_accounts_paginated(rep_id: int, filter_type: str = 'all', page: int = 1, page_size: int = 10) -> tuple[list, int, int]:
+    import time
+    now_ms = int(time.time() * 1000)
+    with get_db() as conn:
+        cur = conn.cursor()
+        base_where = "rep_id = ?"
+        params = [rep_id]
+
+        if filter_type == "active":
+            base_where += " AND enable = 1 AND total_gb > 0 AND (expiry_time = 0 OR expiry_time > ?)"
+            params.append(now_ms)
+        elif filter_type == "critical":
+            base_where += " AND (enable = 0 OR (expiry_time > 0 AND expiry_time <= ?))"
+            params.append(now_ms)
+        elif filter_type == "reserved":
+            base_where += " AND account_code IN (SELECT account_code FROM reserved_packages WHERE status = 'pending')"
+
+        total = cur.execute(f"SELECT COUNT(*) FROM accounts WHERE {base_where}", tuple(params)).fetchone()[0]
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(max(1, page), total_pages)
+        offset = (page - 1) * page_size
+
+        rows = cur.execute(f"""
+        SELECT * FROM accounts
+        WHERE {base_where}
+        ORDER BY updated_at DESC
+        LIMIT ? OFFSET ?
+        """, tuple(params + [page_size, offset])).fetchall()
+        return [dict(r) for r in rows], total, total_pages
+
+def get_rep_reservations(rep_id: int) -> list:
+    with get_db() as conn:
+        cur = conn.cursor()
+        rows = cur.execute("""
+        SELECT * FROM reserved_packages
+        WHERE rep_id = ? AND status = 'pending'
+        ORDER BY created_at DESC
+        """, (rep_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+def get_rep_receipts(rep_id: int, limit: int = 10) -> list:
+    with get_db() as conn:
+        cur = conn.cursor()
+        rows = cur.execute("""
+        SELECT * FROM payment_receipts
+        WHERE rep_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """, (rep_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+def get_user_receipts(user_id: int, limit: int = 10) -> list:
+    with get_db() as conn:
+        cur = conn.cursor()
+        rows = cur.execute("""
+        SELECT * FROM payment_receipts
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """, (user_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+def get_all_receipts(status: str = None, limit: int = 30) -> list:
+    with get_db() as conn:
+        cur = conn.cursor()
+        if status:
+            rows = cur.execute("SELECT * FROM payment_receipts WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit)).fetchall()
+        else:
+            rows = cur.execute("SELECT * FROM payment_receipts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
 if __name__ == "__main__":
     init_db()
     count = sync_all_active_reps()
