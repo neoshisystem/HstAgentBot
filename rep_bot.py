@@ -1645,7 +1645,7 @@ async def watchdog_worker(application: Application):
                     if not c:
                         continue
 
-                    client_detail = xui_manager.parse_client_data(c, full_detail=None)
+                    client_detail = xui_manager.parse_client_info(c, full_detail=None)
                     rem_gb = float(client_detail.get("remaining_gb", 0) if isinstance(client_detail.get("remaining_gb"), (int, float)) else 999.0)
                     days_left = client_detail.get("days_left")
                     is_expired = client_detail.get("is_expired", False)
