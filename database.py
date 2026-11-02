@@ -892,6 +892,8 @@ def get_user_accounts(user_tg_id: int) -> list:
         rows = cur.execute("SELECT * FROM accounts WHERE owner_tg_id = ?", (user_tg_id,)).fetchall()
         return [dict(r) for r in rows]
 
+get_user_linked_accounts = get_user_accounts
+
 # --- Account Scoping & Syncing ---
 
 def sync_rep_accounts(rep_code=None):

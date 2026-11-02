@@ -28,6 +28,8 @@ import config
 import database
 import nlp_matcher
 import admin_panel
+import rep_panel
+import user_portal
 import finance_manager
 import sub_manager
 from watchdog_service import WatchdogService
@@ -119,9 +121,16 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Always clear any active FSM state on start/admin commands
     context.user_data.pop("admin_state", None)
+    context.user_data.pop("rep_state", None)
+    context.user_data.pop("user_state", None)
+    context.user_data.pop("fsm_state", None)
     
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
     if role == "unauthorized_group":
+        return
+
+    if database.is_user_blocked(user.id):
+        await update.message.reply_text("⛔️ دسترسی شما به این بات توسط مدیریت مسدود شده است.")
         return
 
     if role == "super_admin":
@@ -129,36 +138,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if role == "rep":
-        msg = (
-            f"🤖 **سامانه مدیریت اکانت‌های نمایندگی: {rep['name']}**\n\n"
-            "📌 **روش‌های استفاده:**\n"
-            "• روی پیام حاوی کانفیگ یا وضعیت مشتری **ریپلای** کنید یا **کد ۴ رقمی اکانت** را بفرستید.\n"
-            "• استفاده از دکمه‌های تمدید سریع ۱-کلیک (۲۰، ۳۰، ۵۰ گیگ).\n"
-            "• تغییر نوع تمدید با دکمه `[⏱ نوع شروع]` (استاندارد یا با اولین اتصال).\n\n"
-            "📌 **فرمان‌ها:**\n"
-            "• `/balance` — صورت‌حساب مالی و مانده بدهی\n"
-            "• `/pricing` — مشاهده لیست تعرفه‌ها و قیمت‌های خرید شما\n"
-            "• `/stats` — وضعیت آماری اکانت‌های تحت پوشش"
-        )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        await rep_panel.show_rep_dashboard(update, context, rep)
         return
 
     # End-User View
-    user_accs = database.get_user_accounts(user.id)
-    if user_accs:
-        acc_list = "\n".join([f"• `{a['account_code']}` ({a['customer_name'] or 'بدون نام'})" for a in user_accs])
-        msg = (
-            "👋 **سلام! به بات پشتیبانی و مدیریت سرویس خود خوش آمدید.**\n\n"
-            f"📱 **اکانت‌های متصل به حساب تلگرام شما:**\n{acc_list}\n\n"
-            "برای مشاهده وضعیت و دریافت لینک سابسکریپشن، کافیست کد اکانت خود را ارسال کنید."
-        )
-    else:
-        msg = (
-            "👋 **سلام! به بات پشتیبانی سرویس خوش آمدید.**\n\n"
-            "برای اتصال اکانت خود به این حساب تلگرام، دستور زیر را به همراه کد اکانت خود ارسال کنید:\n"
-            "`/link 3029`"
-        )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await user_portal.show_user_portal(update, context)
 
 async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -777,9 +761,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role == "unauthorized_group":
         return
 
+    if database.is_user_blocked(user.id):
+        await update.message.reply_text("⛔️ دسترسی شما به این بات توسط مدیریت مسدود شده است.")
+        return
+
+    # Text triggers for glass dashboard
+    clean_text = msg_text.strip().lower()
+    if clean_text in ("منو", "پنل", "menu", "panel", "پیشخوان", "داشبورد", "منوی اصلی"):
+        if role == "super_admin":
+            await admin_panel.show_admin_dashboard(update, context)
+            return
+        elif role == "rep" and rep:
+            await rep_panel.show_rep_dashboard(update, context, rep)
+            return
+        else:
+            await user_portal.show_user_portal(update, context)
+            return
+
     # Check Admin Interactive Input State (FSM) - STRICTLY in private DM only
     if role == "super_admin" and chat.type == "private":
         if await admin_panel.process_admin_text_input(update, context):
+            return
+
+    # Check Rep Interactive Input State (FSM)
+    if role == "rep" and rep:
+        if await rep_panel.process_rep_text_input(update, context, rep):
+            return
+
+    # Check End-User Interactive Input State (FSM)
+    if role == "end_user":
+        if await user_portal.process_user_text_input(update, context):
             return
 
     # Check Financial FSM State (Card amount or rejection reason)
@@ -1178,6 +1189,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⛔️ دسترسی غیرمجاز در این تاپیک.", show_alert=True)
         return
 
+    if database.is_user_blocked(user.id):
+        await query.answer("⛔️ دسترسی شما به این بات مسدود شده است.", show_alert=True)
+        return
+
     data = query.data or ""
 
     # Admin Receipt Verification Callbacks
@@ -1243,7 +1258,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data in ("wallet_charge_start", "rep_deposit_start"):
+    if data in ("wallet_charge_start", "rep_deposit_start", "user_deposit_start"):
         context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_AMOUNT
         context.user_data["deposit_role"] = "rep" if data == "rep_deposit_start" else "end_user"
         await query.answer("مبلغ را وارد کنید.")
@@ -1265,6 +1280,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = parts[0]
     account_code = parts[1] if len(parts) > 1 else ""
 
+    # 0. Admin Navigation
+    if action == "admin":
+        if role != "super_admin":
+            await query.answer("⛔️ دسترسی فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
+            return
+        await admin_panel.handle_admin_callbacks(update, context)
+        return
+
+    # 0.1 Rep Dashboard Navigation
+    if action == "rep":
+        if role == "rep" and rep:
+            await rep_panel.handle_rep_callbacks(update, context, rep)
+            return
+        elif role == "super_admin":
+            reps = database.get_all_reps()
+            if reps:
+                await rep_panel.handle_rep_callbacks(update, context, reps[0])
+                return
+        await query.answer("⛔️ دسترسی فقط برای نمایندگان مجاز است.", show_alert=True)
+        return
+
+    # 0.2 End-User Portal Navigation
+    if action == "user":
+        await user_portal.handle_user_callbacks(update, context)
+        return
+
     # Strict End-User Isolation in Callbacks
     if role == "end_user":
         if action in ("suspend", "activate", "qrenew", "force_res", "cancel_res", "toggle_mode", "more_plans"):
@@ -1281,14 +1322,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not matched_user_acc:
             await query.answer("⛔️ شما به این اکانت دسترسی ندارید. ابتدا با دستور /link آن را ثبت کنید.", show_alert=True)
             return
-
-    # 0. Admin Navigation
-    if action == "admin":
-        if role != "super_admin":
-            await query.answer("⛔️ دسترسی فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
-            return
-        await admin_panel.handle_admin_callbacks(update, context)
-        return
     
     # 1. More Plans Menu
     if action == "more_plans":
@@ -1723,6 +1756,8 @@ def main():
     
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("admin", start_cmd))
+    app.add_handler(CommandHandler("panel", start_cmd))
+    app.add_handler(CommandHandler("menu", start_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("link", link_cmd))
     app.add_handler(CommandHandler("pricing", pricing_cmd))
