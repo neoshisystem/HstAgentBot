@@ -58,6 +58,14 @@ def has_lock(lock_key):
     return any(item["lock_key"] == lock_key for item in database.get_operation_locks())
 
 
+def audit_count(action):
+    with database.get_db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM audit_logs WHERE action = ?",
+            (action,),
+        ).fetchone()[0]
+
+
 def test_consumed_buy_token_cannot_debit_twice_but_new_intent_can(isolated_db):
     user_id = 7001
     fund_user(user_id)
@@ -305,9 +313,7 @@ def test_unresolved_intent_lock_cannot_use_generic_unlock_and_applied_resolution
     assert database.get_user_wallet_balance(user_id) == 4_500_000
     assert ledger_count(user_id) == 2
     assert not has_lock(started["lock_key"])
-    assert scalar(
-        "SELECT COUNT(*) FROM audit_logs WHERE action='resolve_user_action_intent_applied'",
-    ) == 1
+    assert audit_count("resolve_user_action_intent_applied") == 1
 
 
 def test_unresolved_intent_refund_resolution_credits_once_and_consumes_lock(isolated_db):
@@ -348,6 +354,4 @@ def test_unresolved_intent_refund_resolution_credits_once_and_consumes_lock(isol
         )
     assert database.get_user_wallet_balance(user_id) == 5_000_000
     assert ledger_count(user_id) == 3
-    assert scalar(
-        "SELECT COUNT(*) FROM audit_logs WHERE action='resolve_user_action_intent_refund'",
-    ) == 1
+    assert audit_count("resolve_user_action_intent_refund") == 1
