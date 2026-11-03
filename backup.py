@@ -205,6 +205,7 @@ def _is_path_overlap(first: str, second: str) -> bool:
 
 def restore_backup_archive(archive_path: str, destination_dir: str) -> dict:
     """Extract only to a new/empty disposable destination outside configured live dirs."""
+    verification = verify_backup_archive(archive_path)
     destination_dir = os.path.abspath(os.path.expanduser(destination_dir))
     production_db_dir = os.path.dirname(os.path.abspath(DB_PATH))
     configured_backup_dir = os.path.abspath(BACKUP_DIR)
@@ -222,7 +223,6 @@ def restore_backup_archive(archive_path: str, destination_dir: str) -> dict:
     else:
         os.makedirs(destination_dir, exist_ok=False)
 
-    verification = verify_backup_archive(archive_path)
     try:
         with tarfile.open(archive_path, "r:gz") as archive:
             members, root = _archive_members(archive)
