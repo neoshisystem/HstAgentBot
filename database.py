@@ -877,13 +877,16 @@ def resolve_operation_lock(
             "DELETE FROM operation_locks WHERE lock_key = ?",
             (key,)
         )
+        deleted = cur.rowcount
+        if deleted != 1:
+            return False
         _insert_audit(
             cur, rep_id=None, account_code="", email="", action="resolve_operation_lock",
             actor_id=actor_id, actor_name=actor_name,
             details={"lock_key": key, "lock_created_at": row["created_at"], "evidence_note": note},
             result_status="success"
         )
-        return cur.rowcount >= 0
+        return True
 
 
 def release_operation_lock(lock_key: str, token: str) -> bool:
