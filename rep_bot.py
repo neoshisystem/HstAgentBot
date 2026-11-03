@@ -34,9 +34,9 @@ import finance_manager
 import sub_manager
 from watchdog_service import WatchdogService
 
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
-import backup_and_report
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
+backup_and_report = load_integration("backup_and_report")
 
 # Set up logging
 logging.basicConfig(

@@ -24,8 +24,8 @@ import database
 import nlp_matcher
 import finance_manager
 
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
 
 logger = logging.getLogger("RepPanel")
 

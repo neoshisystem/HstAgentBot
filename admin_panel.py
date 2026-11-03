@@ -12,9 +12,9 @@ from telegram.ext import ContextTypes
 import database
 import nlp_matcher
 
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
-import backup_and_report
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
+backup_and_report = load_integration("backup_and_report")
 
 logger = logging.getLogger("HstAgentBot.AdminPanel")
 

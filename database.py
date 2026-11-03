@@ -18,8 +18,8 @@ from config import (
 MY_PROJECT_GROUP_ID = int(MAIN_GROUP_ID)
 
 # Add scripts directory to path to access xui_manager
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
 
 DEFAULT_PLANS = [
     ("20gb_30d", "۲۰ گیگ ۱ ماهه", 20.0, 30, 300000, 450000, 1, 1),
