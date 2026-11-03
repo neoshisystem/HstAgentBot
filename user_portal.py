@@ -111,6 +111,21 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else "main"
 
+    # Every service-specific user action must be re-authorized against the exact DB owner.
+    account_actions = {
+        "view_acc", "get_sub_link", "get_qr", "reset_sub",
+        "unlink_confirm", "do_unlink", "renew_plans", "do_renew"
+    }
+    owned_account = None
+    if action in account_actions:
+        requested_identifier = parts[2] if len(parts) > 2 else ""
+        owned_account = database.get_user_owned_account(user.id, requested_identifier)
+        if not owned_account:
+            await query.answer("⛔️ این سرویس به حساب تلگرام شما متصل نیست.", show_alert=True)
+            return
+        # Use the verified canonical email for downstream panel operations.
+        parts[2] = owned_account["email"]
+
     # 1. Main Portal
     if action == "main":
         await show_user_portal(update, context, edit_message=True)
@@ -195,7 +210,10 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         acc_code = parts[2] if len(parts) > 2 else ""
         insp = await asyncio.to_thread(xui_manager.inspect_client, acc_code, scope="all", by_code_only=True)
         if insp.get("status") == "ok":
-            sub_link = insp["data"].get("sub_link") or f"https://cv2xx.hst-vip.com:2223/hsubx/{insp['data'].get('sub_id')}"
+            sub_link = insp["data"].get("sub_link") or sub_manager.get_subscription_url(insp["data"].get("sub_id", ""))
+            if not sub_link:
+                await query.answer("لینک اشتراک در تنظیمات دامنه تعریف نشده است.", show_alert=True)
+                return
             msg = (
                 f"🔗 **لینک اشتراک سابسکریپشن اکانت {acc_code}:**\n\n"
                 f"`{sub_link}`\n\n"
@@ -213,7 +231,10 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         insp = await asyncio.to_thread(xui_manager.inspect_client, acc_code, scope="all", by_code_only=True)
         if insp.get("status") == "ok":
             client_info = insp["data"]
-            sub_url = client_info.get("sub_link") or f"https://cv2xx.hst-vip.com:2223/hsubx/{client_info.get('sub_id')}"
+            sub_url = client_info.get("sub_link") or sub_manager.get_subscription_url(client_info.get("sub_id", ""))
+            if not sub_url:
+                await query.answer("دامنه سابسکریپشن در تنظیمات سامانه تعریف نشده است.", show_alert=True)
+                return
             qr_bytes = sub_manager.generate_qr_code(sub_url)
             caption = f"📱 **QR کد اشتراک اکانت {acc_code}**\n\nلینک: `{sub_url}`"
             await query.message.reply_photo(photo=qr_bytes, caption=caption, parse_mode=ParseMode.MARKDOWN)
@@ -224,9 +245,15 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
     # 2.4 Reset Sub
     elif action == "reset_sub":
         acc_code = parts[2] if len(parts) > 2 else ""
-        res = await asyncio.to_thread(sub_manager.reset_client_subscription, acc_code, scope="all")
+        res = await asyncio.to_thread(sub_manager.reset_client_subscription, xui_manager, acc_code, scope="all")
         if res.get("status") == "ok":
             new_sub_url = res["new_sub_url"]
+            database.upsert_account_record(
+                rep_id=owned_account.get("rep_id"),
+                email=owned_account["email"],
+                account_code=owned_account["account_code"],
+                sub_id=res.get("new_sub_id", "")
+            )
             msg = (
                 f"🔄 **لینک اشتراک اکانت {acc_code} با موفقیت بازنشانی شد!**\n\n"
                 f"لینک قبلی باطل گردید. لطفاً لینک جدید زیر را در نرم‌افزار خود جایگزین فرمایید:\n\n"
@@ -256,7 +283,10 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif action == "do_unlink":
         acc_code = parts[2] if len(parts) > 2 else ""
-        database.unlink_account_owner(acc_code)
+        unlinked = database.unlink_account_owner(acc_code, user.id)
+        if not unlinked:
+            await query.answer("⛔️ سرویس در اختیار شما نیست یا قبلاً قطع شده است.", show_alert=True)
+            return
         await query.answer("✅ اتصال اکانت با موفقیت قطع شد.", show_alert=True)
         await show_user_portal(update, context, edit_message=True)
 
@@ -364,11 +394,11 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                 sub_id=sub_id,
                 enable=1,
                 total_gb=gb,
-                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
+                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0),
+                owner_tg_id=user.id
             )
-            database.link_user_to_account(user.id, code, user.username or "", user.full_name or "")
 
-            sub_url = alloc_res.get("data", {}).get("sub_link") or f"https://cv2xx.hst-vip.com:2223/hsubx/{sub_id}"
+            sub_url = alloc_res.get("data", {}).get("sub_link") or sub_manager.get_subscription_url(sub_id or "")
             deliv_text = (
                 f"🎉 **سرویس شما با موفقیت فعال و متصل شد!**\n\n"
                 f"• کد شناسه سرویس: `{code}`\n"
@@ -378,14 +408,21 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                 "💡 این لینک را در اپلیکیشن فیلترشکن خود وارد نمایید."
             )
 
-            # Generate QR
-            qr_bytes = sub_manager.generate_qr_code(sub_url)
-            await query.message.reply_photo(
-                photo=qr_bytes,
-                caption=deliv_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=build_user_portal_keyboard()
-            )
+            # QR is optional when the panel/configuration does not provide a public subscription URL.
+            if sub_url:
+                qr_bytes = sub_manager.generate_qr_code(sub_url)
+                await query.message.reply_photo(
+                    photo=qr_bytes,
+                    caption=deliv_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=build_user_portal_keyboard()
+                )
+            else:
+                await query.message.reply_text(
+                    deliv_text + "\n\n⚠️ لینک عمومی سابسکریپشن هنوز در تنظیمات سرور تعریف نشده است.",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=build_user_portal_keyboard()
+                )
             await query.answer("🎉 خرید با موفقیت انجام شد!")
         else:
             # Refund wallet
@@ -509,12 +546,17 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         # Renew client on X-UI
         gb = plan["gb"]
         days = plan["days"]
-        renew_res = await asyncio.to_thread(
-            xui_manager.renew_client,
-            acc_code, gb, days, comment=None, rollover=True, countdown="auto", scope="all", by_code_only=True
-        )
+        try:
+            renew_res = await asyncio.to_thread(
+                xui_manager.renew_client,
+                acc_code, gb, days, comment=None, rollover=True, countdown="auto", scope="all", by_code_only=True
+            )
+        except Exception:
+            logger.exception("User renewal outcome is unknown for %s", acc_code)
+            await query.answer("⚠️ پاسخ پنل نامشخص است؛ برای جلوگیری از شارژ یا استرداد تکراری، موضوع نیازمند بررسی است.", show_alert=True)
+            return
 
-        if renew_res.get("status") == "success":
+        if isinstance(renew_res, dict) and (renew_res.get("status") in ("success", "ok") or renew_res.get("success") is True):
             await query.message.reply_text(
                 f"✅ **سرویس {acc_code} با موفقیت تمدید شد!**\n\n"
                 f"• بسته: **{plan['name']}**\n"
@@ -524,10 +566,11 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=build_user_portal_keyboard()
             )
             await query.answer("سرویس با موفقیت تمدید شد.")
-        else:
-            # Refund
+        elif isinstance(renew_res, dict) and renew_res.get("status") in ("error", "failed", "failure"):
             database.record_user_payment(user.id, price, f"استرداد به دلیل خطای تمدید {acc_code}", actor_id=user.id, actor_name="RenewRefund")
-            await query.answer("❌ خطا در اجرای تمدید در سرور. مبلغ به کیف پول بازگشت داده شد.", show_alert=True)
+            await query.answer("❌ پنل تمدید را رد کرد؛ مبلغ به کیف پول بازگشت داده شد.", show_alert=True)
+        else:
+            await query.answer("⚠️ پاسخ پنل برای تایید یا رد تمدید کافی نیست؛ مبلغ فعلاً برای بررسی در وضعیت محفوظ باقی ماند.", show_alert=True)
 
 
 async def process_user_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -551,8 +594,8 @@ async def process_user_text_input(update: Update, context: ContextTypes.DEFAULT_
 
     if action == "awaiting_link_code":
         context.user_data.pop("user_state", None)
-        linked = database.link_user_to_account(user.id, msg_text, user.username or "", user.full_name or "")
-        if linked:
+        linked = database.link_user_to_account(msg_text, user.id, user.username or "", user.full_name or "")
+        if isinstance(linked, dict) and linked.get("status") == "ok":
             await update.message.reply_text(
                 f"✅ **اکانت `{msg_text}` با موفقیت به حساب تلگرام شما متصل گردید.**\n\n"
                 "از این پس می‌توانید وضعیت مصرف این سرویس را در بخش «📱 سرویس‌های من» مشاهده و تمدید نمایید.",
