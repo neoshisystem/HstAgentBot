@@ -1761,21 +1761,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "force_res":
         res_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
         res_item = database.get_reservation_by_id(res_id)
-        if not res_item or res_item["status"] != "pending":
-            await query.answer("⚠️ این بسته قبلاً فعال یا لغو شده است.", show_alert=True)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("email", "")).lower() != str(email).lower()
+            or (rep and res_item.get("rep_id") != rep.get("id"))
+        ):
+            await query.answer("⚠️ رزرو در انتظار متعلق به اکانت یا نمایندگی شما نیست.", show_alert=True)
+            return
+
+        lock_key = f"reservation-activation:{res_id}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=900)
+        if not lock_token:
+            await query.answer("⏳ این رزرو در حال فعال‌سازی است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
+            return
+        # Re-check after acquiring the lease so a concurrent cancellation cannot race the X-UI call.
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("email", "")).lower() != str(email).lower()
+            or (rep and res_item.get("rep_id") != rep.get("id"))
+        ):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer("⚠️ وضعیت رزرو تغییر کرده است؛ عملیات متوقف شد.", show_alert=True)
             return
 
         res_email = res_item["email"]
-        if (
-            str(res_email).lower() != str(email).lower()
-            or (rep and res_item.get("rep_id") != rep.get("id"))
-        ):
-            await query.answer("⛔️ این رزرو متعلق به اکانت یا نمایندگی شما نیست.", show_alert=True)
-            return
         gb = res_item["gb"]
         days = res_item["days"]
         on_first_res = bool(res_item.get("on_first_connect", 0))
-
         try:
             ren_res = await asyncio.to_thread(
                 xui_manager.renew_client,
@@ -1785,15 +1798,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             logger.exception("Force reservation outcome is unknown: %s", res_id)
-            await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو در صف باقی ماند و نیاز به بررسی دارد.", show_alert=True)
+            await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
+            return
+
+        if _xui_operation_failed(ren_res):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer("❌ پنل فعال‌سازی رزرو را رد کرد؛ رزرو در صف باقی ماند.", show_alert=True)
             return
         if not _xui_operation_succeeded(ren_res):
-            await query.answer("⚠️ پنل موفقیت فعال‌سازی را تایید نکرد؛ رزرو در صف باقی ماند.", show_alert=True)
+            await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
             return
+
         activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or user.username)
         if not activated:
-            await query.answer("⚠️ وضعیت رزرو تغییر کرده است؛ از اجرای دوباره خودداری شد.", show_alert=True)
+            await query.answer("⚠️ پنل عملیات را انجام داد اما ثبت فعال‌سازی ناموفق بود؛ قفل تطبیق حفظ شد.", show_alert=True)
             return
+        database.release_operation_lock(lock_key, lock_token)
         report_text = ren_res.get("report", "")
         report_text = f"🚀 **بسته رزرو به صورت فوری فعال شد (اعتبار قبلی صفر و دوره جدید آغاز گردید):**\n\n" + report_text
         keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=on_first_res, role=role, pending_res=None)
