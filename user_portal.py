@@ -369,66 +369,132 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ تعرفه یافت نشد.", show_alert=True)
             return
 
-        price = plan["user_price"]
-        ok, new_bal = database.deduct_user_wallet(user.id, price, f"خرید سرویس {plan['name']}")
+        price = int(plan["user_price"])
+        if price <= 0:
+            await query.answer("❌ قیمت پلن معتبر نیست؛ با پشتیبانی تماس بگیرید.", show_alert=True)
+            return
+
+        lock_key = f"user-buy:{user.id}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=300)
+        if not lock_token:
+            await query.answer("⏳ درخواست خرید دیگری در حال پردازش است یا نتیجه درخواست قبلی نیازمند بررسی است.", show_alert=True)
+            return
+
+        try:
+            ok, new_bal = database.deduct_user_wallet(
+                user.id, price, f"خرید سرویس {plan['name']}", plan_code=plan_code
+            )
+        except Exception:
+            database.release_operation_lock(lock_key, lock_token)
+            logger.exception("Could not debit wallet for user purchase %s", user.id)
+            await query.answer("❌ برداشت از کیف پول انجام نشد.", show_alert=True)
+            return
         if not ok:
+            database.release_operation_lock(lock_key, lock_token)
             await query.answer("❌ موجودی کیف پول کافی نیست.", show_alert=True)
             return
 
-        gb = plan["gb"]
-        days = plan["days"]
+        gb = float(plan["gb"])
+        days = int(plan["days"])
         comment = f"User_{user.id}_{user.first_name or ''}"[:30]
+        try:
+            alloc_res = await asyncio.to_thread(
+                xui_manager.allocate_pool_client, gb, days, comment=comment, scope="all"
+            )
+        except Exception:
+            logger.exception("User purchase outcome is unknown for user %s", user.id)
+            await query.answer(
+                "⚠️ پاسخ پنل نامشخص است. مبلغ برای جلوگیری از برداشت/استرداد تکراری محفوظ مانده و درخواست نیازمند بررسی است.",
+                show_alert=True
+            )
+            return
 
-        alloc_res = await asyncio.to_thread(xui_manager.allocate_pool_client, gb, days, comment=comment, scope="all")
-        if alloc_res.get("status") == "success":
+        if isinstance(alloc_res, dict) and alloc_res.get("status") == "success":
             email = alloc_res.get("email")
             sub_id = alloc_res.get("sub_id")
+            if not email:
+                logger.error("X-UI reports success but has no email for user purchase %s: %r", user.id, alloc_res)
+                await query.answer("⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ مبلغ برای بررسی محفوظ ماند.", show_alert=True)
+                return
             code = xui_manager.extract_account_identifier(email) or email
-
-            # Record in accounts and link to user
-            database.upsert_account_record(
-                rep_id=None,
-                email=email,
-                account_code=code,
-                customer_name=user.full_name or "EndUser",
-                sub_id=sub_id,
-                enable=1,
-                total_gb=gb,
-                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0),
-                owner_tg_id=user.id
-            )
+            try:
+                database.upsert_account_record(
+                    rep_id=None,
+                    email=email,
+                    account_code=code,
+                    customer_name=user.full_name or "EndUser",
+                    sub_id=sub_id,
+                    enable=1,
+                    total_gb=gb,
+                    expiry_time=alloc_res.get("data", {}).get("expiry_time", 0),
+                    owner_tg_id=user.id
+                )
+            except Exception:
+                logger.exception("X-UI allocated account %s but local persistence failed", email)
+                await query.answer(
+                    "⚠️ اکانت در پنل ایجاد شده اما ثبت محلی کامل نشد؛ مبلغ محفوظ است و عملیات نیازمند تطبیق است.",
+                    show_alert=True
+                )
+                return
 
             sub_url = alloc_res.get("data", {}).get("sub_link") or sub_manager.get_subscription_url(sub_id or "")
+            delivered_link = (
+                f"🔗 **لینک اختصاصی شما:**\n`{sub_url}`\n\n"
+                if sub_url else
+                "⚠️ لینک عمومی سابسکریپشن در تنظیمات سرور تعریف نشده است. برای دریافت لینک با پشتیبانی تماس بگیرید.\n\n"
+            )
             deliv_text = (
                 f"🎉 **سرویس شما با موفقیت فعال و متصل شد!**\n\n"
                 f"• کد شناسه سرویس: `{code}`\n"
-                f"• حجم: **{int(gb)} گیگابایت** | مدت: **{int(days)} روز**\n"
+                f"• حجم: **{int(gb)} گیگابایت** | مدت: **{days} روز**\n"
                 f"• کسر از کیف پول: `{price:,} تومان` | مانده کیف پول: `{new_bal:,} تومان`\n\n"
-                f"🔗 **لینک اختصاصی شما:**\n`{sub_url}`\n\n"
-                "💡 این لینک را در اپلیکیشن فیلترشکن خود وارد نمایید."
+                f"{delivered_link}"
+                "💡 شناسه سرویس را برای پیگیری‌های بعدی نگهداری کنید."
             )
-
-            # QR is optional when the panel/configuration does not provide a public subscription URL.
+            database.release_operation_lock(lock_key, lock_token)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
             if sub_url:
                 qr_bytes = sub_manager.generate_qr_code(sub_url)
                 await query.message.reply_photo(
-                    photo=qr_bytes,
-                    caption=deliv_text,
+                    photo=qr_bytes, caption=deliv_text,
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=build_user_portal_keyboard()
                 )
             else:
                 await query.message.reply_text(
-                    deliv_text + "\n\n⚠️ لینک عمومی سابسکریپشن هنوز در تنظیمات سرور تعریف نشده است.",
-                    parse_mode=ParseMode.MARKDOWN,
+                    deliv_text, parse_mode=ParseMode.MARKDOWN,
                     reply_markup=build_user_portal_keyboard()
                 )
             await query.answer("🎉 خرید با موفقیت انجام شد!")
+        elif isinstance(alloc_res, dict) and (
+            alloc_res.get("status") in ("error", "failed", "failure")
+            or alloc_res.get("success") is False
+        ):
+            try:
+                database.record_user_payment(
+                    user.id, price, "استرداد وجه به دلیل شکست قطعی تخصیص اکانت",
+                    actor_id=user.id, actor_name="SystemRefund"
+                )
+            finally:
+                database.release_operation_lock(lock_key, lock_token)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            await query.message.reply_text(
+                f"❌ صدور سرویس توسط پنل رد شد. مبلغ {price:,} تومان به کیف پول بازگشت داده شد."
+            )
+            await query.answer("صدور سرویس ناموفق بود.", show_alert=True)
         else:
-            # Refund wallet
-            database.record_user_payment(user.id, price, "استرداد وجه به دلیل عدم موجودی استخر آزاد", actor_id=user.id, actor_name="SystemRefund")
-            await query.message.reply_text(f"❌ متاسفانه موجودی سرور موقتاً به اتمام رسیده است. مبلغ {price:,} تومان به کیف پول شما عودت داده شد.")
-            await query.answer("خطا در صدور سرویس", show_alert=True)
+            logger.error("Ambiguous X-UI allocation response for user %s: %r", user.id, alloc_res)
+            await query.answer(
+                "⚠️ پاسخ پنل برای تایید یا رد خرید کافی نیست؛ مبلغ محفوظ است و درخواست نیازمند بررسی است.",
+                show_alert=True
+            )
+            return
 
     # 4. User Wallet View
     elif action == "wallet":
@@ -536,27 +602,59 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ تعرفه یافت نشد.", show_alert=True)
             return
 
-        price = plan["user_price"]
-        ok, new_bal = database.deduct_user_wallet(user.id, price, f"تمدید سرویس {acc_code} ({plan['name']})")
-        if not ok:
-            wallet_bal = database.get_user_wallet_balance(user.id)
-            await query.answer(f"❌ موجودی کیف پول کافی نیست (موجودی: {wallet_bal:,} ت | مورد نیاز: {price:,} ت)", show_alert=True)
+        price = int(plan["user_price"])
+        if price <= 0:
+            await query.answer("❌ قیمت پلن معتبر نیست؛ با پشتیبانی تماس بگیرید.", show_alert=True)
             return
 
-        # Renew client on X-UI
-        gb = plan["gb"]
-        days = plan["days"]
+        lock_key = f"user-renew:{user.id}:{acc_code.lower()}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=300)
+        if not lock_token:
+            await query.answer("⏳ درخواست تمدید دیگری برای این سرویس در حال پردازش است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
+            return
+
+        try:
+            ok, new_bal = database.deduct_user_wallet(
+                user.id, price, f"تمدید سرویس {acc_code} ({plan['name']})",
+                plan_code=plan_code, account_code=owned_account["account_code"],
+                email=owned_account["email"]
+            )
+        except Exception:
+            database.release_operation_lock(lock_key, lock_token)
+            logger.exception("Could not debit wallet for user renewal %s", acc_code)
+            await query.answer("❌ برداشت از کیف پول انجام نشد.", show_alert=True)
+            return
+        if not ok:
+            database.release_operation_lock(lock_key, lock_token)
+            wallet_bal = database.get_user_wallet_balance(user.id)
+            await query.answer(
+                f"❌ موجودی کیف پول کافی نیست (موجودی: {wallet_bal:,} ت | مورد نیاز: {price:,} ت)",
+                show_alert=True
+            )
+            return
+
         try:
             renew_res = await asyncio.to_thread(
                 xui_manager.renew_client,
-                acc_code, gb, days, comment=None, rollover=True, countdown="auto", scope="all", by_code_only=True
+                acc_code, float(plan["gb"]), int(plan["days"]),
+                comment=None, rollover=True, countdown="auto", scope="all", by_code_only=True
             )
         except Exception:
             logger.exception("User renewal outcome is unknown for %s", acc_code)
-            await query.answer("⚠️ پاسخ پنل نامشخص است؛ برای جلوگیری از شارژ یا استرداد تکراری، موضوع نیازمند بررسی است.", show_alert=True)
+            await query.answer(
+                "⚠️ پاسخ پنل نامشخص است؛ مبلغ محفوظ مانده و درخواست نیازمند بررسی است. لطفاً مجدداً کلیک نکنید.",
+                show_alert=True
+            )
             return
 
-        if isinstance(renew_res, dict) and (renew_res.get("status") in ("success", "ok") or renew_res.get("success") is True):
+        if isinstance(renew_res, dict) and (
+            renew_res.get("status") in ("success", "ok") or renew_res.get("success") is True
+        ):
+            database.release_operation_lock(lock_key, lock_token)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
             await query.message.reply_text(
                 f"✅ **سرویس {acc_code} با موفقیت تمدید شد!**\n\n"
                 f"• بسته: **{plan['name']}**\n"
@@ -566,11 +664,29 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=build_user_portal_keyboard()
             )
             await query.answer("سرویس با موفقیت تمدید شد.")
-        elif isinstance(renew_res, dict) and renew_res.get("status") in ("error", "failed", "failure"):
-            database.record_user_payment(user.id, price, f"استرداد به دلیل خطای تمدید {acc_code}", actor_id=user.id, actor_name="RenewRefund")
+        elif isinstance(renew_res, dict) and (
+            renew_res.get("status") in ("error", "failed", "failure")
+            or renew_res.get("success") is False
+        ):
+            try:
+                database.record_user_payment(
+                    user.id, price, f"استرداد به دلیل شکست قطعی تمدید {acc_code}",
+                    actor_id=user.id, actor_name="RenewRefund"
+                )
+            finally:
+                database.release_operation_lock(lock_key, lock_token)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
             await query.answer("❌ پنل تمدید را رد کرد؛ مبلغ به کیف پول بازگشت داده شد.", show_alert=True)
         else:
-            await query.answer("⚠️ پاسخ پنل برای تایید یا رد تمدید کافی نیست؛ مبلغ فعلاً برای بررسی در وضعیت محفوظ باقی ماند.", show_alert=True)
+            logger.error("Ambiguous X-UI renewal response for %s: %r", acc_code, renew_res)
+            await query.answer(
+                "⚠️ پاسخ پنل برای تایید یا رد تمدید کافی نیست؛ مبلغ محفوظ است و درخواست نیازمند بررسی است.",
+                show_alert=True
+            )
+
 
 
 async def process_user_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
