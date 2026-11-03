@@ -635,26 +635,31 @@ async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_T
         return True
 
     if action == "awaiting_new_acc_name":
-        plan_code = rep_state["plan_code"]
-        plan = database.get_plan(plan_code)
-        context.user_data.pop("rep_state", None)
-        if not plan:
-            context.user_data.pop("rep_temp_name", None)
-            await update.message.reply_text("❌ پلن انتخاب‌شده دیگر در دسترس نیست.")
+        intent_id = rep_state.get("intent_id", "")
+        intent = database.get_rep_action_intent(intent_id, rep["id"], update.effective_user.id)
+        if not intent or intent.get("status") != "pending":
+            context.user_data.pop("rep_state", None)
+            await update.message.reply_text("❌ درخواست صدور منقضی شده یا دیگر معتبر نیست؛ از منوی صدور دوباره شروع کنید.")
             return True
-        context.user_data["rep_temp_name"] = msg_text
+        if not database.set_rep_action_intent_customer_name(
+            intent_id, rep["id"], update.effective_user.id, msg_text
+        ):
+            context.user_data.pop("rep_state", None)
+            await update.message.reply_text("❌ ثبت نام مشتری برای این درخواست ممکن نشد؛ منوی صدور را دوباره باز کنید.")
+            return True
+        context.user_data.pop("rep_state", None)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                f"✅ تایید صدور با هزینه {plan['rep_price']:,} تومان",
-                callback_data=f"rep:issue_acc_direct:{plan_code}"
+                f"✅ تایید صدور با هزینه {intent['amount']:,} تومان",
+                callback_data=f"rep:issue_acc_direct:{intent_id}"
             )],
             [InlineKeyboardButton("❌ انصراف", callback_data="rep:new_acc_plans")]
         ])
         await update.message.reply_text(
             f"👤 **نام مشتری:** {msg_text}\n"
-            f"📦 **پلن:** {plan['name']} ({plan['gb']} گیگ / {plan['days']} روز)\n"
-            f"💳 **هزینه:** {plan['rep_price']:,} تومان\n\n"
-            "برای ادامه، صدور را تایید کنید. مبلغ پیش از درخواست به پنل، با کنترل سقف اعتبار ثبت می‌شود.",
+            f"📦 **پلن:** {intent['plan_name']} ({intent['gb']} گیگ / {intent['days']} روز)\n"
+            f"💳 **هزینه:** {intent['amount']:,} تومان\n\n"
+            "برای ادامه، صدور را تایید کنید. این درخواست یک شناسه یک‌بارمصرف دارد.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard
         )
