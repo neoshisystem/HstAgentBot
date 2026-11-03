@@ -619,18 +619,6 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             if classify_xui_result(renew_result) != XUIResult.SUCCESS:
                 await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
                 return
-            if False and isinstance(renew_result, dict) and (
-                renew_result.get("status") in ("error", "failed", "failure")
-                or renew_result.get("success") is False
-            ):
-                database.release_operation_lock(lock_key, lock_token)
-                await query.answer("❌ پنل فعال‌سازی رزرو را رد کرد؛ رزرو در صف باقی ماند.", show_alert=True)
-                return
-            if not isinstance(renew_result, dict) or not (
-                renew_result.get("status") in ("success", "ok") or renew_result.get("success") is True
-            ):
-                await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
-                return
             activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
             if not activated:
                 await query.answer("⚠️ پنل عملیات را انجام داد اما ثبت فعال‌سازی ناموفق بود؛ قفل تطبیق حفظ شد.", show_alert=True)
