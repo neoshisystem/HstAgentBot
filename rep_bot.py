@@ -446,8 +446,18 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• `{item['lock_key']}`\n"
             f"  ایجاد: `{item['created_at']}` | انقضا: `{item['expires_at']}`"
         )
+        if item.get("intent_id"):
+            lines.append(
+                f"  ⚠️ Intent: `{item['intent_id']}` | نوع: {item.get('action_type')} "
+                f"| کاربر: `{item.get('user_id')}` | وضعیت: {item.get('intent_status')}"
+            )
+            lines.append(
+                "  تعیین تکلیف مالی: /resolveintent <intent-id> APPLIED: ... "
+                "یا /resolveintent <intent-id> REFUND_NOT_APPLIED: ..."
+            )
     lines.append(
-        "\nبرای رفع قفل فقط پس از بررسی پنل و اصلاح وضعیت محلی، دستور /unlock را با کلید دقیق و مدرک متنی ثبت‌شده اجرا کنید."
+        "\nقفل‌های عادی را فقط پس از بررسی پنل و دیتابیس با /unlock حل کنید. "
+        "قفل‌های متصل به Intent کاربر را فقط با /resolveintent تعیین تکلیف کنید."
     )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -492,6 +502,60 @@ async def unlock_operation_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     else:
         await update.message.reply_text("ℹ️ چنین قفل فعالی پیدا نشد.")
+
+
+async def resolve_user_intent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of a user purchase/renewal with atomic wallet semantics."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور (فقط پس از بررسی مستقیم اکانت و دیتابیس):\n"
+            "`/resolveintent <intent-id> APPLIED: مدرک انجام عملیات در 3X-UI`\n"
+            "یا\n"
+            "`/resolveintent <intent-id> REFUND_NOT_APPLIED: مدرک عدم انجام عملیات در 3X-UI`\n\n"
+            "APPLIED قفل را آزاد و Intent را موفق ثبت می‌کند؛ REFUND_NOT_APPLIED مبلغ را به‌صورت اتمیک مسترد و Intent را refunded می‌کند."
+        )
+        return
+
+    intent_id = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("REFUND_NOT_APPLIED:"):
+        resolution = "REFUND_NOT_APPLIED"
+    else:
+        await update.message.reply_text(
+            "⛔️ مدرک باید با APPLIED: یا REFUND_NOT_APPLIED: شروع شود."
+        )
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_user_action_intent,
+            intent_id,
+            user.id,
+            user.full_name or "Super Admin",
+            resolution,
+            evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف انجام نشد: {exc}")
+        return
+
+    if result["status"] == "succeeded":
+        await update.message.reply_text(
+            f"✅ Intent `{intent_id}` به‌عنوان انجام‌شده ثبت شد و قفل `{result['lock_key']}` آزاد شد.\n"
+            "برداشت مالی قبلی حفظ شد؛ هیچ درخواست خارجی جدیدی ارسال نشد."
+        )
+    elif result["status"] == "refunded":
+        await update.message.reply_text(
+            f"✅ Intent `{intent_id}` مسترد شد؛ مبلغ {result['amount']:,} تومان به کیف پول کاربر "
+            f"`{result['user_id']}` بازگشت و موجودی جدید {result['new_balance']:,} تومان است.\n"
+            f"قفل `{result['lock_key']}` نیز در همان تراکنش آزاد شد."
+        )
 
 
 async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2197,6 +2261,7 @@ def main():
     app.add_handler(CommandHandler("sync", sync_cmd))
     app.add_handler(CommandHandler("operations", operations_cmd))
     app.add_handler(CommandHandler("unlock", unlock_operation_cmd))
+    app.add_handler(CommandHandler("resolveintent", resolve_user_intent_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
