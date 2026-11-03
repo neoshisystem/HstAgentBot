@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import tarfile
 import sqlite3
@@ -9,8 +8,8 @@ from datetime import datetime, timezone
 
 from config import DB_PATH, BACKUP_DIR, BACKUPS_TOPIC_ID
 
-sys.path.append("/root/.hermes/scripts")
-import backup_and_report
+from server_integrations import load_integration
+backup_and_report = load_integration("backup_and_report")
 
 def run_backup():
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -67,12 +66,30 @@ def run_backup():
             f"🔄 <b>دستور استخراج:</b>\n"
             f"<pre>tar -xzf {os.path.basename(archive_path)} -C ./</pre>"
         )
-        try:
-            print(f"Uploading backup to Topic {BACKUPS_TOPIC_ID}...")
-            upload_res = backup_and_report.send_telegram_document(BACKUPS_TOPIC_ID, archive_path, caption, parse_mode="HTML")
-            print("Telegram upload result:", upload_res.get("ok"))
-        except Exception as e:
-            print(f"Failed to upload backup to Telegram: {e}")
+        upload_status = "not_configured"
+        upload_error = ""
+        if BACKUPS_TOPIC_ID:
+            try:
+                print(f"Uploading backup to Topic {BACKUPS_TOPIC_ID}...")
+                upload_res = backup_and_report.send_telegram_document(
+                    BACKUPS_TOPIC_ID, archive_path, caption, parse_mode="HTML"
+                )
+                if isinstance(upload_res, dict) and upload_res.get("ok"):
+                    upload_status = "sent"
+                else:
+                    upload_status = "failed"
+                    upload_error = (
+                        str(upload_res.get("description") or upload_res)
+                        if isinstance(upload_res, dict) else
+                        f"Unexpected upload result type: {type(upload_res).__name__}"
+                    )
+                print("Telegram upload status:", upload_status, upload_error)
+            except Exception as exc:
+                upload_status = "failed"
+                upload_error = str(exc)
+                print(f"Failed to upload backup to Telegram: {exc}")
+        else:
+            upload_error = "BACKUPS_TOPIC_ID is not configured"
         
         # 5. Retention policy: Keep last 30 backups, prune older
         all_backups = []
@@ -90,7 +107,14 @@ def run_backup():
                 except Exception as e:
                     print(f"Error removing {old_file}: {e}")
                     
-        return {"status": "ok", "archive": archive_path, "size_kb": size_kb, "sha256": sha256_hash}
+        return {
+            "status": "ok",
+            "archive": archive_path,
+            "size_kb": size_kb,
+            "sha256": sha256_hash,
+            "telegram_upload_status": upload_status,
+            "telegram_upload_error": upload_error,
+        }
         
     finally:
         if os.path.exists(temp_dir):
