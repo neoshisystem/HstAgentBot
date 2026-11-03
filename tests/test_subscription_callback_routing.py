@@ -155,3 +155,107 @@ def test_user_qr_generation_failure_is_reported_without_crashing(monkeypatch):
 
     assert query.answers and query.answers[-1][1] is True
     assert "QR ناموفق" in query.answers[-1][0]
+
+def make_rep_card_update(data="reset_sub:ACC-1"):
+    query = FakeQuery(data)
+    user = SimpleNamespace(id=88001, username="rep", full_name="Rep", first_name="Rep")
+    chat = SimpleNamespace(id=88001, type="private")
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=user,
+        effective_chat=chat,
+        effective_message=SimpleNamespace(message_thread_id=None),
+        message=query.message,
+    )
+    return update, query
+
+
+def patch_rep_card_preflight(monkeypatch):
+    rep = {"id": 5, "name": "Rep", "scope_filter": "all"}
+    account = {
+        "id": 1, "rep_id": 5, "account_code": "ACC-1",
+        "email": "acc-1@example.test", "sub_id": "old-sub",
+    }
+    monkeypatch.setattr(rep_bot.database, "get_user_role", lambda *a, **k: ("rep", rep))
+    monkeypatch.setattr(rep_bot.database, "is_user_blocked", lambda _uid: False)
+    monkeypatch.setattr(rep_bot.database, "is_account_in_rep_scope", lambda *_: account)
+    monkeypatch.setattr(rep_bot.database, "get_user_first_connect_mode", lambda _uid: False)
+    monkeypatch.setattr(
+        rep_bot, "xui_manager",
+        SimpleNamespace(inspect_client=lambda *_a, **_k: {
+            "status": "ok",
+            "data": {
+                "raw": {"email": "acc-1@example.test", "enable": True, "comment": ""},
+                "email": "acc-1@example.test",
+                "sub_id": "old-sub",
+            },
+        }),
+    )
+    return rep
+
+
+def test_rep_account_card_reset_partial_persists_id_and_releases_shared_lock(monkeypatch):
+    update, query = make_rep_card_update()
+    patch_rep_card_preflight(monkeypatch)
+    events, persisted = [], []
+    monkeypatch.setattr(
+        rep_bot.database, "acquire_operation_lock",
+        lambda key, **kwargs: events.append(("acquire", key)) or "token",
+    )
+    monkeypatch.setattr(
+        rep_bot.database, "release_operation_lock",
+        lambda key, token: events.append(("release", key, token)),
+    )
+    monkeypatch.setattr(
+        rep_bot.sub_manager, "reset_client_subscription",
+        lambda *a, **k: {"status": "partial", "new_sub_id": "rotated-sub"},
+    )
+    monkeypatch.setattr(rep_bot.database, "upsert_account_record", lambda **kwargs: persisted.append(kwargs))
+    monkeypatch.setattr(rep_bot.database, "log_audit", lambda **kwargs: None)
+
+    asyncio.run(rep_bot.handle_callback(update, SimpleNamespace(user_data={})))
+
+    assert persisted and persisted[0]["sub_id"] == "rotated-sub"
+    assert events[0][0] == "acquire" and events[-1][0] == "release"
+    assert events[0][1] == "subscription-reset:acc-1@example.test"
+    assert query.answers and "لینک عمومی ساخته نشد" in query.answers[-1][0]
+
+
+def test_rep_account_card_reset_unknown_keeps_lock(monkeypatch):
+    update, query = make_rep_card_update()
+    patch_rep_card_preflight(monkeypatch)
+    released, persisted = [], []
+    monkeypatch.setattr(rep_bot.database, "acquire_operation_lock", lambda *a, **k: "token")
+    monkeypatch.setattr(rep_bot.database, "release_operation_lock", lambda *a, **k: released.append(True))
+    monkeypatch.setattr(
+        rep_bot.sub_manager, "reset_client_subscription",
+        lambda *a, **k: {"status": "unknown", "candidate_sub_id": "possible"},
+    )
+    monkeypatch.setattr(rep_bot.database, "upsert_account_record", lambda **kwargs: persisted.append(kwargs))
+
+    asyncio.run(rep_bot.handle_callback(update, SimpleNamespace(user_data={})))
+
+    assert not released
+    assert not persisted
+    assert query.answers and "قفل تطبیق حفظ شد" in query.answers[-1][0]
+
+
+def test_rep_account_card_reset_local_persistence_failure_keeps_lock(monkeypatch):
+    update, query = make_rep_card_update()
+    patch_rep_card_preflight(monkeypatch)
+    released = []
+    monkeypatch.setattr(rep_bot.database, "acquire_operation_lock", lambda *a, **k: "token")
+    monkeypatch.setattr(rep_bot.database, "release_operation_lock", lambda *a, **k: released.append(True))
+    monkeypatch.setattr(
+        rep_bot.sub_manager, "reset_client_subscription",
+        lambda *a, **k: {"status": "ok", "new_sub_id": "rotated-sub", "new_sub_url": "https://sub.example.test/rotated-sub"},
+    )
+    monkeypatch.setattr(
+        rep_bot.database, "upsert_account_record",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("injected DB failure")),
+    )
+
+    asyncio.run(rep_bot.handle_callback(update, SimpleNamespace(user_data={})))
+
+    assert not released
+    assert query.answers and "ثبت محلی انجام نشد" in query.answers[-1][0]
