@@ -285,51 +285,71 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await query.answer("❌ خطا در تولید QR.", show_alert=True)
 
-    # 2.4 Reset Sub
+    # 2.4 Reset Sub — persist only a confirmed remote rotation.
     elif action == "reset_sub":
         acc_code = parts[2] if len(parts) > 2 else ""
-        res = await asyncio.to_thread(
-            sub_manager.reset_client_subscription, xui_manager, acc_code, scope="all"
-        )
+        lock_key = f"subscription-reset:{str(owned_account['account_code']).lower()}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
+        if not lock_token:
+            await query.answer("⏳ بازنشانی لینک این سرویس در حال انجام یا نیازمند تطبیق است؛ دوباره تلاش نکنید.", show_alert=True)
+            return
 
-        # A partial result means the external panel already rotated the subId,
-        # but a public URL could not be constructed. Persist the new ID anyway
-        # so SQLite never continues to advertise the revoked subscription token.
-        if res.get("status") in ("ok", "partial") and res.get("new_sub_id"):
-            try:
-                database.upsert_account_record(
-                    rep_id=owned_account.get("rep_id"),
-                    email=owned_account["email"],
-                    account_code=owned_account["account_code"],
-                    sub_id=res["new_sub_id"],
-                )
-            except Exception:
-                logger.exception(
-                    "3X-UI rotated subscription id for %s but local persistence failed",
-                    owned_account.get("email"),
-                )
-                await query.answer(
-                    "⚠️ پنل لینک قبلی را باطل و شناسه جدید ایجاد کرده، اما ثبت محلی کامل نشد؛ موضوع نیازمند تطبیق مدیریتی است.",
-                    show_alert=True,
-                )
-                return
+        try:
+            res = await asyncio.to_thread(
+                sub_manager.reset_client_subscription, xui_manager, acc_code, scope="all"
+            )
+        except Exception as exc:
+            logger.exception("Subscription reset outcome is unknown for %s", acc_code)
+            await query.answer(
+                "⚠️ نتیجه بازنشانی پنل مشخص نیست؛ قفل برای بررسی مدیریت نگه داشته شد. فعلاً دوباره اقدام نکنید.",
+                show_alert=True,
+            )
+            return
 
-            if res.get("status") == "ok" and res.get("new_sub_url"):
-                msg = (
-                    f"🔄 **لینک اشتراک اکانت {acc_code} با موفقیت بازنشانی شد!**\n\n"
-                    "لینک قبلی باطل گردید. لینک جدید را جایگزین کنید:\n\n"
-                    f"{res['new_sub_url']}"
-                )
-                await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-                await query.answer("لینک ساب بازنشانی شد.")
-            else:
-                await query.answer(
-                    "⚠️ لینک قبلی باطل شد و شناسه جدید در دیتابیس ثبت گردید، اما لینک عمومی ساخته نشد. تنظیمات دامنه سابسکریپشن را بررسی کنید.",
-                    show_alert=True,
-                )
+        if res.get("status") == "unknown":
+            await query.answer(
+                "⚠️ پاسخ پنل برای مشخص‌کردن وضعیت لینک کافی نیست؛ قفل تطبیق حفظ شد. فعلاً دوباره تلاش نکنید.",
+                show_alert=True,
+            )
+            return
+        if res.get("status") not in ("ok", "partial") or not res.get("new_sub_id"):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer(
+                f"❌ خطا: {res.get('message', 'بازنشانی تأیید نشد')}",
+                show_alert=True,
+            )
+            return
+
+        try:
+            database.upsert_account_record(
+                rep_id=owned_account.get("rep_id"),
+                email=owned_account["email"],
+                account_code=owned_account["account_code"],
+                sub_id=res["new_sub_id"],
+            )
+        except Exception:
+            logger.exception(
+                "Remote subscription ID rotated for %s but local persistence failed",
+                owned_account.get("email"),
+            )
+            await query.answer(
+                "⚠️ شناسه در پنل تغییر کرده اما ثبت محلی کامل نشد؛ قفل تطبیق حفظ شد و بررسی مدیریت لازم است.",
+                show_alert=True,
+            )
+            return
+
+        database.release_operation_lock(lock_key, lock_token)
+        if res.get("status") == "ok" and res.get("new_sub_url"):
+            msg = (
+                f"🔄 **لینک اشتراک اکانت {acc_code} با موفقیت بازنشانی شد!**\\n\\n"
+                "لینک قبلی باطل گردید. لینک جدید را جایگزین کنید:\\n\\n"
+                f"{res['new_sub_url']}"
+            )
+            await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await query.answer("لینک ساب بازنشانی شد.")
         else:
             await query.answer(
-                f"❌ خطا: {res.get('message', 'بازنشانی انجام نشد')}",
+                "⚠️ شناسه جدید در پنل و دیتابیس ثبت شد، اما لینک عمومی ساخته نشد. تنظیمات دامنه را بررسی کنید.",
                 show_alert=True,
             )
 
