@@ -3,6 +3,8 @@ import sys
 import sqlite3
 import json
 import secrets
+import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -325,6 +327,16 @@ def init_db():
         )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_status ON payment_receipts(status)")
+
+        # 13. Cross-process operation locks for sensitive portal actions
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS operation_locks (
+            lock_key TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            expires_at REAL NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
         # Migrations check
         cols_acc = [c[1] for c in cur.execute("PRAGMA table_info(accounts)").fetchall()]
@@ -779,19 +791,45 @@ def reassign_account(account_code, new_rep_id=None, new_owner_tg_id=None):
                 (int(new_owner_tg_id), row["id"])
             )
         return {"status": "ok", "account_code": row["account_code"]}
-def acquire_renewal_lock(account_code: str, ttl_seconds: int = 20) -> bool:
-    """
-    Prevents accidental double-clicks or rapid successive duplicate renewal requests.
-    Returns True if lock acquired, False if locked (must wait).
-    """
-    import time
+def acquire_operation_lock(lock_key: str, ttl_seconds: int = 300) -> str | None:
+    """Acquire a database-backed lease for one sensitive operation."""
+    key = str(lock_key or "").strip()
+    ttl = max(1, int(ttl_seconds))
+    if not key:
+        raise ValueError("Operation lock key is required")
     now = time.time()
-    code = str(account_code).strip().lower()
-    last_time = _RENEWAL_LOCKS.get(code, 0)
-    if now - last_time < ttl_seconds:
-        return False
-    _RENEWAL_LOCKS[code] = now
-    return True
+    token = uuid.uuid4().hex
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (now,))
+        row = cur.execute(
+            "SELECT token FROM operation_locks WHERE lock_key = ?", (key,)
+        ).fetchone()
+        if row:
+            return None
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (key, token, now + ttl)
+        )
+        return token
+
+
+def release_operation_lock(lock_key: str, token: str) -> bool:
+    """Release a lease only when the supplied token still owns it."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ? AND token = ?",
+            (str(lock_key), str(token))
+        )
+        return cur.rowcount == 1
+
+
+def acquire_renewal_lock(account_code: str, ttl_seconds: int = 20) -> bool:
+    """Prevent concurrent repeated renewal requests for the same account."""
+    code = str(account_code or "").strip().lower()
+    return bool(acquire_operation_lock(f"renewal:{code}", ttl_seconds))
 
 # --- Financial Ledger & Accounting ---
 
