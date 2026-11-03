@@ -447,13 +447,15 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  ایجاد: `{item['created_at']}` | انقضا: `{item['expires_at']}`"
         )
         if item.get("intent_id"):
+            owner_label = "نماینده" if item.get("intent_owner_type") == "representative" else "کاربر"
+            command = "/resolverepintent" if item.get("intent_owner_type") == "representative" else "/resolveintent"
             lines.append(
                 f"  ⚠️ Intent: `{item['intent_id']}` | نوع: {item.get('action_type')} "
-                f"| کاربر: `{item.get('user_id')}` | وضعیت: {item.get('intent_status')}"
+                f"| {owner_label} Telegram ID: `{item.get('user_id')}` | وضعیت: {item.get('intent_status')}"
             )
             lines.append(
-                "  تعیین تکلیف مالی: /resolveintent <intent-id> APPLIED: ... "
-                "یا /resolveintent <intent-id> REFUND_NOT_APPLIED: ..."
+                f"  تعیین تکلیف مالی: {command} <intent-id> APPLIED: ... "
+                f"یا {command} <intent-id> REFUND_NOT_APPLIED: ..."
             )
     lines.append(
         "\nقفل‌های عادی را فقط پس از بررسی پنل و دیتابیس با /unlock حل کنید. "
@@ -555,6 +557,59 @@ async def resolve_user_intent_cmd(update: Update, context: ContextTypes.DEFAULT_
             f"✅ Intent `{intent_id}` مسترد شد؛ مبلغ {result['amount']:,} تومان به کیف پول کاربر "
             f"`{result['user_id']}` بازگشت و موجودی جدید {result['new_balance']:,} تومان است.\n"
             f"قفل `{result['lock_key']}` نیز در همان تراکنش آزاد شد."
+        )
+
+
+async def resolve_rep_intent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of a representative issuance precharge."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور (پس از تطبیق مستقیم اکانت در 3X-UI و دیتابیس):\n"
+            "`/resolverepintent <intent-id> APPLIED: مدرک وجود اکانت و ثبت محلی`\n"
+            "یا\n"
+            "`/resolverepintent <intent-id> REFUND_NOT_APPLIED: مدرک عدم صدور اکانت`\n\n"
+            "APPLIED پیش‌پرداخت را حفظ و Intent را موفق ثبت می‌کند؛ "
+            "REFUND_NOT_APPLIED پیش‌پرداخت را به‌صورت اتمیک به تراز نماینده برمی‌گرداند."
+        )
+        return
+
+    intent_id = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("REFUND_NOT_APPLIED:"):
+        resolution = "REFUND_NOT_APPLIED"
+    else:
+        await update.message.reply_text("⛔️ مدرک باید با APPLIED: یا REFUND_NOT_APPLIED: شروع شود.")
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_rep_action_intent,
+            intent_id,
+            user.id,
+            user.full_name or "Super Admin",
+            resolution,
+            evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف انجام نشد: {exc}")
+        return
+
+    if result["status"] == "succeeded":
+        await update.message.reply_text(
+            f"✅ Intent نماینده `{intent_id}` به‌عنوان انجام‌شده ثبت شد؛ "
+            f"قفل `{result['lock_key']}` آزاد شد. پیش‌پرداخت قبلی حفظ شد و درخواست خارجی جدیدی ارسال نشد."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ پیش‌پرداخت Intent `{intent_id}` مسترد شد؛ "
+            f"{result['amount']:,} تومان به تراز نماینده {result['rep_id']} برگشت. "
+            f"مانده جدید: {result['new_balance']:,} تومان؛ قفل نیز آزاد شد."
         )
 
 
@@ -2262,6 +2317,7 @@ def main():
     app.add_handler(CommandHandler("operations", operations_cmd))
     app.add_handler(CommandHandler("unlock", unlock_operation_cmd))
     app.add_handler(CommandHandler("resolveintent", resolve_user_intent_cmd))
+    app.add_handler(CommandHandler("resolverepintent", resolve_rep_intent_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
