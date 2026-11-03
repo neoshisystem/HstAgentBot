@@ -262,24 +262,50 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
     # 2.4 Reset Sub
     elif action == "reset_sub":
         acc_code = parts[2] if len(parts) > 2 else ""
-        res = await asyncio.to_thread(sub_manager.reset_client_subscription, xui_manager, acc_code, scope="all")
-        if res.get("status") == "ok":
-            new_sub_url = res["new_sub_url"]
-            database.upsert_account_record(
-                rep_id=owned_account.get("rep_id"),
-                email=owned_account["email"],
-                account_code=owned_account["account_code"],
-                sub_id=res.get("new_sub_id", "")
-            )
-            msg = (
-                f"🔄 **لینک اشتراک اکانت {acc_code} با موفقیت بازنشانی شد!**\n\n"
-                f"لینک قبلی باطل گردید. لطفاً لینک جدید زیر را در نرم‌افزار خود جایگزین فرمایید:\n\n"
-                f"`{new_sub_url}`"
-            )
-            await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-            await query.answer("لینک ساب بازنشانی شد.")
+        res = await asyncio.to_thread(
+            sub_manager.reset_client_subscription, xui_manager, acc_code, scope="all"
+        )
+
+        # A partial result means the external panel already rotated the subId,
+        # but a public URL could not be constructed. Persist the new ID anyway
+        # so SQLite never continues to advertise the revoked subscription token.
+        if res.get("status") in ("ok", "partial") and res.get("new_sub_id"):
+            try:
+                database.upsert_account_record(
+                    rep_id=owned_account.get("rep_id"),
+                    email=owned_account["email"],
+                    account_code=owned_account["account_code"],
+                    sub_id=res["new_sub_id"],
+                )
+            except Exception:
+                logger.exception(
+                    "3X-UI rotated subscription id for %s but local persistence failed",
+                    owned_account.get("email"),
+                )
+                await query.answer(
+                    "⚠️ پنل لینک قبلی را باطل و شناسه جدید ایجاد کرده، اما ثبت محلی کامل نشد؛ موضوع نیازمند تطبیق مدیریتی است.",
+                    show_alert=True,
+                )
+                return
+
+            if res.get("status") == "ok" and res.get("new_sub_url"):
+                msg = (
+                    f"🔄 **لینک اشتراک اکانت {acc_code} با موفقیت بازنشانی شد!**\n\n"
+                    "لینک قبلی باطل گردید. لینک جدید را جایگزین کنید:\n\n"
+                    f"{res['new_sub_url']}"
+                )
+                await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+                await query.answer("لینک ساب بازنشانی شد.")
+            else:
+                await query.answer(
+                    "⚠️ لینک قبلی باطل شد و شناسه جدید در دیتابیس ثبت گردید، اما لینک عمومی ساخته نشد. تنظیمات دامنه سابسکریپشن را بررسی کنید.",
+                    show_alert=True,
+                )
         else:
-            await query.answer(f"❌ خطا: {res.get('message', 'ناموفق')}", show_alert=True)
+            await query.answer(
+                f"❌ خطا: {res.get('message', 'بازنشانی انجام نشد')}",
+                show_alert=True,
+            )
 
     # 2.5 Unlink Confirm
     elif action == "unlink_confirm":
