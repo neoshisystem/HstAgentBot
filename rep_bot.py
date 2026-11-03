@@ -950,88 +950,128 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # 1. Action: New Account Allocation (Admin / Rep only)
     if intent == "new_account" and role in ("super_admin", "rep"):
-        gb = params.get("gb", 20.0)
-        days = params.get("days", 30.0)
+        gb = float(params.get("gb", 20.0))
+        days = int(params.get("days", 30))
         comment = params.get("comment", "")
+        if gb <= 0 or days <= 0:
+            await update.message.reply_text("❌ حجم و مدت اکانت باید مثبت باشند.")
+            return
+
+        target_rep_id = rep["id"] if rep else None
+        is_exempt = role == "super_admin" or target_rep_id is None
+        plan_code = f"{int(gb)}gb_{int(days)}d"
+        plan = database.get_plan(plan_code) or database.get_plan("20gb_30d")
+        charge = int(plan["rep_price"]) if plan else 300_000
+        if not is_exempt and charge <= 0:
+            await update.message.reply_text("❌ قیمت صدور اکانت معتبر نیست؛ با مدیریت تماس بگیرید.")
+            return
+
+        lock_key = f"new-account:{role}:{user.id}:{plan_code}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=300)
+        if not lock_token:
+            await update.message.reply_text("⏳ درخواست صدور دیگری در حال پردازش است یا نتیجه قبلی نیازمند بررسی است؛ لطفاً دوباره اجرا نکنید.")
+            return
+
+        new_bal = None
+        if not is_exempt:
+            try:
+                new_bal = database.record_ledger_entry(
+                    rep_id=target_rep_id, account_code="", email="", plan_code=plan_code,
+                    tx_type="debit", amount=charge,
+                    description=f"پیش‌پرداخت صدور اکانت {int(gb)}G/{days}D (در انتظار تأیید پنل)",
+                    actor_id=user.id, actor_name=user.full_name or user.username
+                )
+            except ValueError as exc:
+                database.release_operation_lock(lock_key, lock_token)
+                await update.message.reply_text(f"⛔️ صدور اکانت انجام نشد: {exc}")
+                return
 
         scope_for_alloc = rep["scope_filter"] if rep else "all"
-        alloc_res = await asyncio.to_thread(xui_manager.allocate_pool_client, gb, days, comment=comment, scope=scope_for_alloc)
-        if alloc_res.get("status") == "success":
-            email = alloc_res.get("email")
-            sub_id = alloc_res.get("sub_id")
-            code = xui_manager.extract_account_identifier(email) or email
-            target_rep_id = rep["id"] if rep else database.resolve_account_rep_id(email)
-            is_exempt = (role == "super_admin") or (target_rep_id is None)
-
-            # Upsert into DB
-            database.upsert_account_record(
-                rep_id=target_rep_id,
-                email=email,
-                account_code=code,
-                customer_name=comment,
-                sub_id=sub_id,
-                enable=1,
-                total_gb=gb,
-                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
+        try:
+            alloc_res = await asyncio.to_thread(
+                xui_manager.allocate_pool_client, gb, days,
+                comment=comment, scope=scope_for_alloc
             )
+        except Exception:
+            logger.exception("New account allocation outcome is unknown for %s", user.id)
+            await update.message.reply_text(
+                "⚠️ پاسخ پنل نامشخص است؛ مبلغ/اعتبار در وضعیت محفوظ باقی مانده و بررسی دستی لازم است. لطفاً درخواست صدور دیگری نفرستید."
+            )
+            return
 
-            # Accounting record
-            plan_code = f"{int(gb)}gb_{int(days)}d"
-            plan = database.get_plan(plan_code) or database.get_plan("20gb_30d")
-            charge = plan["rep_price"] if plan else 300000
+        if isinstance(alloc_res, dict) and alloc_res.get("status") == "success":
+            email = alloc_res.get("email")
+            if not email:
+                logger.error("X-UI reports account allocation success without email: %r", alloc_res)
+                await update.message.reply_text("⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ مبلغ برای تطبیق محفوظ ماند.")
+                return
+            sub_id = alloc_res.get("sub_id")
+            try:
+                code = xui_manager.extract_account_identifier(email) or email
+                database.upsert_account_record(
+                    rep_id=target_rep_id, email=email, account_code=code,
+                    customer_name=comment, sub_id=sub_id, enable=1,
+                    total_gb=gb, expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
+                )
+            except Exception:
+                logger.exception("X-UI allocated %s but local account persistence failed", email)
+                await update.message.reply_text(
+                    "⚠️ اکانت در پنل ایجاد شد اما ثبت محلی کامل نشد؛ مبلغ محفوظ است و تطبیق پنل/دیتابیس لازم است."
+                )
+                return
 
             deliv_text = alloc_res.get("deliverable", "")
             if is_exempt:
                 deliv_text += "\n\n👑 **عملیات مستقیم مدیریت کل (معاف از صورت‌حساب نمایندگی)**"
-                database.log_audit(
-                    rep_id=None, account_code=code, email=email,
-                    action="admin_allocate_new_account", actor_id=user.id, actor_name=user.full_name or user.username,
-                    details={"gb": gb, "days": days, "comment": comment, "exempt": True},
-                    result_status="success"
-                )
+                try:
+                    database.log_audit(
+                        rep_id=None, account_code=code, email=email,
+                        action="admin_allocate_new_account", actor_id=user.id,
+                        actor_name=user.full_name or user.username,
+                        details={"gb": gb, "days": days, "comment": comment, "exempt": True},
+                        result_status="success"
+                    )
+                except Exception:
+                    logger.exception("Audit log failed for admin allocation %s", email)
             else:
-                new_bal = database.record_ledger_entry(
-                    rep_id=target_rep_id,
-                    account_code=code,
-                    email=email,
-                    plan_code=plan_code,
-                    tx_type="debit",
-                    amount=charge,
-                    description=f"صدور اکانت جدید {int(gb)}G/{int(days)}D ({comment or 'بدون نام'})",
-                    actor_id=user.id,
-                    actor_name=user.full_name or user.username
-                )
-                database.log_audit(
-                    rep_id=target_rep_id, account_code=code, email=email,
-                    action="allocate_new_account", actor_id=user.id, actor_name=user.full_name or user.username,
-                    details={"gb": gb, "days": days, "comment": comment, "charge": charge, "balance_after": new_bal},
-                    result_status="success"
-                )
+                try:
+                    database.log_audit(
+                        rep_id=target_rep_id, account_code=code, email=email,
+                        action="allocate_new_account", actor_id=user.id,
+                        actor_name=user.full_name or user.username,
+                        details={"gb": gb, "days": days, "comment": comment, "charge": charge, "balance_after": new_bal},
+                        result_status="success"
+                    )
+                except Exception:
+                    logger.exception("Audit log failed for representative allocation %s", email)
                 deliv_text += f"\n\n💳 **فاکتور صدور:** `{charge:,} تومان` | **مانده بدهی:** `{new_bal:,} تومان`"
 
+            database.release_operation_lock(lock_key, lock_token)
             keyboard = nlp_matcher.build_account_keyboard(code, is_enabled=True, role=role)
-
             sub_url = alloc_res.get("sub_url")
             qr_file = None
             if sub_url:
                 try:
                     qr_file = f"/tmp/qr_new_{code}.png"
                     await asyncio.to_thread(xui_manager.generate_qr, sub_url, qr_file)
-                except Exception as e:
-                    logger.error(f"Failed to generate QR: {e}")
+                except Exception:
+                    logger.exception("Failed to generate QR for new account %s", code)
                     qr_file = None
 
-            if qr_file and os.path.exists(qr_file):
-                with open(qr_file, "rb") as photo:
-                    await update.message.reply_photo(
-                        photo=photo,
-                        caption=deliv_text,
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=keyboard
+            try:
+                if qr_file and os.path.exists(qr_file):
+                    with open(qr_file, "rb") as photo:
+                        await update.message.reply_photo(
+                            photo=photo, caption=deliv_text,
+                            parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+                        )
+                    os.remove(qr_file)
+                else:
+                    await update.message.reply_text(
+                        deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
                     )
-                os.remove(qr_file)
-            else:
-                await update.message.reply_text(deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            except Exception:
+                logger.exception("Failed to deliver new account information to Telegram for %s", email)
 
             await asyncio.to_thread(
                 send_admin_log,
@@ -1041,10 +1081,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• وضعیت: {'مدیریت (معاف)' if is_exempt else f'{charge:,} تومان'}"
             )
             return
-        else:
-            await update.message.reply_text(f"❌ خطا در تخصیص اکانت: {alloc_res.get('message')}", parse_mode=ParseMode.MARKDOWN)
+
+        if isinstance(alloc_res, dict) and (
+            alloc_res.get("status") in ("error", "failed", "failure")
+            or alloc_res.get("success") is False
+        ):
+            if not is_exempt:
+                try:
+                    database.register_rep_payment(
+                        target_rep_id, charge,
+                        f"استرداد پیش‌پرداخت به دلیل شکست قطعی صدور {plan_code}",
+                        actor_id=user.id, actor_name=user.full_name or user.username
+                    )
+                except Exception:
+                    logger.exception("Failed to reverse representative account precharge")
+                    await update.message.reply_text("⚠️ پنل صدور را رد کرد اما استرداد مالی ثبت نشد؛ مدیریت باید بررسی کند.")
+                    return
+            database.release_operation_lock(lock_key, lock_token)
+            await update.message.reply_text(
+                f"❌ پنل صدور اکانت را رد کرد؛ {'پیش‌پرداخت مسترد شد.' if not is_exempt else 'هزینه‌ای ثبت نشد.'} "
+                f"{alloc_res.get('message', '')}"
+            )
             return
 
+        logger.error("Ambiguous X-UI allocation response for %s: %r", user.id, alloc_res)
+        await update.message.reply_text(
+            "⚠️ پاسخ پنل برای تأیید یا رد صدور کافی نیست؛ مبلغ/اعتبار محفوظ است و بررسی دستی لازم است."
+        )
+        return
     # 2. Extract account code from reply or message
     account_code = nlp_matcher.extract_account_code(reply_text, msg_text)
 
