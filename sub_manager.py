@@ -40,6 +40,8 @@ def get_subscription_url(sub_id: str) -> str:
         return ""
     try:
         parsed = urlsplit("https://" + domain)
+        if any(ord(ch) <= 32 or ord(ch) == 127 for ch in parsed.netloc):
+            return ""
         if (
             not parsed.hostname or parsed.username is not None
             or parsed.password is not None or parsed.path
