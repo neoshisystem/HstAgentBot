@@ -307,6 +307,12 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
                     f"  مبلغ: **{r['amount_toman']:,} تومان** | ثبت: `{r['created_at'][:16]}`"
                 )
                 extra_btns.append([
+                    InlineKeyboardButton(
+                        f"🔎 جزئیات / تصویر {r['tracking_code']}",
+                        callback_data=f"admin_detail_rcp_{r['id']}",
+                    )
+                ])
+                extra_btns.append([
                     InlineKeyboardButton(f"✅ تایید {r['tracking_code']}", callback_data=f"admin_approve_rcp_{r['tracking_code']}"),
                     InlineKeyboardButton(f"❌ رد {r['tracking_code']}", callback_data=f"admin_reject_rcp_{r['tracking_code']}")
                 ])
