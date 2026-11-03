@@ -361,7 +361,7 @@ def test_super_admin_quick_confirmation_ambiguous_result_retains_lock_for_resolu
         renewal_env, token, monkeypatch, {"status": "pending", "message": "unknown"}
     )
     assert ok is False
-    assert "مبهم" in message or "نامشخص" in message
+    assert "محفوظ مانده" in message or "مشخص نمی‌کند" in message
     confirmation = database.get_account_renewal_confirmation(token, 9000)
     assert confirmation["status"] == "needs_reconciliation"
     lock = next(item for item in database.get_operation_locks() if item["lock_key"] == "account-renewal:admin-pipe")
