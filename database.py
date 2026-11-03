@@ -701,6 +701,75 @@ def activate_reservation(res_id: int, actor_id=0, actor_name="system"):
             result_status="success"
         )
         return data
+def resolve_reservation_activation(
+    res_id: int, actor_id: int, actor_name: str, resolution: str, evidence_note: str
+) -> dict:
+    """Resolve an ambiguous reservation activation and consume its exact persistent lock."""
+    res_id = int(res_id)
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if choice not in ("APPLIED", "NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or NOT_APPLIED")
+    prefix = "APPLIED:" if choice == "APPLIED" else "NOT_APPLIED:"
+    if not note.startswith(prefix) or len(note) < len(prefix) + 15:
+        raise ValueError(f"Evidence must start with {prefix} and contain at least 15 characters after it")
+
+    lock_key = f"reservation-activation:{res_id}"
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT * FROM reserved_packages WHERE id=?", (res_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError("Reservation not found")
+        reservation = dict(row)
+        if reservation["status"] not in ("pending", "activated"):
+            raise ValueError(f"Reservation is already {reservation['status']} and cannot be activation-resolved")
+
+        lock = cur.execute(
+            "SELECT token, created_at FROM operation_locks WHERE lock_key=? AND expires_at>?",
+            (lock_key, time.time()),
+        ).fetchone()
+        if not lock:
+            raise ValueError("No active activation lock exists for this reservation")
+        if choice == "NOT_APPLIED" and reservation["status"] == "activated":
+            raise ValueError("Reservation is already marked activated; NOT_APPLIED would contradict local state")
+
+        if choice == "APPLIED" and reservation["status"] == "pending":
+            cur.execute("""
+                UPDATE reserved_packages
+                SET status='activated', activated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND status='pending'
+            """, (res_id,))
+            if cur.rowcount != 1:
+                raise RuntimeError("Could not mark reservation activated during reconciliation")
+
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (lock_key, lock["token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume exact reservation activation lock")
+
+        final_status = "activated" if choice == "APPLIED" else "pending"
+        _insert_audit(
+            cur, reservation.get("rep_id"), reservation["account_code"], reservation["email"],
+            "resolve_reservation_activation", int(actor_id), str(actor_name or "Super Admin"),
+            {
+                "res_id": res_id, "resolution": choice, "evidence_note": note,
+                "lock_key": lock_key, "lock_created_at": lock["created_at"],
+                "previous_status": reservation["status"], "final_status": final_status,
+            },
+            "success",
+        )
+        return {
+            "status": final_status, "reservation_id": res_id,
+            "account_code": reservation["account_code"], "lock_key": lock_key,
+            "rep_id": reservation.get("rep_id"),
+        }
+
+
 def cancel_reservation(res_id: int, actor_id=0, actor_name="admin"):
     """Cancel one pending reservation and refund its representative atomically."""
     with get_db() as conn:
@@ -960,17 +1029,22 @@ def get_operation_locks() -> list[dict]:
     with get_db() as conn:
         rows = conn.execute("""
             SELECT o.lock_key, o.expires_at, o.created_at,
-                   COALESCE(i.intent_id, r.intent_id, rr.intent_id) AS intent_id,
+                   COALESCE(i.intent_id, r.intent_id, rr.intent_id,
+                       CASE WHEN rp.id IS NOT NULL THEN 'reservation:' || CAST(rp.id AS TEXT) END) AS intent_id,
                    COALESCE(i.action_type, r.action_type,
-                       CASE WHEN rr.intent_id IS NOT NULL THEN 'renew' END) AS action_type,
-                   COALESCE(i.user_id, r.actor_tg_id, rr.actor_tg_id) AS user_id,
-                   COALESCE(i.account_code, r.account_code, rr.account_code) AS account_code,
-                   COALESCE(i.status, r.status, rr.status) AS intent_status,
+                       CASE WHEN rr.intent_id IS NOT NULL THEN 'renew'
+                            WHEN rp.id IS NOT NULL THEN 'reservation_activation' END) AS action_type,
+                   COALESCE(i.user_id, r.actor_tg_id, rr.actor_tg_id, rp.actor_id) AS user_id,
+                   COALESCE(i.account_code, r.account_code, rr.account_code, rp.account_code) AS account_code,
+                   COALESCE(i.status, r.status, rr.status, rp.status) AS intent_status,
                    CASE
                        WHEN r.intent_id IS NOT NULL OR rr.intent_id IS NOT NULL THEN 'representative'
                        WHEN i.intent_id IS NOT NULL THEN 'end_user'
+                       WHEN rp.id IS NOT NULL AND rp.rep_id IS NOT NULL THEN 'representative'
+                       WHEN rp.id IS NOT NULL THEN 'super_admin'
                        ELSE 'unlinked'
-                   END AS intent_owner_type
+                   END AS intent_owner_type,
+                   rp.id AS reservation_id
             FROM operation_locks o
             LEFT JOIN user_action_intents i
               ON i.operation_lock_key = o.lock_key
@@ -981,6 +1055,8 @@ def get_operation_locks() -> list[dict]:
             LEFT JOIN rep_renewal_intents rr
               ON rr.operation_lock_key = o.lock_key
              AND rr.operation_lock_token = o.token
+            LEFT JOIN reserved_packages rp
+              ON o.lock_key = 'reservation-activation:' || CAST(rp.id AS TEXT)
             WHERE o.expires_at > ?
             ORDER BY o.created_at ASC
         """, (time.time(),)).fetchall()
@@ -1026,10 +1102,19 @@ def resolve_operation_lock(
                   SELECT token FROM operation_locks WHERE lock_key = ?
               )
               AND status IN ('processing', 'needs_reconciliation')
+            UNION ALL
+            SELECT 'reservation:' || CAST(id AS TEXT), status,
+                   CASE WHEN rep_id IS NULL THEN 'super_admin' ELSE 'representative' END AS owner_type,
+                   'reservation_activation' AS action_type
+            FROM reserved_packages
+            WHERE ('reservation-activation:' || CAST(id AS TEXT)) = ?
+              AND status IN ('pending', 'activated')
             LIMIT 1
-        """, (key, key, key, key, key, key)).fetchone()
+        """, (key, key, key, key, key, key, key)).fetchone()
         if linked_intent:
-            if linked_intent["owner_type"] == "end_user":
+            if linked_intent["action_type"] == "reservation_activation":
+                resolve_command = "/resolvereservation"
+            elif linked_intent["owner_type"] == "end_user":
                 resolve_command = "/resolveintent"
             elif linked_intent["action_type"] == "renew":
                 resolve_command = "/resolvereprenewal"
