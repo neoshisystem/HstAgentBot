@@ -426,6 +426,73 @@ async def card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
 
+async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show persistent or unexpired external-operation locks to the Super Admin."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_TELEGRAM_ID:
+        return
+    locks = await asyncio.to_thread(database.get_operation_locks)
+    if not locks:
+        await update.message.reply_text("✅ هیچ عملیات معلق یا قفل فعالی برای تطبیق وجود ندارد.")
+        return
+    lines = [
+        "⚠️ **عملیات‌های قفل‌شده / نیازمند تطبیق**",
+        "این قفل‌ها مانع اجرای دوباره عملیات خارجی می‌شوند. پیش از آزادسازی، وضعیت دقیق اکانت را در 3X-UI بررسی کنید.",
+        ""
+    ]
+    for item in locks[:30]:
+        lines.append(
+            f"• `{item['lock_key']}`\n"
+            f"  ایجاد: `{item['created_at']}` | انقضا: `{item['expires_at']}`"
+        )
+    lines.append(
+        "\nبرای رفع قفل فقط پس از بررسی پنل و اصلاح وضعیت محلی، دستور /unlock را با کلید دقیق و مدرک متنی ثبت‌شده اجرا کنید."
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def unlock_operation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Release an unresolved-operation lock only with explicit admin evidence."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور:\n"
+            "`/unlock <operation-key> VERIFIED_NOT_APPLIED: توضیح بررسی پنل`\n"
+            "یا\n"
+            "`/unlock <operation-key> RECONCILED: توضیح اصلاح وضعیت محلی`\n\n"
+            "پیش از این دستور حتماً وضعیت همان اکانت را در 3X-UI و دیتابیس تطبیق دهید."
+        )
+        return
+    lock_key = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if not (
+        evidence.startswith("VERIFIED_NOT_APPLIED:")
+        or evidence.startswith("RECONCILED:")
+    ):
+        await update.message.reply_text(
+            "⛔️ مدرک باید با VERIFIED_NOT_APPLIED: یا RECONCILED: شروع شود."
+        )
+        return
+    try:
+        resolved = await asyncio.to_thread(
+            database.resolve_operation_lock,
+            lock_key, user.id, user.full_name or "Super Admin", evidence
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ آزادسازی انجام نشد: {exc}")
+        return
+    if resolved:
+        await update.message.reply_text(
+            f"✅ قفل `{lock_key}` با ثبت مدرک و هویت مدیر آزاد شد.\n"
+            "این دستور هیچ تغییری در 3X-UI، موجودی یا وضعیت رزرو ایجاد نمی‌کند."
+        )
+    else:
+        await update.message.reply_text("ℹ️ چنین قفل فعالی پیدا نشد.")
+
+
 async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id != ADMIN_TELEGRAM_ID:
@@ -2122,6 +2189,8 @@ def main():
     app.add_handler(CommandHandler("card", card_cmd))
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("sync", sync_cmd))
+    app.add_handler(CommandHandler("operations", operations_cmd))
+    app.add_handler(CommandHandler("unlock", unlock_operation_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
