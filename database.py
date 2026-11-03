@@ -50,7 +50,6 @@ DEFAULT_SETTINGS = [
     ("admin_telegram_id", str(ADMIN_TELEGRAM_ID), "شناسه تلگرام ادمین کل", "شناسه عددی ادمین اصلی سیستم")
 ]
 
-@contextmanager
 def _insert_audit(cur, rep_id, account_code, email, action, actor_id, actor_name, details, result_status):
     cur.execute("""
         INSERT INTO audit_logs (rep_id, account_code, email, action, actor_id, actor_name, details_json, result_status)
@@ -106,6 +105,7 @@ def _credit_user_wallet(cur, user_id, amount, description, actor_id, actor_name)
     return new_balance
 
 
+@contextmanager
 def get_db():
     """Yield a configured SQLite connection and always close it.
 
