@@ -632,7 +632,7 @@ async def process_account_renewal(
 
     if can_renew_immediate:
         countdown_param = True if effective_first else "auto"
-        operation_lock_key = f"rep-renew-pending:{account_code.lower()}"
+        operation_lock_key = f"account-renewal:{account_code.lower()}"
         operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=None)
         if not operation_lock_token:
             pending_res = database.get_pending_reservation(account_code)
