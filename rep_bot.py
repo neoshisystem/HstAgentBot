@@ -378,7 +378,7 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
-    if role == "unauthorized_group":
+    if role not in ("end_user", "rep") or (role == "rep" and not rep):
         return
 
     args = context.args or []
