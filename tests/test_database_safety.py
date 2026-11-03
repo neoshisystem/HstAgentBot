@@ -316,3 +316,29 @@ def test_rep_archive_preserves_ledger_and_prevents_new_debits(isolated_db):
             rep_id, "ARC2", "ARC2@example.test", "p2", "debit", 100,
             "post archive", 9000, "test"
         )
+
+
+
+def test_persistent_operation_lock_requires_audited_admin_resolution(isolated_db):
+    key = "user-renew:9009:A9009"
+    token = database.acquire_operation_lock(key, ttl_seconds=None)
+    assert token
+    locks = database.get_operation_locks()
+    assert len(locks) == 1
+    assert locks[0]["lock_key"] == key
+    assert "token" not in locks[0]
+    assert locks[0]["expires_at"] > 253402300000
+    assert database.acquire_operation_lock(key, ttl_seconds=1) is None
+
+    with pytest.raises(ValueError, match="15 characters"):
+        database.resolve_operation_lock(key, 9999, "Admin", "short")
+
+    assert database.resolve_operation_lock(
+        key, 9999, "Admin",
+        "VERIFIED_NOT_APPLIED: inspected X-UI client; renewal was not applied"
+    ) is True
+    assert database.get_operation_locks() == []
+    assert scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'resolve_operation_lock' AND actor_id = ?",
+        (9999,),
+    ) == 1
