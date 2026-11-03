@@ -510,8 +510,8 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.answer("⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ مبلغ محفوظ و عملیات قفل شد.", show_alert=True)
                 return
 
-            code = xui_manager.extract_account_identifier(email) or email
             try:
+                code = xui_manager.extract_account_identifier(email) or email
                 database.upsert_account_record(
                     rep_id=None,
                     email=email,
