@@ -68,7 +68,8 @@ def pending_reservation(rep_id=5, res_id=7, account_code="ABCD"):
     }
 
 
-def test_rep_account_card_reservation_actions_use_two_step_callbacks():
+def test_rep_account_card_reservation_actions_use_two_step_callbacks(monkeypatch):
+    monkeypatch.setattr(nlp_matcher.database, "get_pricing_plans", lambda *args, **kwargs: [])
     keyboard = nlp_matcher.build_account_keyboard(
         "ABCD",
         role="rep",
@@ -88,7 +89,7 @@ def test_rep_account_card_reservation_actions_use_two_step_callbacks():
 def test_rep_reservation_queue_buttons_open_confirmation_screens(monkeypatch):
     monkeypatch.setattr(
         rep_panel.database, "get_rep_reservations",
-        lambda rep_id: [pending_reservation(rep_id=rep_id)],
+        lambda rep_id: [{**pending_reservation(rep_id=rep_id), "created_at": "2026-11-03 17:00"}],
     )
     update, query = make_callback("rep:reserves")
     asyncio.run(rep_panel.handle_rep_callbacks(update, SimpleNamespace(user_data={}), make_rep()))
