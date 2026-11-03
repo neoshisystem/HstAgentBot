@@ -7,6 +7,9 @@ import database
 def isolated_db(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "reservation-activation-resolution.sqlite3"))
     database.init_db()
+    database.add_or_update_plan(
+        "reserve_20gb_30d", "Reserve 20G", 20, 30, 300000, 450000, is_quick=1
+    )
     with database.get_db() as conn:
         rep_id = conn.execute(
             """
@@ -138,3 +141,115 @@ def test_existing_activated_reservation_can_only_clear_residual_lock_as_applied(
     assert reservation_status(res_id) == "activated"
     assert activation_lock(res_id) is None
     assert rep_balance(rep_id) == 300000
+
+def create_reservation_confirmation(rep_id, code="RSV-CONF"):
+    email = f"{code.lower()}@example.test"
+    database.upsert_account_record(
+        rep_id=rep_id,
+        email=email,
+        account_code=code,
+        customer_name="Confirmed Renewal",
+        sub_id=f"sub-{code.lower()}",
+        enable=1,
+        total_gb=20,
+        expiry_time=0,
+    )
+    plan = database.get_plan("reserve_20gb_30d")
+    return database.create_account_renewal_confirmation(
+        actor_id=89001,
+        actor_role="rep",
+        rep_id=rep_id,
+        account_code=code,
+        account_email=email,
+        plan_code=plan["plan_code"],
+        plan_name=plan["name"],
+        gb=plan["gb"],
+        days=plan["days"],
+        amount=plan["rep_price"],
+    )
+
+
+def test_rep_confirmation_is_claimed_atomically_with_reservation_and_debit(isolated_db):
+    rep_id = isolated_db
+    code = "RSV-CONF"
+    token = create_reservation_confirmation(rep_id, code)
+    email = f"{code.lower()}@example.test"
+
+    res_id = database.create_reservation(
+        rep_id=rep_id,
+        account_code=code,
+        email=email,
+        plan_code="reserve_20gb_30d",
+        plan_name="Reserve 20G",
+        gb=20,
+        days=30,
+        on_first_connect=0,
+        charge_amount=300000,
+        actor_id=89001,
+        actor_name="Reservation Representative",
+        confirmation_id=token,
+        actor_role="rep",
+        confirmation_rep_id=rep_id,
+    )
+
+    confirmation = database.get_account_renewal_confirmation(token, 89001)
+    assert confirmation["status"] == "reserved"
+    assert confirmation["operation_ref_type"] == "reservation"
+    assert confirmation["operation_ref_id"] == str(res_id)
+    assert reservation_status(res_id) == "pending"
+    assert rep_balance(rep_id) == 300000
+
+    with pytest.raises(ValueError, match="already reserved"):
+        database.create_reservation(
+            rep_id=rep_id,
+            account_code=code,
+            email=email,
+            plan_code="reserve_20gb_30d",
+            plan_name="Reserve 20G",
+            gb=20,
+            days=30,
+            on_first_connect=0,
+            charge_amount=300000,
+            actor_id=89001,
+            actor_name="Reservation Representative",
+            confirmation_id=token,
+            actor_role="rep",
+            confirmation_rep_id=rep_id,
+        )
+    assert rep_balance(rep_id) == 300000
+
+
+def test_reservation_confirmation_claim_rolls_back_with_debit_failure(isolated_db, monkeypatch):
+    rep_id = isolated_db
+    code = "RSV-ROLLBACK"
+    token = create_reservation_confirmation(rep_id, code)
+    email = f"{code.lower()}@example.test"
+    original = database._record_rep_ledger_entry
+
+    def write_then_fail(cur, *args, **kwargs):
+        original(cur, *args, **kwargs)
+        raise RuntimeError("injected reservation debit failure")
+
+    monkeypatch.setattr(database, "_record_rep_ledger_entry", write_then_fail)
+    with pytest.raises(RuntimeError, match="injected reservation debit failure"):
+        database.create_reservation(
+            rep_id=rep_id,
+            account_code=code,
+            email=email,
+            plan_code="reserve_20gb_30d",
+            plan_name="Reserve 20G",
+            gb=20,
+            days=30,
+            on_first_connect=0,
+            charge_amount=300000,
+            actor_id=89001,
+            actor_name="Reservation Representative",
+            confirmation_id=token,
+            actor_role="rep",
+            confirmation_rep_id=rep_id,
+        )
+
+    assert database.get_account_renewal_confirmation(token, 89001)["status"] == "pending"
+    assert rep_balance(rep_id) == 0
+    assert database.get_pending_reservation(code) is None
+
