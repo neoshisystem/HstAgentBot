@@ -242,6 +242,25 @@ def test_retention_prunes_only_verified_archives_and_keeps_one_valid_backup(tmp_
     assert corrupt.exists()
 
 
+def test_restore_failure_preserves_caller_owned_empty_destination(tmp_path, monkeypatch):
+    _backup_dir, _uploader, _db_path = prepare_backup(
+        tmp_path, monkeypatch, {"ok": True}
+    )
+    result = backup.run_backup()
+    destination = tmp_path / "caller-owned-empty"
+    destination.mkdir()
+
+    def fail_copy(_source, _destination):
+        raise OSError("injected restore write failure")
+
+    monkeypatch.setattr(backup.shutil, "copyfileobj", fail_copy)
+    with pytest.raises(OSError, match="injected restore write failure"):
+        backup.restore_backup_archive(result["archive"], str(destination))
+
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+
+
 def test_restore_preserves_hstagentbot_database_schema_and_settings(tmp_path, monkeypatch):
     production_dir = tmp_path / "production"
     production_dir.mkdir()
