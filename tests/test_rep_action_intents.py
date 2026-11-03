@@ -12,7 +12,7 @@ def isolated_db(tmp_path, monkeypatch):
             """
             INSERT INTO representatives
                 (rep_code, name, telegram_id, scope_filter, is_active, balance_toman, credit_limit_toman)
-            VALUES ('rep-intent', 'Intent Representative', 81001, 'all', 1, 0, 5_000_000)
+            VALUES ('rep-intent', 'Intent Representative', 81001, 'all', 1, 0, 5000000)
             """
         )
         rep_id = cur.lastrowid
