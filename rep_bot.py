@@ -960,8 +960,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_rep_id = rep["id"] if rep else None
         is_exempt = role == "super_admin" or target_rep_id is None
         plan_code = f"{int(gb)}gb_{int(days)}d"
-        plan = database.get_plan(plan_code) or database.get_plan("20gb_30d")
-        charge = int(plan["rep_price"]) if plan else 300_000
+        plan = database.get_plan(plan_code)
+        if not is_exempt and not plan:
+            await update.message.reply_text(
+                "❌ این ترکیب حجم/مدت، تعرفه مصوب نمایندگی ندارد. لطفاً از فهرست پلن‌های تاییدشده برای صدور استفاده کنید."
+            )
+            return
+        charge = int(plan["rep_price"]) if plan else 0
         if not is_exempt and charge <= 0:
             await update.message.reply_text("❌ قیمت صدور اکانت معتبر نیست؛ با مدیریت تماس بگیرید.")
             return
