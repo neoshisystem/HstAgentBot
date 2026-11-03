@@ -75,3 +75,58 @@ def reset_client_sub_id(xui_module, email: str) -> tuple[bool, str, str]:
     except Exception as e:
         logger.error(f"Failed to reset subId for {email}: {e}")
         return False, str(e), ""
+
+
+def generate_qr_code(payload: str):
+    """Return a Telegram-compatible in-memory PNG QR image."""
+    if not isinstance(payload, str) or not payload.strip():
+        raise ValueError("QR payload must be a non-empty string")
+    try:
+        import qrcode
+        from io import BytesIO
+    except ImportError as exc:
+        raise RuntimeError("QR generation dependency is missing; install qrcode[pil]") from exc
+    image = qrcode.make(payload)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    buffer.name = "subscription-qr.png"
+    return buffer
+
+
+def reset_client_subscription(xui_module, account_identifier: str, scope: str = "all") -> dict:
+    """Resolve an account identifier, rotate its subscription ID and return one stable result shape."""
+    if not account_identifier:
+        return {"status": "error", "message": "شناسه اکانت مشخص نشده است."}
+    try:
+        search = xui_module.find_client_by_code(account_identifier)
+        if not search or not search.get("found"):
+            return {"status": "error", "message": "اکانت موردنظر در پنل یافت نشد."}
+        data = search.get("data") or {}
+        raw = data.get("raw") or {}
+        email = data.get("email") or raw.get("email") or account_identifier
+
+        url_builder = getattr(xui_module, "get_sub_url", None)
+        if not callable(url_builder) and not get_subscription_url("probe"):
+            return {"status": "error", "message": "دامنه سابسکریپشن در تنظیمات سامانه تعریف نشده است."}
+
+        ok, message, new_sub_id = reset_client_sub_id(xui_module, email)
+        if not ok:
+            return {"status": "error", "message": message}
+        new_url = url_builder(new_sub_id) if callable(url_builder) else get_subscription_url(new_sub_id)
+        if not new_url:
+            return {
+                "status": "partial",
+                "message": "شناسه سابسکریپشن تغییر کرد، اما ساخت لینک جدید ممکن نشد؛ تنظیمات دامنه را بررسی کنید.",
+                "new_sub_id": new_sub_id,
+            }
+        return {
+            "status": "ok",
+            "message": message,
+            "new_sub_id": new_sub_id,
+            "new_sub_url": new_url,
+            "email": email,
+        }
+    except Exception as exc:
+        logger.exception("Failed to reset subscription for %s", account_identifier)
+        return {"status": "error", "message": str(exc)}
