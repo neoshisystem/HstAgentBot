@@ -595,6 +595,12 @@ def cancel_reservation(res_id: int, actor_id=0, actor_name="admin"):
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
+        activation_lock = cur.execute(
+            "SELECT 1 FROM operation_locks WHERE lock_key = ? AND expires_at > ?",
+            (f"reservation-activation:{int(res_id)}", time.time())
+        ).fetchone()
+        if activation_lock:
+            return None
         row = cur.execute(
             "SELECT * FROM reserved_packages WHERE id = ? AND status = 'pending'",
             (res_id,)
