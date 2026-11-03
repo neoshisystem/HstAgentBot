@@ -449,7 +449,10 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if item.get("intent_id"):
             owner_type = item.get("intent_owner_type")
             action_type = item.get("action_type")
-            if owner_type == "representative" and action_type == "renew":
+            if action_type == "reservation_activation":
+                owner_label = "نماینده" if owner_type == "representative" else "مدیریت کل"
+                command = "/resolvereservation"
+            elif owner_type == "representative" and action_type == "renew":
                 owner_label, command = "نماینده", "/resolvereprenewal"
             elif owner_type == "representative":
                 owner_label, command = "نماینده", "/resolverepintent"
@@ -457,17 +460,27 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 owner_label, command = "کاربر", "/resolveintent"
             else:
                 owner_label, command = "نامشخص", "/unlock"
-            lines.append(
-                f"  ⚠️ Intent: `{item['intent_id']}` | نوع: {action_type} "
-                f"| {owner_label} Telegram ID: `{item.get('user_id')}` | وضعیت: {item.get('intent_status')}"
-            )
-            lines.append(
-                f"  تعیین تکلیف مالی: {command} <intent-id> APPLIED: ... "
-                f"یا {command} <intent-id> REFUND_NOT_APPLIED: ..."
-            )
+            if action_type == "reservation_activation":
+                lines.append(
+                    f"  ⚠️ رزرو: `{item.get('reservation_id')}` | {owner_label} | "
+                    f"Actor Telegram ID: `{item.get('user_id')}` | وضعیت: {item.get('intent_status')}"
+                )
+                lines.append(
+                    f"  تعیین تکلیف پس از تطبیق X-UI: {command} <reservation-id> APPLIED: ... "
+                    f"یا {command} <reservation-id> NOT_APPLIED: ..."
+                )
+            else:
+                lines.append(
+                    f"  ⚠️ Intent: `{item['intent_id']}` | نوع: {action_type} "
+                    f"| {owner_label} Telegram ID: `{item.get('user_id')}` | وضعیت: {item.get('intent_status')}"
+                )
+                lines.append(
+                    f"  تعیین تکلیف مالی: {command} <intent-id> APPLIED: ... "
+                    f"یا {command} <intent-id> REFUND_NOT_APPLIED: ..."
+                )
     lines.append(
         "\nقفل‌های عادی را فقط پس از بررسی پنل و دیتابیس با /unlock حل کنید. "
-        "قفل‌های Intent کاربر با /resolveintent، صدور نماینده با /resolverepintent و تمدید نماینده با /resolvereprenewal تعیین تکلیف می‌شوند."
+        "قفل‌های Intent کاربر با /resolveintent، صدور نماینده با /resolverepintent، تمدید نماینده با /resolvereprenewal و فعال‌سازی رزرو با /resolvereservation تعیین تکلیف می‌شوند."
     )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -618,6 +631,51 @@ async def resolve_rep_intent_cmd(update: Update, context: ContextTypes.DEFAULT_T
             f"✅ پیش‌پرداخت Intent `{intent_id}` مسترد شد؛ "
             f"{result['amount']:,} تومان به تراز نماینده {result['rep_id']} برگشت. "
             f"مانده جدید: {result['new_balance']:,} تومان؛ قفل نیز آزاد شد."
+        )
+
+
+async def resolve_reservation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of an ambiguous reserved-package activation."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if len(args) < 2 or not args[0].isdigit():
+        await update.message.reply_text(
+            "فرمت دستور (پس از تطبیق وضعیت همان اکانت در 3X-UI):\n"
+            "`/resolvereservation <reservation-id> APPLIED: مدرک فعال شدن بسته`\n"
+            "یا\n"
+            "`/resolvereservation <reservation-id> NOT_APPLIED: مدرک عدم اعمال تمدید`\n\n"
+            "APPLIED رزرو را فعال و قفل را آزاد می‌کند. NOT_APPLIED فقط قفل را آزاد می‌کند و رزرو در صف باقی می‌ماند؛ در صورت نیاز می‌توانید بعداً آن را لغو و وجه را مسترد کنید."
+        )
+        return
+
+    res_id = int(args[0])
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("NOT_APPLIED:"):
+        resolution = "NOT_APPLIED"
+    else:
+        await update.message.reply_text("⛔️ مدرک باید با APPLIED: یا NOT_APPLIED: شروع شود.")
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_reservation_activation,
+            res_id, user.id, user.full_name or "Super Admin", resolution, evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف رزرو انجام نشد: {exc}")
+        return
+
+    if result["status"] == "activated":
+        await update.message.reply_text(
+            f"✅ رزرو `{res_id}` به‌عنوان فعال‌شده ثبت شد؛ قفل `{result['lock_key']}` آزاد شد. پیش‌پرداخت قبلی بدون تغییر باقی ماند."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ مدرک عدم اعمال تمدید برای رزرو `{res_id}` ثبت شد؛ قفل آزاد شد و رزرو همچنان در صف باقی ماند. برای لغو و استرداد از دکمه لغو رزرو استفاده کنید."
         )
 
 
@@ -2592,6 +2650,7 @@ def main():
     app.add_handler(CommandHandler("resolveintent", resolve_user_intent_cmd))
     app.add_handler(CommandHandler("resolverepintent", resolve_rep_intent_cmd))
     app.add_handler(CommandHandler("resolvereprenewal", resolve_rep_renewal_cmd))
+    app.add_handler(CommandHandler("resolvereservation", resolve_reservation_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
