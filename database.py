@@ -611,7 +611,11 @@ def get_all_settings():
 
 # --- Reserved Packages Queue Management ---
 
-def create_reservation(rep_id, account_code, email, plan_code, plan_name, gb, days, on_first_connect, charge_amount, actor_id, actor_name):
+def create_reservation(
+    rep_id, account_code, email, plan_code, plan_name, gb, days, on_first_connect,
+    charge_amount, actor_id, actor_name, confirmation_id=None, actor_role=None,
+    confirmation_rep_id=None,
+):
     """Create one pending reservation and charge the representative in one transaction."""
     charge_amount = int(charge_amount)
     if charge_amount < 0:
@@ -619,6 +623,20 @@ def create_reservation(rep_id, account_code, email, plan_code, plan_name, gb, da
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
+        confirmation_amount = None
+        if confirmation_id:
+            plan_row = cur.execute(
+                "SELECT rep_price FROM pricing_plans WHERE plan_code=?",
+                (str(plan_code),),
+            ).fetchone()
+            if not plan_row:
+                raise ValueError("Quick-renew plan no longer exists")
+            confirmation_amount = int(plan_row["rep_price"])
+            _validate_account_renewal_confirmation_for_claim(
+                cur, confirmation_id, actor_id, actor_role or "",
+                rep_id, account_code, email, plan_code, plan_name, gb, days,
+                confirmation_amount, confirmation_rep_id=confirmation_rep_id,
+            )
         existing = cur.execute("""
             SELECT id FROM reserved_packages
             WHERE status = 'pending' AND LOWER(account_code) = LOWER(?)
@@ -656,6 +674,18 @@ def create_reservation(rep_id, account_code, email, plan_code, plan_name, gb, da
             )
         else:
             new_balance = 0
+
+        if confirmation_id:
+            cur.execute("""
+                UPDATE account_renewal_confirmations
+                SET status='reserved', operation_ref_type='reservation',
+                    operation_ref_id=?, operation_lock_key=NULL, operation_lock_token=NULL,
+                    result_note='Reservation created and representative charge committed',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE intent_id=? AND actor_id=? AND status='pending'
+            """, (str(res_id), str(confirmation_id), int(actor_id)))
+            if cur.rowcount != 1:
+                raise RuntimeError("Could not atomically claim quick-renew confirmation for reservation")
 
         _insert_audit(
             cur, rep_id, account_code, email, "create_reservation",
@@ -2026,10 +2056,11 @@ def mark_user_action_intent_for_reconciliation(
 def _validate_account_renewal_confirmation_for_claim(
     cur, confirmation_id: str, actor_id: int, actor_role: str, rep_id: int | None,
     account_code: str, account_email: str, plan_code: str, plan_name: str,
-    gb: float, days: int, amount: int,
+    gb: float, days: int, amount: int, confirmation_rep_id: int | None = None,
 ) -> dict:
     key = str(confirmation_id or "").strip()
     role = str(actor_role or "").strip().lower()
+    expected_rep_id = rep_id if confirmation_rep_id is None else confirmation_rep_id
     row = cur.execute("""
         SELECT * FROM account_renewal_confirmations
         WHERE intent_id=? AND actor_id=?
@@ -2043,9 +2074,9 @@ def _validate_account_renewal_confirmation_for_claim(
         raise ValueError("Quick-renew confirmation expired")
     if intent["actor_role"] != role:
         raise ValueError("Quick-renew confirmation role mismatch")
-    if (intent.get("rep_id") is None) != (rep_id is None):
+    if (intent.get("rep_id") is None) != (expected_rep_id is None):
         raise ValueError("Quick-renew representative context mismatch")
-    if intent.get("rep_id") is not None and int(intent["rep_id"]) != int(rep_id):
+    if intent.get("rep_id") is not None and int(intent["rep_id"]) != int(expected_rep_id):
         raise ValueError("Quick-renew representative mismatch")
     if (
         str(intent["account_code"]).lower() != str(account_code).lower()
