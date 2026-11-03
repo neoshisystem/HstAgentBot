@@ -2730,29 +2730,89 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("❌ خطا در ساخت QR کانفیگ", show_alert=True)
 
-    # 11. Reset SubId
+    # 11. Reset SubId — share the verified reset/persistence flow with the user portal.
     elif action == "reset_sub":
-        res_ok, res_msg, new_sub = await asyncio.to_thread(sub_manager.reset_client_sub_id, xui_manager, email)
-        if res_ok:
-            new_url = sub_manager.get_subscription_url(new_sub)
+        lock_key = f"subscription-reset:{str(account_code).lower()}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
+        if not lock_token:
+            await query.answer("⏳ بازنشانی لینک این اکانت در حال انجام یا نیازمند تطبیق است؛ دوباره تلاش نکنید.", show_alert=True)
+            return
+        try:
+            reset_result = await asyncio.to_thread(
+                sub_manager.reset_client_subscription, xui_manager, email, scope="all"
+            )
+        except Exception:
+            logger.exception("Account-card subscription reset outcome is unknown: %s", account_code)
+            await query.answer(
+                "⚠️ نتیجه بازنشانی پنل مشخص نیست؛ قفل برای بررسی مدیریت نگه داشته شد. فعلاً دوباره اقدام نکنید.",
+                show_alert=True,
+            )
+            return
+
+        if reset_result.get("status") == "unknown":
+            await query.answer(
+                "⚠️ وضعیت شناسه در پنل قابل تأیید نیست؛ قفل تطبیق حفظ شد. فعلاً دوباره تلاش نکنید.",
+                show_alert=True,
+            )
+            return
+        if reset_result.get("status") not in ("ok", "partial") or not reset_result.get("new_sub_id"):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer(
+                f"❌ خطا در بازنشانی لینک ساب: {reset_result.get('message', 'بازنشانی تأیید نشد')}",
+                show_alert=True,
+            )
+            return
+
+        try:
+            database.upsert_account_record(
+                rep_id=acc_record.get("rep_id"),
+                email=email,
+                account_code=account_code,
+                sub_id=reset_result["new_sub_id"],
+            )
+        except Exception:
+            logger.exception(
+                "Subscription ID rotated remotely for %s but local persistence failed",
+                email,
+            )
+            await query.answer(
+                "⚠️ شناسه در پنل تغییر کرده اما ثبت محلی انجام نشد؛ قفل تطبیق حفظ شد و بررسی مدیریت لازم است.",
+                show_alert=True,
+            )
+            return
+
+        try:
             target_rep_id = acc_record.get("rep_id") or (rep["id"] if rep else None)
-            database.upsert_account_record(rep_id=target_rep_id, email=email, account_code=account_code, sub_id=new_sub)
             database.log_audit(
                 rep_id=target_rep_id, account_code=account_code, email=email,
-                action="reset_sub_id", actor_id=user.id, actor_name=user.full_name or user.username,
-                details={"new_sub_id": new_sub}, result_status="success"
+                action="reset_sub_id", actor_id=user.id,
+                actor_name=user.full_name or user.username,
+                details={"new_sub_id": reset_result["new_sub_id"]},
+                result_status="success",
             )
+        except Exception:
+            logger.exception("Subscription ID changed and persisted but audit write failed for %s", email)
+
+        database.release_operation_lock(lock_key, lock_token)
+        if reset_result.get("status") == "ok" and reset_result.get("new_sub_url"):
             out_text = (
-                f"🔄 **لینک سابسکریپشن اکانت `{account_code}` با موفقیت بازنشانی شد.**\n\n"
-                f"⚠️ لینک قبلی بی‌درنگ باطل گردید.\n\n"
-                f"🔗 **لینک جدید سابسکریپشن:**\n`{new_url}`"
+                f"🔄 **لینک سابسکریپشن اکانت `{account_code}` با موفقیت بازنشانی شد.**\\n\\n"
+                f"⚠️ لینک قبلی باطل گردید.\\n\\n"
+                f"🔗 **لینک جدید سابسکریپشن:**\\n`{reset_result['new_sub_url']}`"
             )
-            keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role)
+            keyboard = nlp_matcher.build_account_keyboard(
+                account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role
+            )
             await safe_edit_message(query, out_text, reply_markup=keyboard)
             await query.answer("✅ لینک سابسکریپشن بازنشانی شد.")
-            await asyncio.to_thread(send_admin_log, f"🔄 بازنشانی لینک ساب اکانت `{email}` توسط `{user.id}`", target_rep_id)
+            await asyncio.to_thread(
+                send_admin_log, f"بازنشانی لینک ساب اکانت `{email}` توسط `{user.id}`", target_rep_id
+            )
         else:
-            await query.answer(f"❌ خطا در بازنشانی لینک ساب: {res_msg}", show_alert=True)
+            await query.answer(
+                "⚠️ شناسه جدید در پنل و دیتابیس ثبت شد، اما لینک عمومی ساخته نشد. تنظیمات دامنه را بررسی کنید.",
+                show_alert=True,
+            )
 
 # --- Background Reserve Queue Watchdog Task ---
 
