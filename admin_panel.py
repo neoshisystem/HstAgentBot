@@ -436,13 +436,20 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
     # 7. Sync & Server Status
     elif action == "sync":
-        count = await asyncio.to_thread(database.sync_all_active_reps)
+        result = await asyncio.to_thread(database.sync_all_active_reps_detailed)
+        if result.get("status") == "success":
+            sync_status = (
+                f"✅ همگام‌سازی کامل شد.\n"
+                f"• اکانت‌های به‌روزشده: **{result['count']}**\n"
+                f"• موارد دارای بیش از یک نماینده محتمل: **{result['ambiguous']}**\n"
+                f"• موارد بدون نماینده منطبق: **{result['unmatched']}**"
+            )
+        else:
+            sync_status = f"❌ همگام‌سازی ناموفق بود: {result.get('message', 'خطای نامشخص')}"
         text = (
-            "🔄 **همگام‌سازی و آمار لایو سرور ۳X-UI:**\n\n"
-            f"✅ همگام‌سازی دیتابیس لوکال با موفقیت انجام شد.\n"
-            f"• تعداد اکانت‌های بروزرسانی‌شده: **{count}**\n"
-            f"• وضعیت اتصال API پنل: **پایدار و متصل**\n"
-            f"• زمان آخرین همگام‌سازی: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+            "🔄 **گزارش همگام‌سازی سرور ۳X-UI:**\n\n"
+            f"{sync_status}\n"
+            f"• زمان بررسی: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
         )
         keyboard = build_back_to_admin_keyboard()
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
