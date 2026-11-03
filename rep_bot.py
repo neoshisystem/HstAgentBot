@@ -1757,7 +1757,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Strict End-User Isolation in Callbacks
     if role == "end_user":
-        if action in ("suspend", "activate", "qrenew", "force_res", "cancel_res", "toggle_mode", "more_plans"):
+        if action in ("suspend", "activate", "qrenew", "force_res", "cancel_res", "toggle_mode", "set_mode", "more_plans"):
             await query.answer("⛔️ این عملیات فقط برای نماینده و مدیریت مجاز است.", show_alert=True)
             return
 
@@ -1790,18 +1790,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("↩️ بازگشت به منوی اصلی")
         return
 
-    # 3. Toggle Mode (Standard Rollover vs On First Connect)
+    # 3. Legacy toggle callback is read-only: it carries no desired state.
     if action == "toggle_mode":
-        new_mode = database.toggle_user_first_connect_mode(user.id)
+        await query.answer(
+            "⚠️ این دکمه قدیمی است و تغییری اعمال نشد؛ کارت اکانت را تازه کنید.",
+            show_alert=True
+        )
+        return
+
+    # 3. Explicit renewal mode: replaying this callback preserves the selected value.
+    if action == "set_mode":
+        desired_mode = parts[2] if len(parts) > 2 else ""
+        if desired_mode not in ("0", "1"):
+            await query.answer("⛔️ حالت درخواستی معتبر نیست؛ کارت اکانت را تازه کنید.", show_alert=True)
+            return
+        new_mode = database.set_user_first_connect_mode(user.id, desired_mode == "1")
         acc_rec = database.is_account_in_rep_scope(rep["id"], account_code) if rep else None
         is_en = bool(acc_rec.get("enable", 1)) if acc_rec else True
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_en, on_first_connect=new_mode, role=role)
+        keyboard = nlp_matcher.build_account_keyboard(
+            account_code, is_enabled=is_en, on_first_connect=new_mode, role=role
+        )
         try:
             await query.edit_message_reply_markup(reply_markup=keyboard)
         except BadRequest:
             pass
         mode_label = "شروع با اولین اتصال" if new_mode else "استاندارد (رول‌اوور)"
-        await query.answer(f"⚙️ حالت تمدید تغییر یافت به: {mode_label}", show_alert=True)
+        await query.answer(f"⚙️ حالت تمدید روی «{mode_label}» تنظیم شد.", show_alert=True)
         return
 
     # Account Verification
