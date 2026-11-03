@@ -12,7 +12,7 @@ def isolated_db(tmp_path, monkeypatch):
             """
             INSERT INTO representatives
                 (rep_code, name, telegram_id, scope_filter, is_active, balance_toman, credit_limit_toman)
-            VALUES ('rep-renew', 'Renewal Representative', 87001, 'all', 1, 0, 600_000)
+            VALUES ('rep-renew', 'Renewal Representative', 87001, 'all', 1, 0, 600000)
             """
         ).lastrowid
     yield rep_id
