@@ -87,6 +87,59 @@ def run_renewal(env):
     ))
 
 
+def invoke_renewal(env, plan_code, gb=20, days=30):
+    _rep_id, user, rep, acc, client = env
+    return asyncio.run(rep_bot.process_account_renewal(
+        user=user,
+        role="rep",
+        rep=rep,
+        acc_record=acc,
+        client_info=client,
+        gb=gb,
+        days=days,
+        plan_code=plan_code,
+        effective_first=False,
+        curr_comment="Pipeline Customer",
+    ))
+
+
+@pytest.mark.parametrize(
+    ("plan_code", "gb", "days", "disable_plan"),
+    [
+        ("missing_99gb_90d", 99, 90, False),
+        ("pipeline_20gb_30d", 20, 30, True),
+        ("pipeline_20gb_30d", 50, 30, False),
+        ("pipeline_20gb_30d", 20, 45, False),
+    ],
+)
+def test_renewal_rejects_unapproved_inactive_or_mismatched_plan_before_any_mutation(
+    renewal_env, monkeypatch, plan_code, gb, days, disable_plan
+):
+    rep_id = renewal_env[0]
+    if disable_plan:
+        with database.get_db() as conn:
+            conn.execute(
+                "UPDATE pricing_plans SET is_active=0 WHERE plan_code=?",
+                (plan_code,),
+            )
+
+    def forbidden_xui(*_args, **_kwargs):
+        raise AssertionError("X-UI must not be called for an invalid renewal plan")
+
+    monkeypatch.setattr(rep_bot, "xui_manager", SimpleNamespace(renew_client=forbidden_xui))
+    ok, message, _keyboard = invoke_renewal(renewal_env, plan_code, gb, days)
+
+    assert ok is False
+    assert "پلن" in message or "مطابقت" in message
+    assert database.get_rep_balance(rep_id) == 0
+    assert renewal_rows() == []
+    assert renewal_locks() == []
+    with database.get_db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM financial_ledger WHERE rep_id=?", (rep_id,)
+        ).fetchone()[0] == 0
+
+
 def test_rep_renewal_pipeline_finalizes_intent_on_explicit_xui_success(renewal_env, monkeypatch):
     monkeypatch.setattr(
         rep_bot, "xui_manager",
