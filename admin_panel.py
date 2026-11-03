@@ -294,8 +294,14 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("امور مالی")
 
     elif action == "pending_receipts":
-        pending_rcps = database.get_all_receipts(status="pending", limit=10)
-        lines = ["⏳ **فیش‌های واریزی در انتظار بررسی و تایید:**\n"]
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        pending_rcps, total_receipts, total_pages = database.get_receipts_paginated(
+            status="pending", page=page, page_size=10
+        )
+        page = min(max(1, page), total_pages)
+        lines = [
+            f"⏳ **فیش‌های در انتظار بررسی ({total_receipts} مورد) — صفحه {page}/{total_pages}:**\n"
+        ]
         extra_btns = []
         if not pending_rcps:
             lines.append("✅ هیچ فیش در انتظار تاییدی در سیستم موجود نیست.")
@@ -316,9 +322,16 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
                     InlineKeyboardButton(f"✅ تایید {r['tracking_code']}", callback_data=f"admin_approve_rcp_{r['tracking_code']}"),
                     InlineKeyboardButton(f"❌ رد {r['tracking_code']}", callback_data=f"admin_reject_rcp_{r['tracking_code']}")
                 ])
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"admin:pending_receipts:{page - 1}"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"admin:pending_receipts:{page + 1}"))
+        if nav:
+            extra_btns.append(nav)
         keyboard = build_back_to_admin_keyboard(extra_btns)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        await query.answer()
+        await query.answer("فیش‌های در انتظار بررسی")
 
     # 6. Pricing Plans Management (Complete CRUD)
     elif action == "plans":
