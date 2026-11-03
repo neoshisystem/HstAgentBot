@@ -1389,8 +1389,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_rcp = int(raw_id) if raw_id.isdigit() else raw_id
         try:
             rcp = database.approve_payment_receipt(target_rcp, user.id, user.full_name or "Admin")
+            if rcp.get("status") != "approved":
+                status = rcp.get("status", "unknown")
+                await query.edit_message_reply_markup(
+                    reply_markup=finance_manager.build_admin_reviewed_keyboard(status)
+                )
+                await query.answer(
+                    f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {status}",
+                    show_alert=True
+                )
+                return
             await query.edit_message_reply_markup(reply_markup=finance_manager.build_admin_reviewed_keyboard("approved"))
-            await query.answer(f"✅ فیش {rcp['tracking_code']} با موفقیت تایید شد.")
+            await query.answer(f"✅ فیش {rcp['tracking_code']} تایید شد.")
             
             try:
                 role_fa = "نماینده" if rcp["role"] == "rep" else "کاربر"
@@ -1415,6 +1425,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_rcp = int(raw_id) if raw_id.isdigit() else raw_id
         try:
             rcp = database.reject_payment_receipt(target_rcp, user.id, "عدم تطابق با گردش حساب")
+            if rcp.get("status") != "rejected":
+                status = rcp.get("status", "unknown")
+                await query.edit_message_reply_markup(
+                    reply_markup=finance_manager.build_admin_reviewed_keyboard(status)
+                )
+                await query.answer(
+                    f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {status}",
+                    show_alert=True
+                )
+                return
             await query.edit_message_reply_markup(reply_markup=finance_manager.build_admin_reviewed_keyboard("rejected"))
             await query.answer(f"❌ فیش {rcp['tracking_code']} رد شد.")
             
