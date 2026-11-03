@@ -36,6 +36,7 @@ class FakeMessage:
 def make_update(data="", role="end_user", user_id=71001, chat_type="private"):
     query = FakeQuery(data)
     message = FakeMessage()
+    query.message = message
     chat = SimpleNamespace(
         id=71001 if chat_type == "private" else -10071001,
         type=chat_type,
