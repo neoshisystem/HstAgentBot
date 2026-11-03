@@ -688,63 +688,78 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     fsm_state = context.user_data.get("fsm_state")
-    if fsm_state == finance_manager.STATE_AWAITING_RECEIPT_PHOTO:
-        photo = update.message.photo[-1]
-        photo_id = photo.file_id
-        caption = update.message.caption or ""
-        tr_code = context.user_data.get("active_receipt_code") or finance_manager.generate_tracking_code()
-        amount = context.user_data.get("deposit_amount", 0)
-        dep_role = context.user_data.get("deposit_role", "end_user" if role == "end_user" else "rep")
-        target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
+    photo = update.message.photo[-1]
+    photo_id = photo.file_id
+    caption = (update.message.caption or "").strip()
+    tr_code = context.user_data.get("active_receipt_code")
+    amount = context.user_data.get("deposit_amount", 0)
+    dep_role = context.user_data.get("deposit_role", "end_user" if role == "end_user" else "rep")
+    target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
 
-        existing_rcp = database.get_payment_receipt(tr_code)
-        if not existing_rcp:
-            database.create_payment_receipt(
-                user_id=user.id,
-                role=dep_role,
-                amount_toman=amount,
-                rep_id=target_rep_id,
-                photo_id=photo_id,
-                note=caption
-            )
-        else:
-            with database.get_db() as conn:
-                conn.execute(
-                    "UPDATE payment_receipts SET receipt_photo_id = ?, receipt_note = ? WHERE id = ?",
-                    (photo_id, caption, existing_rcp["id"])
-                )
-                conn.commit()
-
-        rcp = database.get_payment_receipt(tr_code)
-        context.user_data.pop("fsm_state", None)
-        context.user_data.pop("active_receipt_code", None)
-
-        await update.message.reply_text(
-            f"🚀 **رسید پرداخت شما با موفقیت دریافت و ثبت گردید.**\n\n"
-            f"• کد پیگیری: `{tr_code}`\n"
-            f"• مبلغ واریزی: **{rcp['amount_toman']:,} تومان**\n\n"
-            "به محض بررسی و تایید توسط مدیریت، حساب شما شارژ یا تسویه خواهد شد.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        # Send card to Super Admin
-        admin_tg_id = database.get_setting("admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int)
-        admin_dm_top = database.get_setting("admin_dm_topic_id", default=ADMIN_DM_LOGS_TOPIC_ID, cast_type=int)
-        card_text = finance_manager.format_admin_receipt_card(rcp, user.full_name, user.username)
-        review_keyboard = finance_manager.build_admin_receipt_review_keyboard(rcp["id"])
-
-        if admin_tg_id:
+    # If amount is 0, attempt to parse amount from caption text if provided
+    if amount == 0 and caption:
+        import re
+        digits_match = re.findall(r'\b\d[\d,]{3,}\b', caption)
+        if digits_match:
             try:
-                await context.bot.send_photo(
-                    chat_id=admin_tg_id,
-                    message_thread_id=admin_dm_top if admin_dm_top else None,
-                    photo=photo_id,
-                    caption=card_text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=review_keyboard
-                )
-            except Exception as e:
-                logger.error(f"Failed to forward receipt photo to admin: {e}")
+                amount = int(digits_match[0].replace(',', ''))
+            except ValueError:
+                amount = 0
+
+    if not tr_code:
+        tr_code = finance_manager.generate_tracking_code()
+
+    existing_rcp = database.get_payment_receipt(tr_code)
+    if not existing_rcp:
+        database.create_payment_receipt(
+            user_id=user.id,
+            role=dep_role,
+            amount_toman=amount,
+            rep_id=target_rep_id,
+            photo_id=photo_id,
+            note=caption
+        )
+    else:
+        with database.get_db() as conn:
+            conn.execute(
+                "UPDATE payment_receipts SET receipt_photo_id = ?, receipt_note = ?, amount_toman = CASE WHEN amount_toman = 0 THEN ? ELSE amount_toman END WHERE id = ?",
+                (photo_id, caption, amount, existing_rcp["id"])
+            )
+            conn.commit()
+
+    rcp = database.get_payment_receipt(tr_code)
+    context.user_data.pop("fsm_state", None)
+    context.user_data.pop("active_receipt_code", None)
+    context.user_data.pop("deposit_amount", None)
+
+    amount_disp = f"**{rcp['amount_toman']:,} تومان**" if rcp['amount_toman'] > 0 else "ثبت‌شده روی تصویر فیش"
+
+    await update.message.reply_text(
+        f"🚀 **رسید پرداخت شما با موفقیت دریافت و ثبت گردید.**\n\n"
+        f"• کد پیگیری: `{tr_code}`\n"
+        f"• مبلغ واریزی: {amount_disp}\n\n"
+        "به محض بررسی و تایید توسط مدیریت، حساب شما شارژ یا تسویه خواهد شد.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # Send card to Super Admin
+    admin_tg_id = database.get_setting("admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int)
+    admin_dm_top = database.get_setting("admin_dm_topic_id", default=ADMIN_DM_LOGS_TOPIC_ID, cast_type=int)
+    card_text = finance_manager.format_admin_receipt_card(rcp, user.full_name, user.username)
+    review_keyboard = finance_manager.build_admin_receipt_review_keyboard(rcp["id"])
+
+    if admin_tg_id:
+        try:
+            await context.bot.send_photo(
+                chat_id=admin_tg_id,
+                message_thread_id=admin_dm_top if admin_dm_top else None,
+                photo=photo_id,
+                caption=card_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=review_keyboard
+            )
+        except Exception as e:
+            logger.error(f"Failed to forward receipt photo to admin: {e}")
 
 # --- Message & NLP Router ---
 
@@ -1200,9 +1215,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role != "super_admin":
             await query.answer("⛔️ این عملیات فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
             return
-        rcp_id = int(data.replace("admin_approve_rcp_", ""))
+        raw_id = data.replace("admin_approve_rcp_", "")
+        target_rcp = int(raw_id) if raw_id.isdigit() else raw_id
         try:
-            rcp = database.approve_payment_receipt(rcp_id, user.id, user.full_name or "Admin")
+            rcp = database.approve_payment_receipt(target_rcp, user.id, user.full_name or "Admin")
             await query.edit_message_reply_markup(reply_markup=finance_manager.build_admin_reviewed_keyboard("approved"))
             await query.answer(f"✅ فیش {rcp['tracking_code']} با موفقیت تایید شد.")
             
@@ -1225,9 +1241,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role != "super_admin":
             await query.answer("⛔️ این عملیات فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
             return
-        rcp_id = int(data.replace("admin_reject_rcp_", ""))
+        raw_id = data.replace("admin_reject_rcp_", "")
+        target_rcp = int(raw_id) if raw_id.isdigit() else raw_id
         try:
-            rcp = database.reject_payment_receipt(rcp_id, user.id, "عدم تطابق با گردش حساب")
+            rcp = database.reject_payment_receipt(target_rcp, user.id, "عدم تطابق با گردش حساب")
             await query.edit_message_reply_markup(reply_markup=finance_manager.build_admin_reviewed_keyboard("rejected"))
             await query.answer(f"❌ فیش {rcp['tracking_code']} رد شد.")
             
@@ -1243,6 +1260,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Failed to notify user of receipt rejection: {e}")
         except Exception as e:
             await query.answer(f"❌ خطا در رد فیش: {e}", show_alert=True)
+        return
+
+    if data.startswith("admin_detail_rcp_"):
+        if role != "super_admin":
+            await query.answer("⛔️ این عملیات فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
+            return
+        raw_id = data.replace("admin_detail_rcp_", "")
+        target_rcp = int(raw_id) if raw_id.isdigit() else raw_id
+        rcp = database.get_payment_receipt(target_rcp)
+        if not rcp:
+            await query.answer("❌ فیش یافت نشد.", show_alert=True)
+            return
+        
+        status_fa = "⏳ در انتظار بررسی" if rcp["status"] == "pending" else ("✅ تایید شده" if rcp["status"] == "approved" else "❌ رد شده")
+        role_fa = "نماینده" if rcp["role"] == "rep" else "کاربر نهایی"
+        note_txt = rcp.get('receipt_note') or 'ندارد'
+        text = (
+            f"🧾 **شناسنامه و جزئیات فیش پرداختی:**\n\n"
+            f"• کد پیگیری: `{rcp['tracking_code']}`\n"
+            f"• نقش: **{role_fa}**\n"
+            f"• شناسه کاربر: `{rcp['user_id']}`\n"
+            f"• مبلغ واریزی: **{rcp['amount_toman']:,} تومان**\n"
+            f"• وضعیت فعلی: **{status_fa}**\n"
+            f"• تاریخ ارسال: `{rcp['created_at'][:19]}`\n"
+            f"• توضیحات فرستنده: _{note_txt}_\n"
+        )
+        if rcp["status"] == "pending":
+            btns = [
+                [
+                    InlineKeyboardButton("✅ تایید فیش", callback_data=f"admin_approve_rcp_{rcp['id']}"),
+                    InlineKeyboardButton("❌ رد فیش", callback_data=f"admin_reject_rcp_{rcp['id']}")
+                ]
+            ]
+        else:
+            btns = [[InlineKeyboardButton(status_fa, callback_data="noop")]]
+        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(btns))
+        await query.answer()
         return
 
     if data.startswith("send_receipt_"):

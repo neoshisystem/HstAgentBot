@@ -159,7 +159,7 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
         ])
     
     if role in ("super_admin", "rep"):
-        quick_plans = database.get_pricing_plans(quick_only=True)
+        quick_plans = database.get_pricing_plans(quick_only=True, active_only=True)
         # Pair quick plans dynamically
         row = []
         for p in quick_plans:
@@ -195,7 +195,7 @@ def build_more_plans_keyboard(account_code: str) -> InlineKeyboardMarkup:
     """
     Submenu for expanded pricing plans loaded dynamically from database (is_quick=0).
     """
-    all_plans = database.get_pricing_plans(quick_only=False)
+    all_plans = database.get_pricing_plans(quick_only=False, active_only=True)
     more_plans = [p for p in all_plans if not p.get("is_quick")]
     
     keyboard = []

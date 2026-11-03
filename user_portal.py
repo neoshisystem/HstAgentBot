@@ -48,13 +48,19 @@ def build_user_portal_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_back_to_user_keyboard(extra_buttons=None) -> InlineKeyboardMarkup:
-    """Builds back button returning to the user portal."""
+def build_back_to_user_keyboard(extra_buttons=None, back_callback="user:main") -> InlineKeyboardMarkup:
+    """Builds two-tier navigation back button returning to previous step or user portal."""
     buttons = []
     if extra_buttons:
         for row in extra_buttons:
             buttons.append(row)
-    buttons.append([InlineKeyboardButton("🔙 بازگشت به پورتال کاربری", callback_data="user:main")])
+    if back_callback and back_callback != "user:main":
+        buttons.append([
+            InlineKeyboardButton("↩️ بازگشت به مرحله قبل", callback_data=back_callback),
+            InlineKeyboardButton("🏠 منوی اصلی کاربری", callback_data="user:main")
+        ])
+    else:
+        buttons.append([InlineKeyboardButton("🏠 بازگشت به پورتال کاربری", callback_data="user:main")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -175,7 +181,8 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                     InlineKeyboardButton("❌ قطع اتصال از تلگرام", callback_data=f"user:unlink_confirm:{acc_code}")
                 ],
                 [
-                    InlineKeyboardButton("🔙 بازگشت به سرویس‌های من", callback_data="user:services")
+                    InlineKeyboardButton("↩️ بازگشت به سرویس‌های من", callback_data="user:services"),
+                    InlineKeyboardButton("🏠 منوی اصلی کاربری", callback_data="user:main")
                 ]
             ]
             await query.edit_message_text(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard_btns))
@@ -255,7 +262,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 3. Buy Service (Self-Service)
     elif action == "buy_service":
-        plans = database.get_pricing_plans()
+        plans = database.get_pricing_plans(active_only=True)
         wallet_bal = database.get_user_wallet_balance(user.id)
         lines = [
             "🛒 **خرید سرویس اینترنت آزاد:**\n",
@@ -421,7 +428,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                 if r.get("rejection_reason") and r["status"] == "rejected":
                     lines.append(f"  علت رد: _{r['rejection_reason']}_")
 
-        keyboard = build_back_to_user_keyboard([[InlineKeyboardButton("➕ شارژ مجدد کیف پول", callback_data="user_deposit_start")]])
+        keyboard = build_back_to_user_keyboard([[InlineKeyboardButton("➕ شارژ مجدد کیف پول", callback_data="user_deposit_start")]], back_callback="user:wallet")
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("سوابق پرداخت")
 
@@ -443,7 +450,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 6. Pricing Plans for Users
     elif action == "pricing":
-        plans = database.get_pricing_plans()
+        plans = database.get_pricing_plans(active_only=True)
         lines = ["📋 **لیست تعرفه‌های اینترنت پرسرعت:**\n"]
         for p in plans:
             lines.append(
@@ -459,7 +466,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
     # 7. Renew Account Via Wallet Selection
     elif action == "renew_plans":
         acc_code = parts[2] if len(parts) > 2 else ""
-        plans = database.get_pricing_plans()
+        plans = database.get_pricing_plans(active_only=True)
         wallet_bal = database.get_user_wallet_balance(user.id)
         lines = [
             f"⚡️ **تمدید سرویس {acc_code} با کیف پول:**\n",

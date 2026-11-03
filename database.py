@@ -264,6 +264,10 @@ def init_db():
         if "credit_limit_toman" not in cols_rep:
             cur.execute("ALTER TABLE representatives ADD COLUMN credit_limit_toman INTEGER DEFAULT 5000000")
 
+        cols_plans = [c[1] for c in cur.execute("PRAGMA table_info(pricing_plans)").fetchall()]
+        if "is_active" not in cols_plans:
+            cur.execute("ALTER TABLE pricing_plans ADD COLUMN is_active INTEGER DEFAULT 1")
+
         led_info = cur.execute("PRAGMA table_info(financial_ledger)").fetchall()
         rep_col = next((c for c in led_info if c[1] == "rep_id"), None)
         if rep_col and rep_col[3] == 1:  # notnull is set
@@ -477,14 +481,27 @@ def cancel_reservation(res_id: int, actor_id=0, actor_name="admin"):
     )
     return res_data, new_bal
 
-def get_pricing_plans(quick_only=False):
+def get_pricing_plans(quick_only=False, active_only=False):
     with get_db() as conn:
         cur = conn.cursor()
+        clauses = []
+        if active_only:
+            clauses.append("is_active = 1")
         if quick_only:
-            rows = cur.execute("SELECT * FROM pricing_plans WHERE is_quick = 1 ORDER BY sort_order ASC").fetchall()
-        else:
-            rows = cur.execute("SELECT * FROM pricing_plans ORDER BY sort_order ASC").fetchall()
+            clauses.append("is_quick = 1")
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = cur.execute(f"SELECT * FROM pricing_plans {where_sql} ORDER BY sort_order ASC").fetchall()
         return [dict(r) for r in rows]
+
+def toggle_plan_active(plan_code: str) -> int:
+    with get_db() as conn:
+        cur = conn.cursor()
+        p = cur.execute("SELECT is_active FROM pricing_plans WHERE plan_code = ?", (plan_code,)).fetchone()
+        curr = p["is_active"] if (p and p["is_active"] is not None) else 1
+        new_val = 0 if curr == 1 else 1
+        cur.execute("UPDATE pricing_plans SET is_active = ? WHERE plan_code = ?", (new_val, plan_code))
+        conn.commit()
+        return new_val
 
 def get_plan(plan_code):
     with get_db() as conn:
@@ -753,11 +770,53 @@ def get_rep_balance(rep_id: int) -> int:
 def get_recent_ledger_entries(rep_id=None, limit=10):
     with get_db() as conn:
         cur = conn.cursor()
+        query = """
+        SELECT l.*, 
+               r.name as rep_name,
+               u.full_name as user_full_name,
+               u.username as user_username
+        FROM financial_ledger l
+        LEFT JOIN representatives r ON l.rep_id = r.id
+        LEFT JOIN bot_users u ON l.user_id = u.telegram_id
+        """
         if rep_id:
-            rows = cur.execute("SELECT * FROM financial_ledger WHERE rep_id = ? ORDER BY id DESC LIMIT ?", (rep_id, limit)).fetchall()
+            query += " WHERE l.rep_id = ? ORDER BY l.id DESC LIMIT ?"
+            rows = cur.execute(query, (rep_id, limit)).fetchall()
         else:
-            rows = cur.execute("SELECT * FROM financial_ledger ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            query += " ORDER BY l.id DESC LIMIT ?"
+            rows = cur.execute(query, (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+def get_financial_ledger_paginated(rep_id=None, page=1, page_size=10) -> tuple[list, int, int]:
+    with get_db() as conn:
+        cur = conn.cursor()
+        base_where = "1=1"
+        params = []
+        if rep_id:
+            base_where += " AND l.rep_id = ?"
+            params.append(rep_id)
+        
+        total = cur.execute(f"SELECT COUNT(*) FROM financial_ledger l WHERE {base_where}", tuple(params)).fetchone()[0]
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(max(1, page), total_pages)
+        offset = (page - 1) * page_size
+        
+        query = f"""
+        SELECT l.*, 
+               r.name as rep_name,
+               u.full_name as user_full_name,
+               u.username as user_username
+        FROM financial_ledger l
+        LEFT JOIN representatives r ON l.rep_id = r.id
+        LEFT JOIN bot_users u ON l.user_id = u.telegram_id
+        WHERE {base_where}
+        ORDER BY l.id DESC
+        LIMIT ? OFFSET ?
+        """
+        rows = cur.execute(query, tuple(params + [page_size, offset])).fetchall()
+        return [dict(r) for r in rows], total, total_pages
+
+record_payment = register_rep_payment
 
 # --- User Settings (On First Connect Mode) ---
 

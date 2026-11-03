@@ -47,8 +47,11 @@ def build_admin_receipt_review_keyboard(receipt_id: int) -> InlineKeyboardMarkup
     """Builds Super Admin inline keyboard for receipt verification."""
     keyboard = [
         [
-            InlineKeyboardButton("✅ تایید واریز", callback_data=f"admin_approve_rcp_{receipt_id}"),
+            InlineKeyboardButton("✅ تایید فیش", callback_data=f"admin_approve_rcp_{receipt_id}"),
             InlineKeyboardButton("❌ رد فیش", callback_data=f"admin_reject_rcp_{receipt_id}"),
+        ],
+        [
+            InlineKeyboardButton("👁 مشاهده جزئیات", callback_data=f"admin_detail_rcp_{receipt_id}"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)

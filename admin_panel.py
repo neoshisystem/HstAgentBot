@@ -58,6 +58,50 @@ def build_back_to_admin_keyboard(extra_buttons=None) -> InlineKeyboardMarkup:
 
 # --- Admin Views & Logic ---
 
+def get_build_info() -> dict:
+    """
+    Dynamically extracts live build metadata (version, branch, short commit hash, commit date).
+    """
+    import subprocess
+    import config
+    
+    version = getattr(config, "VERSION", "v4.0.0-beta.3")
+    branch = "beta"
+    short_hash = "unknown"
+    commit_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    try:
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        r_branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo_dir, capture_output=True, text=True, timeout=2
+        )
+        if r_branch.returncode == 0 and r_branch.stdout.strip():
+            branch = r_branch.stdout.strip()
+            
+        r_hash = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_dir, capture_output=True, text=True, timeout=2
+        )
+        if r_hash.returncode == 0 and r_hash.stdout.strip():
+            short_hash = r_hash.stdout.strip()
+            
+        r_date = subprocess.run(
+            ["git", "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M"],
+            cwd=repo_dir, capture_output=True, text=True, timeout=2
+        )
+        if r_date.returncode == 0 and r_date.stdout.strip():
+            commit_date = r_date.stdout.strip()
+    except Exception as e:
+        logger.warning(f"Error fetching dynamic git build info: {e}")
+        
+    return {
+        "version": version,
+        "branch": branch,
+        "short_hash": short_hash,
+        "commit_date": commit_date
+    }
+
 async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message=False):
     with database.get_db() as conn:
         cur = conn.cursor()
@@ -65,6 +109,8 @@ async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYP
         active_accs = cur.execute("SELECT count(*) FROM accounts WHERE enable = 1").fetchone()[0]
         reps = database.get_all_reps()
         total_rep_debt = sum([r["balance_toman"] or 0 for r in reps])
+
+    build = get_build_info()
         
     dashboard_text = (
         "👑 **پیشخوان مدیریت جامع سیستم (Super Admin Dashboard)**\n\n"
@@ -73,6 +119,9 @@ async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYP
         f"• اکانت‌های فعال: **{active_accs}** | غیرفعال: **{total_accs - active_accs}**\n"
         f"• تعداد کل نماینده‌ها: **{len(reps)}**\n"
         f"• مجموع بدهی تجمیعی نماینده‌ها: **{total_rep_debt:,} تومان**\n\n"
+        f"🔖 نسخه سامانه: **{build['version']}** [شاخه `{build['branch']}`]\n"
+        f"⚡️ شناسه بیلد: `commit {build['short_hash']}`\n"
+        f"🕒 زمان استقرار: `{build['commit_date']}`\n\n"
         "👇 بخش مورد نظر را از دکمه‌های زیر انتخاب کنید:"
     )
     
@@ -308,8 +357,24 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         plan_code = sub_action
         database.delete_plan(plan_code)
         await query.answer("🗑 تعرفه با موفقیت حذف گردید.", show_alert=True)
-        await handle_admin_callbacks(update, context)
-
+        # Refresh and return to plans list cleanly
+        plans = database.get_pricing_plans()
+        lines = ["⚙️ **تعرفه‌ها و پلن‌های سیستم:**\n"]
+        extra_btns = []
+        for p in plans:
+            quick_tag = "⚡️ [سریع]" if p.get("is_quick") else "📦"
+            active_tag = "🟢" if p.get("is_active", 1) else "🔴 [غیرفعال]"
+            lines.append(
+                f"{active_tag} {quick_tag} **{p['name']}** (`{p['plan_code']}`):\n"
+                f"   • {p['traffic_gb']}GB / {p['period_days']} روز | خرید: **{p['rep_price']:,} ت** | فروش: **{p['user_price']:,} ت**"
+            )
+            extra_btns.append([
+                InlineKeyboardButton(f"⚙️ مدیریت {p['name']}", callback_data=f"admin:plan_detail:{p['plan_code']}")
+            ])
+        extra_btns.append([InlineKeyboardButton("➕ تعریف پلن جدید", callback_data="admin:prompt_add_plan")])
+        keyboard = build_back_to_admin_keyboard(extra_btns)
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        return
 
     # 4. Scope & Account Transfer
     elif action == "scope":
@@ -325,57 +390,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         keyboard = build_back_to_admin_keyboard(extra_btns)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("اسکوپ اکانت‌ها")
-
-    # 5. Financial Management
-    elif action == "finance":
-        reps = database.get_all_reps()
-        total_debt = sum([r["balance_toman"] or 0 for r in reps])
-        recent_tx = database.get_recent_ledger_entries(limit=5)
-        
-        lines = [
-            "💰 **امور مالی، صورت‌حساب‌ها و تسویه‌حساب:**\n",
-            f"• مجموع بدهی وصول‌نشده نماینده‌ها: **{total_debt:,} تومان**\n",
-            "📊 **مانده به تفکیک نماینده:**"
-        ]
-        extra_btns = []
-        for r in reps:
-            lines.append(f"• {r['name']}: **{r['balance_toman']:,} تومان**")
-            extra_btns.append([
-                InlineKeyboardButton(f"🟢 ثبت واریزی {r['name']}", callback_data=f"admin:prompt_pay:{r['rep_code']}")
-            ])
-            
-        lines.append("\n🕒 **آخرین تراکنش‌های سیستم:**")
-        if not recent_tx:
-            lines.append("• تراکنشی ثبت نشده است.")
-        else:
-            for tx in recent_tx:
-                sign = "🔺" if tx["transaction_type"] == "debit" else "🟢"
-                lines.append(f"{sign} `{tx['created_at'][:16]}` | {tx['amount']:,} ت | {tx['description']}")
-                
-        extra_btns.append([InlineKeyboardButton("📑 مشاهده ۱۰ تراکنش آخر", callback_data="admin:recent_tx:all")])
-        keyboard = build_back_to_admin_keyboard(extra_btns)
-        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        await query.answer("امور مالی")
-
-    # 6. Pricing Plans Management
-    elif action == "plans":
-        plans = database.get_pricing_plans()
-        lines = ["⚙️ **تعرفه‌ها و پلن‌های فعال سیستم:**\n"]
-        extra_btns = []
-        for p in plans:
-            quick_tag = "⚡️ [سریع]" if p["is_quick"] else "📦"
-            lines.append(
-                f"{quick_tag} **{p['name']}** (`{p['plan_code']}`):\n"
-                f"   • خرید نماینده: **{p['rep_price']:,} ت** | فروش کاربر: **{p['user_price']:,} ت**"
-            )
-            extra_btns.append([
-                InlineKeyboardButton(f"✏️ ویرایش نرخ {p['name']}", callback_data=f"admin:prompt_edit_plan:{p['plan_code']}")
-            ])
-            
-        extra_btns.append([InlineKeyboardButton("➕ تعریف پلن جدید", callback_data="admin:prompt_add_plan")])
-        keyboard = build_back_to_admin_keyboard(extra_btns)
-        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        await query.answer("تعرفه‌ها و پلن‌ها")
+        return
 
     # 7. Sync & Server Status
     elif action == "sync":

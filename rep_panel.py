@@ -52,13 +52,19 @@ def build_rep_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_back_to_rep_keyboard(extra_buttons=None) -> InlineKeyboardMarkup:
-    """Builds back button returning to the representative dashboard."""
+def build_back_to_rep_keyboard(extra_buttons=None, back_callback="rep:main") -> InlineKeyboardMarkup:
+    """Builds two-tier navigation back button returning to previous step or representative dashboard."""
     buttons = []
     if extra_buttons:
         for row in extra_buttons:
             buttons.append(row)
-    buttons.append([InlineKeyboardButton("🔙 بازگشت به پیشخوان نماینده", callback_data="rep:main")])
+    if back_callback and back_callback != "rep:main":
+        buttons.append([
+            InlineKeyboardButton("↩️ بازگشت به مرحله قبل", callback_data=back_callback),
+            InlineKeyboardButton("🏠 منوی اصلی نماینده", callback_data="rep:main")
+        ])
+    else:
+        buttons.append([InlineKeyboardButton("🏠 بازگشت به پیشخوان نماینده", callback_data="rep:main")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -108,7 +114,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 2. New Account: Plan Selection
     elif action == "new_acc_plans":
-        plans = database.get_pricing_plans()
+        plans = database.get_pricing_plans(active_only=True)
         lines = [
             "🆕 **صدور اکانت جدید از استخر آزاد:**\n",
             "پلن مورد نظر خود را جهت تخصیص انتخاب فرمایید:\n"
@@ -340,7 +346,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 if r.get("rejection_reason") and r["status"] == "rejected":
                     lines.append(f"  علت رد: _{r['rejection_reason']}_")
 
-        keyboard = build_back_to_rep_keyboard([[InlineKeyboardButton("📤 ثبت فیش واریزی جدید", callback_data="rep_deposit_start")]])
+        keyboard = build_back_to_rep_keyboard([[InlineKeyboardButton("📤 ثبت فیش واریزی جدید", callback_data="rep_deposit_start")]], back_callback="rep:wallet")
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("تاریخچه فیش‌ها")
 
@@ -399,7 +405,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 7. Wholesale Pricing Plans
     elif action == "pricing":
-        plans = database.get_pricing_plans()
+        plans = database.get_pricing_plans(active_only=True)
         lines = ["🏷 **تعرفه‌ها و نرخ‌های همکاری نمایندگی:**\n"]
         for p in plans:
             quick_tag = "⚡️ [سریع]" if p["is_quick"] else "📦"
