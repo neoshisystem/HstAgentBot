@@ -31,7 +31,13 @@ BACKUP_DIR = os.getenv("BACKUP_DIR", str(BASE_DIR / "backups"))
 
 # Public subscription URL configuration. No live-domain fallback is embedded in code.
 SUB_DOMAIN = os.getenv("SUB_DOMAIN", "").strip()
-SUB_PORT = int(os.getenv("SUB_PORT", "443"))
+def _read_subscription_port():
+    try:
+        value = int(os.getenv("SUB_PORT", "443"))
+        return value if 1 <= value <= 65535 else 443
+    except (TypeError, ValueError):
+        return 443
+SUB_PORT = _read_subscription_port()
 SUB_PATH = os.getenv("SUB_PATH", "sub").strip("/")
 
 # Ensure local directories exist
