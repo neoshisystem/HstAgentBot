@@ -153,10 +153,23 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
 
     if pending_res and role in ("super_admin", "rep"):
         res_id = pending_res["id"]
-        keyboard.append([
-            InlineKeyboardButton("🚀 فعال‌سازی فوری رزرو (سوزاندن فعلی)", callback_data=f"force_res:{res_id}:{account_code}"),
-            InlineKeyboardButton("🗑 لغو رزرو و عودت وجه", callback_data=f"cancel_res:{res_id}:{account_code}")
-        ])
+        if role == "rep":
+            # Representative activation/cancellation is explicitly two-step.
+            keyboard.append([
+                InlineKeyboardButton(
+                    "🚀 فعال‌سازی فوری رزرو (تأیید دوم)",
+                    callback_data=f"rep:confirm_force_res:{res_id}:{account_code}"
+                ),
+                InlineKeyboardButton(
+                    "🗑 لغو رزرو و عودت (تأیید دوم)",
+                    callback_data=f"rep:confirm_cancel_res:{res_id}:{account_code}"
+                )
+            ])
+        else:
+            keyboard.append([
+                InlineKeyboardButton("🚀 فعال‌سازی فوری رزرو (سوزاندن فعلی)", callback_data=f"force_res:{res_id}:{account_code}"),
+                InlineKeyboardButton("🗑 لغو رزرو و عودت وجه", callback_data=f"cancel_res:{res_id}:{account_code}")
+            ])
     
     if role in ("super_admin", "rep"):
         quick_plans = database.get_pricing_plans(quick_only=True, active_only=True)
