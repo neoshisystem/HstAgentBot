@@ -373,6 +373,34 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_user_action_intents_user_status "
             "ON user_action_intents(user_id, status, expires_at)"
         )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rep_action_intents (
+            intent_id TEXT PRIMARY KEY,
+            rep_id INTEGER NOT NULL,
+            actor_tg_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('issue')),
+            plan_code TEXT NOT NULL,
+            plan_name TEXT NOT NULL,
+            gb REAL NOT NULL,
+            days INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            customer_name TEXT NOT NULL DEFAULT '',
+            account_code TEXT,
+            account_email TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            operation_lock_key TEXT,
+            operation_lock_token TEXT,
+            result_note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at REAL NOT NULL,
+            FOREIGN KEY (rep_id) REFERENCES representatives(id)
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rep_action_intents_owner_status "
+            "ON rep_action_intents(rep_id, actor_tg_id, status, expires_at)"
+        )
 
         # Migrations check
         cols_acc = [c[1] for c in cur.execute("PRAGMA table_info(accounts)").fetchall()]
@@ -876,12 +904,19 @@ def get_operation_locks() -> list[dict]:
     with get_db() as conn:
         rows = conn.execute("""
             SELECT o.lock_key, o.expires_at, o.created_at,
-                   i.intent_id, i.action_type, i.user_id,
-                   i.account_code, i.status AS intent_status
+                   COALESCE(i.intent_id, r.intent_id) AS intent_id,
+                   COALESCE(i.action_type, r.action_type) AS action_type,
+                   COALESCE(i.user_id, r.actor_tg_id) AS user_id,
+                   COALESCE(i.account_code, r.account_code) AS account_code,
+                   COALESCE(i.status, r.status) AS intent_status,
+                   CASE WHEN r.intent_id IS NOT NULL THEN 'representative' ELSE 'end_user' END AS intent_owner_type
             FROM operation_locks o
             LEFT JOIN user_action_intents i
               ON i.operation_lock_key = o.lock_key
              AND i.operation_lock_token = o.token
+            LEFT JOIN rep_action_intents r
+              ON r.operation_lock_key = o.lock_key
+             AND r.operation_lock_token = o.token
             WHERE o.expires_at > ?
             ORDER BY o.created_at ASC
         """, (time.time(),)).fetchall()
@@ -906,18 +941,25 @@ def resolve_operation_lock(
         if not row:
             return False
         linked_intent = cur.execute("""
-            SELECT intent_id, status FROM user_action_intents
+            SELECT intent_id, status, 'end_user' AS owner_type FROM user_action_intents
+            WHERE operation_lock_key = ?
+              AND operation_lock_token = (
+                  SELECT token FROM operation_locks WHERE lock_key = ?
+              )
+              AND status IN ('processing', 'needs_reconciliation')
+            UNION ALL
+            SELECT intent_id, status, 'representative' AS owner_type FROM rep_action_intents
             WHERE operation_lock_key = ?
               AND operation_lock_token = (
                   SELECT token FROM operation_locks WHERE lock_key = ?
               )
               AND status IN ('processing', 'needs_reconciliation')
             LIMIT 1
-        """, (key, key)).fetchone()
+        """, (key, key, key, key)).fetchone()
         if linked_intent:
             raise ValueError(
-                f"Operation lock belongs to user action intent {linked_intent['intent_id']} "
-                f"({linked_intent['status']}); use /resolveintent so wallet and intent state are reconciled together"
+                f"Operation lock belongs to {linked_intent['owner_type']} action intent {linked_intent['intent_id']} "
+                f"({linked_intent['status']}); resolve the linked intent so ledger and intent state are reconciled together"
             )
         cur.execute(
             "DELETE FROM operation_locks WHERE lock_key = ?",
@@ -1781,6 +1823,273 @@ def mark_user_action_intent_for_reconciliation(
         if cur.rowcount != 1:
             raise RuntimeError("Could not mark user action for reconciliation")
         return True
+
+
+def create_rep_action_intent(
+    rep_id: int,
+    actor_tg_id: int,
+    plan_code: str,
+    plan_name: str,
+    gb: float,
+    days: int,
+    amount: int,
+    ttl_seconds: int = 900,
+) -> str:
+    """Create one expiring representative issuance intent for one confirmation flow."""
+    plan_code = str(plan_code or "").strip()
+    gb, days, amount = float(gb), int(days), int(amount)
+    if not plan_code or gb <= 0 or days <= 0 or amount <= 0:
+        raise ValueError("A valid positive representative plan snapshot is required")
+    intent_id = secrets.token_hex(16)
+    with get_db() as conn:
+        cur = conn.cursor()
+        rep = cur.execute(
+            "SELECT is_active FROM representatives WHERE id = ?", (int(rep_id),)
+        ).fetchone()
+        if not rep or not bool(rep["is_active"]):
+            raise ValueError("Representative is inactive or does not exist")
+        cur.execute("""
+            INSERT INTO rep_action_intents
+            (intent_id, rep_id, actor_tg_id, action_type, plan_code, plan_name,
+             gb, days, amount, status, expires_at)
+            VALUES (?, ?, ?, 'issue', ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            intent_id, int(rep_id), int(actor_tg_id), plan_code, str(plan_name),
+            gb, days, amount, time.time() + max(60, int(ttl_seconds))
+        ))
+    return intent_id
+
+
+def set_rep_action_intent_customer_name(
+    intent_id: str, rep_id: int, actor_tg_id: int, customer_name: str
+) -> bool:
+    """Update the display/customer comment only while the intent remains pending."""
+    name = str(customer_name or "").strip()[:100]
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET customer_name = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND rep_id = ? AND actor_tg_id = ? AND status = 'pending'
+        """, (name, str(intent_id), int(rep_id), int(actor_tg_id)))
+        return cur.rowcount == 1
+
+
+def get_rep_action_intent(intent_id: str, rep_id: int, actor_tg_id: int) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT * FROM rep_action_intents
+            WHERE intent_id = ? AND rep_id = ? AND actor_tg_id = ?
+        """, (str(intent_id or ""), int(rep_id), int(actor_tg_id))).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result.pop("operation_lock_token", None)
+        return result
+
+
+def begin_rep_action_intent(intent_id: str, rep_id: int, actor_tg_id: int) -> dict:
+    """Atomically validate plan/rep, debit ledger and acquire a durable operation lock."""
+    key = str(intent_id or "").strip()
+    if not key:
+        return {"status": "not_found"}
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM rep_action_intents
+            WHERE intent_id = ? AND rep_id = ? AND actor_tg_id = ?
+        """, (key, int(rep_id), int(actor_tg_id))).fetchone()
+        if not row:
+            return {"status": "not_found"}
+        intent = dict(row)
+        if intent["status"] != "pending":
+            return {"status": "already_processed", "intent_status": intent["status"]}
+        now = time.time()
+        if float(intent["expires_at"]) <= now:
+            cur.execute(
+                "UPDATE rep_action_intents SET status='expired', updated_at=CURRENT_TIMESTAMP "
+                "WHERE intent_id=? AND status='pending'", (key,)
+            )
+            return {"status": "expired"}
+
+        plan = cur.execute("""
+            SELECT name, gb, days, rep_price, is_active FROM pricing_plans
+            WHERE plan_code = ?
+        """, (intent["plan_code"],)).fetchone()
+        if (
+            not plan or not int(plan["is_active"] or 0)
+            or int(plan["rep_price"]) != int(intent["amount"])
+            or str(plan["name"]) != str(intent["plan_name"])
+            or float(plan["gb"]) != float(intent["gb"])
+            or int(plan["days"]) != int(intent["days"])
+        ):
+            cur.execute(
+                "UPDATE rep_action_intents SET status='cancelled', result_note=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE intent_id=? AND status='pending'",
+                ("Plan changed or became inactive after the menu was displayed", key)
+            )
+            return {"status": "plan_changed"}
+
+        lock_key = f"rep-issue-intent:{key}"
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (now,))
+        if cur.execute(
+            "SELECT 1 FROM operation_locks WHERE lock_key=?", (lock_key,)
+        ).fetchone():
+            return {"status": "busy"}
+
+        new_balance = _record_rep_ledger_entry(
+            cur,
+            int(rep_id),
+            "",
+            "",
+            intent["plan_code"],
+            "debit",
+            int(intent["amount"]),
+            f"پیش‌پرداخت صدور {intent['plan_name']} (در انتظار تأیید پنل)",
+            int(actor_tg_id),
+            "Representative",
+        )
+        _insert_audit(
+            cur, int(rep_id), "", "", "rep_issue_intent_started",
+            int(actor_tg_id), "Representative",
+            {"intent_id": key, "plan_code": intent["plan_code"], "amount": int(intent["amount"]),
+             "balance_after": new_balance},
+            "success"
+        )
+        lock_token = uuid.uuid4().hex
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (lock_key, lock_token, 253402300799.0)
+        )
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status='processing', operation_lock_key=?, operation_lock_token=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND rep_id=? AND actor_tg_id=? AND status='pending'
+        """, (lock_key, lock_token, key, int(rep_id), int(actor_tg_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not atomically claim representative action intent")
+        intent["status"] = "processing"
+        return {
+            "status": "started", "intent": intent, "lock_key": lock_key,
+            "lock_token": lock_token, "new_balance": new_balance,
+        }
+
+
+def _verify_rep_action_lock(cur, intent_id: str, rep_id: int, actor_tg_id: int, lock_key: str, token: str):
+    intent = cur.execute("""
+        SELECT * FROM rep_action_intents
+        WHERE intent_id=? AND rep_id=? AND actor_tg_id=?
+    """, (str(intent_id), int(rep_id), int(actor_tg_id))).fetchone()
+    if not intent or intent["status"] != "processing":
+        raise ValueError("Representative action intent is not processing")
+    if str(intent["operation_lock_key"] or "") != str(lock_key):
+        raise ValueError("Representative intent lock key mismatch")
+    if not secrets.compare_digest(str(intent["operation_lock_token"] or ""), str(token)):
+        raise ValueError("Representative intent lock ownership mismatch")
+    lock = cur.execute("SELECT token FROM operation_locks WHERE lock_key=?", (str(lock_key),)).fetchone()
+    if not lock or not secrets.compare_digest(str(lock["token"]), str(token)):
+        raise ValueError("Operation lock ownership mismatch")
+    return intent
+
+
+def complete_rep_action_intent(
+    intent_id: str, rep_id: int, actor_tg_id: int, lock_key: str, token: str,
+    account_code: str, account_email: str,
+) -> bool:
+    """Finalize a successful representative issuance and release the exact lock."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent = _verify_rep_action_lock(cur, intent_id, rep_id, actor_tg_id, lock_key, token)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?", (str(lock_key), str(token))
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release representative issuance lock")
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status='succeeded', account_code=?, account_email=?,
+                operation_lock_key=NULL, operation_lock_token=NULL,
+                result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status='processing'
+        """, (
+            str(account_code), str(account_email),
+            f"Issued account {account_code}"[:500], str(intent_id)
+        ))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative issuance intent")
+        _insert_audit(
+            cur, int(rep_id), str(account_code), str(account_email), "rep_issue_intent_succeeded",
+            int(actor_tg_id), "Representative",
+            {"intent_id": str(intent_id), "plan_code": intent["plan_code"], "amount": int(intent["amount"])},
+            "success"
+        )
+        return True
+
+
+def mark_rep_action_intent_for_reconciliation(
+    intent_id: str, rep_id: int, actor_tg_id: int,
+    lock_key: str, token: str, result_note: str,
+) -> bool:
+    note = str(result_note or "").strip()
+    if len(note) < 5:
+        raise ValueError("A reconciliation note is required")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        _verify_rep_action_lock(cur, intent_id, rep_id, actor_tg_id, lock_key, token)
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status='needs_reconciliation', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status='processing'
+        """, (note[:500], str(intent_id)))
+        return cur.rowcount == 1
+
+
+def refund_rep_action_intent(
+    intent_id: str, rep_id: int, actor_tg_id: int,
+    lock_key: str, token: str, actor_name: str = "Representative",
+) -> int:
+    """Atomically credit back a definite failed representative precharge and consume intent."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent = _verify_rep_action_lock(cur, intent_id, rep_id, actor_tg_id, lock_key, token)
+        new_balance = _record_rep_ledger_entry(
+            cur, int(rep_id), "", "", intent["plan_code"], "credit",
+            int(intent["amount"]),
+            f"استرداد پیش‌پرداخت پس از شکست قطعی صدور {intent['plan_code']}",
+            int(actor_tg_id), str(actor_name or "Representative"),
+        )
+        cur.execute("DELETE FROM operation_locks WHERE lock_key=? AND token=?", (str(lock_key), str(token)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume representative issuance lock")
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status='refunded', operation_lock_key=NULL, operation_lock_token=NULL,
+                result_note='Definite external allocation failure; precharge refunded',
+                updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status='processing'
+        """, (str(intent_id),))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative issuance refund")
+        _insert_audit(
+            cur, int(rep_id), "", "", "rep_issue_intent_refunded",
+            int(actor_tg_id), str(actor_name or "Representative"),
+            {"intent_id": str(intent_id), "amount": int(intent["amount"]), "new_balance": new_balance},
+            "success"
+        )
+        return new_balance
+
+
+def mark_rep_action_intent_for_reconciliation_from_admin(
+    intent_id: str, rep_id: int, actor_tg_id: int, lock_key: str, token: str, note: str
+):
+    return mark_rep_action_intent_for_reconciliation(
+        intent_id, rep_id, actor_tg_id, lock_key, token, note
+    )
 
 
 def resolve_user_action_intent(
