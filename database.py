@@ -348,6 +348,30 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
+        CREATE TABLE IF NOT EXISTS user_action_intents (
+            intent_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('buy', 'renew')),
+            account_code TEXT,
+            account_email TEXT,
+            plan_code TEXT NOT NULL,
+            plan_name TEXT NOT NULL,
+            gb REAL NOT NULL,
+            days INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            operation_lock_key TEXT,
+            operation_lock_token TEXT,
+            result_note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at REAL NOT NULL
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_action_intents_user_status "
+            "ON user_action_intents(user_id, status, expires_at)"
+        )
 
         # Migrations check
         cols_acc = [c[1] for c in cur.execute("PRAGMA table_info(accounts)").fetchall()]
@@ -1464,6 +1488,280 @@ def record_user_payment(user_id: int, amount: int, description: str, actor_id: i
         return _credit_user_wallet(cur, user_id, amount, description, actor_id, actor_name)
 
 
+
+def create_user_action_intent(
+    user_id: int,
+    action_type: str,
+    plan_code: str,
+    plan_name: str,
+    gb: float,
+    days: int,
+    amount: int,
+    account_code: str = "",
+    account_email: str = "",
+    ttl_seconds: int = 900,
+) -> str:
+    """Create one opaque, expiring idempotency key for a single user menu action."""
+    action = str(action_type or "").strip().lower()
+    if action not in ("buy", "renew"):
+        raise ValueError("Unsupported user action type")
+    amount, days, gb = int(amount), int(days), float(gb)
+    if amount <= 0 or days <= 0 or gb <= 0 or not str(plan_code or "").strip():
+        raise ValueError("A valid plan snapshot and positive price are required")
+    code = str(account_code or "").strip()
+    email = str(account_email or "").strip()
+    if action == "renew" and (not code or not email):
+        raise ValueError("Renewal intent requires the canonical account code and email")
+
+    intent_id = secrets.token_hex(16)
+    expires_at = time.time() + max(60, int(ttl_seconds))
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO user_action_intents
+            (intent_id, user_id, action_type, account_code, account_email,
+             plan_code, plan_name, gb, days, amount, status, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            intent_id, int(user_id), action, code or None, email or None,
+            str(plan_code), str(plan_name), gb, days, amount, expires_at
+        ))
+    return intent_id
+
+
+def get_user_action_intent(intent_id: str, user_id: int) -> dict | None:
+    """Fetch an intent only for its owning Telegram user; never expose lock tokens."""
+    key = str(intent_id or "").strip()
+    if not key:
+        return None
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_action_intents WHERE intent_id = ? AND user_id = ?",
+            (key, int(user_id))
+        ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result.pop("operation_lock_token", None)
+        return result
+
+
+def begin_user_action_intent(
+    intent_id: str,
+    user_id: int,
+    expected_action: str,
+) -> dict:
+    """Atomically consume an intent, acquire its durable lock and debit the wallet.
+
+    A consumed token is never executable again. A new menu creates a new token,
+    allowing a deliberate later purchase or renewal of the same plan.
+    """
+    key = str(intent_id or "").strip()
+    action = str(expected_action or "").strip().lower()
+    if not key or action not in ("buy", "renew"):
+        raise ValueError("A valid intent token and action are required")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT * FROM user_action_intents WHERE intent_id = ? AND user_id = ?",
+            (key, int(user_id))
+        ).fetchone()
+        if not row:
+            return {"status": "not_found"}
+        intent = dict(row)
+        if intent["action_type"] != action:
+            return {"status": "wrong_action"}
+        if intent["status"] != "pending":
+            return {"status": "already_processed", "intent_status": intent["status"]}
+        now = time.time()
+        if float(intent["expires_at"]) <= now:
+            cur.execute(
+                "UPDATE user_action_intents SET status = 'expired', updated_at = CURRENT_TIMESTAMP "
+                "WHERE intent_id = ? AND status = 'pending'",
+                (key,)
+            )
+            return {"status": "expired"}
+
+        plan = cur.execute(
+            "SELECT name, gb, days, user_price, is_active FROM pricing_plans WHERE plan_code = ?",
+            (intent["plan_code"],)
+        ).fetchone()
+        if (
+            not plan
+            or not int(plan["is_active"] or 0)
+            or int(plan["user_price"]) != int(intent["amount"])
+            or str(plan["name"]) != str(intent["plan_name"])
+            or float(plan["gb"]) != float(intent["gb"])
+            or int(plan["days"]) != int(intent["days"])
+        ):
+            cur.execute(
+                "UPDATE user_action_intents SET status = 'cancelled', result_note = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE intent_id = ? AND status = 'pending'",
+                ("Plan changed or became inactive after the menu was displayed", key)
+            )
+            return {"status": "plan_changed"}
+
+        if action == "renew":
+            owner = cur.execute("""
+                SELECT 1 FROM accounts
+                WHERE owner_tg_id = ?
+                  AND LOWER(account_code) = LOWER(?)
+                  AND LOWER(email) = LOWER(?)
+                LIMIT 1
+            """, (
+                int(user_id), str(intent["account_code"] or ""),
+                str(intent["account_email"] or "")
+            )).fetchone()
+            if not owner:
+                cur.execute(
+                    "UPDATE user_action_intents SET status = 'cancelled', result_note = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE intent_id = ? AND status = 'pending'",
+                    ("Account ownership changed or could not be re-verified", key)
+                )
+                return {"status": "not_owned"}
+            lock_key = f"account-renewal:{str(intent['account_code']).lower()}"
+        else:
+            lock_key = f"user-buy:{int(user_id)}"
+
+        # The lock and wallet mutation are in this same transaction. A second
+        # intent that collides with an active operation is cancelled; it must
+        # not unexpectedly execute later from a stale button.
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (now,))
+        existing = cur.execute(
+            "SELECT 1 FROM operation_locks WHERE lock_key = ?", (lock_key,)
+        ).fetchone()
+        if existing:
+            cur.execute(
+                "UPDATE user_action_intents SET status = 'cancelled', result_note = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE intent_id = ? AND status = 'pending'",
+                ("Another operation currently owns the account/user lock; reopen the menu", key)
+            )
+            return {"status": "busy"}
+
+        wallet = cur.execute(
+            "SELECT balance_toman FROM user_wallets WHERE user_id = ?",
+            (int(user_id),)
+        ).fetchone()
+        current = int(wallet["balance_toman"] or 0) if wallet else 0
+        amount = int(intent["amount"])
+        if current < amount:
+            return {"status": "insufficient_funds", "balance": current, "required": amount}
+
+        new_balance = current - amount
+        cur.execute("""
+            UPDATE user_wallets SET balance_toman = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND balance_toman >= ?
+        """, (new_balance, int(user_id), amount))
+        if cur.rowcount != 1:
+            return {"status": "insufficient_funds", "balance": current, "required": amount}
+
+        cur.execute("""
+            INSERT INTO financial_ledger
+            (rep_id, user_id, account_code, email, plan_code, transaction_type,
+             amount, balance_after, description, actor_id, actor_name)
+            VALUES (NULL, ?, ?, ?, ?, 'debit', ?, ?, ?, ?, 'User')
+        """, (
+            int(user_id), intent["account_code"], intent["account_email"],
+            intent["plan_code"], amount,
+            new_balance,
+            (f"خرید سرویس {intent['plan_name']}" if action == "buy" else
+             f"تمدید سرویس {intent['account_code']} ({intent['plan_name']})"),
+            int(user_id)
+        ))
+
+        lock_token = uuid.uuid4().hex
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (lock_key, lock_token, 253402300799.0)
+        )
+        cur.execute("""
+            UPDATE user_action_intents
+            SET status = 'processing', operation_lock_key = ?, operation_lock_token = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND user_id = ? AND status = 'pending'
+        """, (lock_key, lock_token, key, int(user_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not atomically claim the user action intent")
+
+        intent["status"] = "processing"
+        return {
+            "status": "started",
+            "intent": intent,
+            "lock_key": lock_key,
+            "lock_token": lock_token,
+            "new_balance": new_balance,
+        }
+
+
+def _verify_user_action_lock(cur, intent_id: str, user_id: int, lock_key: str, token: str):
+    intent = cur.execute(
+        "SELECT * FROM user_action_intents WHERE intent_id = ? AND user_id = ?",
+        (str(intent_id), int(user_id))
+    ).fetchone()
+    if not intent or intent["status"] != "processing":
+        raise ValueError("User action intent is not in processing state")
+    if str(intent["operation_lock_key"] or "") != str(lock_key):
+        raise ValueError("User action intent lock key mismatch")
+    if not secrets.compare_digest(str(intent["operation_lock_token"] or ""), str(token)):
+        raise ValueError("User action intent lock ownership mismatch")
+    lock = cur.execute(
+        "SELECT token FROM operation_locks WHERE lock_key = ?", (str(lock_key),)
+    ).fetchone()
+    if not lock or not secrets.compare_digest(str(lock["token"]), str(token)):
+        raise ValueError("Operation lock ownership mismatch")
+    return intent
+
+
+def complete_user_action_intent(
+    intent_id: str, user_id: int, lock_key: str, token: str, result_note: str = ""
+) -> bool:
+    """Atomically mark a user action successful and release its exact owned lock."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        _verify_user_action_lock(cur, intent_id, user_id, lock_key, token)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ? AND token = ?",
+            (str(lock_key), str(token))
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release the owned operation lock")
+        cur.execute("""
+            UPDATE user_action_intents
+            SET status = 'succeeded', operation_lock_key = NULL,
+                operation_lock_token = NULL, result_note = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND user_id = ? AND status = 'processing'
+        """, (str(result_note or "")[:500], str(intent_id), int(user_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize the user action intent")
+        return True
+
+
+def mark_user_action_intent_for_reconciliation(
+    intent_id: str, user_id: int, lock_key: str, token: str, result_note: str
+) -> bool:
+    """Mark an uncertain external outcome without releasing its persistent lock."""
+    note = str(result_note or "").strip()
+    if len(note) < 5:
+        raise ValueError("A reconciliation note is required")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        _verify_user_action_lock(cur, intent_id, user_id, lock_key, token)
+        cur.execute("""
+            UPDATE user_action_intents
+            SET status = 'needs_reconciliation', result_note = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND user_id = ? AND status = 'processing'
+        """, (note[:500], str(intent_id), int(user_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not mark user action for reconciliation")
+        return True
+
+
 def refund_user_wallet_and_release_operation_lock(
     user_id: int,
     amount: int,
@@ -1472,6 +1770,7 @@ def refund_user_wallet_and_release_operation_lock(
     actor_name: str,
     lock_key: str,
     token: str,
+    intent_id: str | None = None,
 ) -> int:
     """Atomically refund a user and consume the exact operation-lock token.
 
@@ -1490,12 +1789,17 @@ def refund_user_wallet_and_release_operation_lock(
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
-        lock = cur.execute(
-            "SELECT token FROM operation_locks WHERE lock_key = ?",
-            (key,),
-        ).fetchone()
-        if not lock or not secrets.compare_digest(str(lock["token"]), lock_token):
-            raise ValueError("Operation lock ownership mismatch; refund was not applied")
+        if intent_id is not None:
+            intent = _verify_user_action_lock(cur, intent_id, user_id, key, lock_token)
+            if int(intent["amount"]) != amount:
+                raise ValueError("Refund amount does not match the consumed user action intent")
+        else:
+            lock = cur.execute(
+                "SELECT token FROM operation_locks WHERE lock_key = ?",
+                (key,),
+            ).fetchone()
+            if not lock or not secrets.compare_digest(str(lock["token"]), lock_token):
+                raise ValueError("Operation lock ownership mismatch; refund was not applied")
 
         new_balance = _credit_user_wallet(
             cur, user_id, amount, description, actor_id, actor_name
@@ -1506,6 +1810,19 @@ def refund_user_wallet_and_release_operation_lock(
         )
         if cur.rowcount != 1:
             raise RuntimeError("Could not atomically resolve the owned operation lock")
+        if intent_id is not None:
+            cur.execute("""
+                UPDATE user_action_intents
+                SET status = 'refunded', operation_lock_key = NULL,
+                    operation_lock_token = NULL, result_note = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE intent_id = ? AND user_id = ? AND status = 'processing'
+            """, (
+                str(description or "Refunded after definite external failure")[:500],
+                str(intent_id), int(user_id)
+            ))
+            if cur.rowcount != 1:
+                raise RuntimeError("Could not finalize refunded user action intent")
         return new_balance
 def deduct_user_wallet(user_id: int, amount: int, description: str, plan_code: str = "", account_code: str = "", email: str = "") -> tuple[bool, int]:
     """Atomically debit a positive amount; return (success, resulting balance)."""
