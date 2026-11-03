@@ -227,7 +227,6 @@ async def setprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not _is_private_super_admin(update):
         return
-        return
     args = context.args
     if len(args) < 3:
         await update.message.reply_text("⚠️ فرمت دستور:\n`/setprice <plan_code> <rep_price> <user_price>`\nمثال:\n`/setprice 20gb_30d 75000 130000`", parse_mode=ParseMode.MARKDOWN)
@@ -818,6 +817,10 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id if update.message else None
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
     if role == "unauthorized_group":
+        return
+    if role == "super_admin" and rep is None and chat.type != "private":
+        return
+    if role not in ("super_admin", "rep") or (role == "rep" and not rep):
         return
 
     if role == "super_admin" and rep is None:
