@@ -387,3 +387,31 @@ def test_user_renewal_conflicting_response_is_not_refunded(monkeypatch):
     assert unresolved
     assert not refunded
     assert query.answers and "کافی نیست" in query.answers[-1][0]
+
+def test_rep_reservation_local_state_write_failure_retains_activation_lease(monkeypatch):
+    rep = {"id": 5, "name": "Rep 5", "scope_filter": "all"}
+    stored = {
+        "id": 7, "rep_id": 5, "status": "pending", "account_code": "ABCD",
+        "email": "abcd@example.test", "gb": 20, "days": 30, "on_first_connect": 0,
+    }
+    events = []
+    monkeypatch.setattr(rep_panel.database, "get_reservation_by_id", lambda _rid: stored)
+    monkeypatch.setattr(rep_panel.database, "acquire_operation_lock", lambda *a, **k: "lease")
+    monkeypatch.setattr(
+        rep_panel.database, "release_operation_lock",
+        lambda *a, **k: events.append("released"),
+    )
+    monkeypatch.setattr(
+        rep_panel.database, "activate_reservation",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected state write failure")),
+    )
+    monkeypatch.setattr(
+        rep_panel, "xui_manager",
+        SimpleNamespace(renew_client=lambda *a, **k: {"status": "success"}),
+    )
+    update, query = callback_update("rep:do_force_res:7:ABCD", user_id=88001)
+
+    asyncio.run(rep_panel.handle_rep_callbacks(update, SimpleNamespace(user_data={}), rep))
+
+    assert not events
+    assert query.answers and "ثبت محلی انجام نشد" in query.answers[-1][0]
