@@ -37,7 +37,7 @@ def build_card_payment_keyboard(tracking_code: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📸 ارسال تصویر فیش واریزی", callback_data=f"send_receipt_{tracking_code}"),
         ],
         [
-            InlineKeyboardButton("❌ انصراف", callback_data="cancel_payment"),
+            InlineKeyboardButton("❌ انصراف", callback_data=f"cancel_payment:{tracking_code}"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
