@@ -375,7 +375,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         lock_key = f"user-buy:{user.id}"
-        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=300)
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
             await query.answer("⏳ درخواست خرید دیگری در حال پردازش است یا نتیجه درخواست قبلی نیازمند بررسی است.", show_alert=True)
             return
@@ -608,7 +608,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         lock_key = f"user-renew:{user.id}:{acc_code.lower()}"
-        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=300)
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
             await query.answer("⏳ درخواست تمدید دیگری برای این سرویس در حال پردازش است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
             return
