@@ -63,6 +63,29 @@ def build_admin_reviewed_keyboard(status: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data="noop")]])
 
 
+async def reply_with_receipt_detail(message, receipt: dict, text: str, reply_markup=None):
+    """Show the persisted receipt image when available, with a text fallback."""
+    photo_id = receipt.get("receipt_photo_id")
+    if photo_id:
+        try:
+            return await message.reply_photo(
+                photo=photo_id,
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            logger.exception(
+                "Could not replay stored receipt image for receipt %s; using text fallback",
+                receipt.get("id") or receipt.get("tracking_code"),
+            )
+    return await message.reply_text(
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
+    )
+
+
 def build_wallet_menu_keyboard(balance_toman: int, is_rep: bool = False) -> InlineKeyboardMarkup:
     """Builds interactive wallet management keyboard."""
     if is_rep:
