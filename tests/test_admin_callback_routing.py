@@ -49,9 +49,8 @@ def test_admin_dashboard_is_private_chat_only(monkeypatch):
     )
     asyncio.run(admin_panel.show_admin_dashboard(update, SimpleNamespace(), edit_message=False))
     assert message.replies == []
-    assert query.answers == []
-    # Message-based dashboard entry has no callback; it receives a clear private-DM denial.
-    assert any("خصوصی" in text for text, _ in message.replies) or query.answers
+    assert query.answers and query.answers[0][1] is True
+    assert "خصوصی" in query.answers[0][0]
 
 
 def test_admin_callback_handler_rejects_group_before_processing(monkeypatch):
