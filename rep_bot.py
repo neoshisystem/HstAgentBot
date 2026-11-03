@@ -1247,13 +1247,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if database.is_user_blocked(user.id):
         await update.message.reply_text("⛔️ دسترسی شما به این بات مسدود شده است.")
         return
+    if role not in ("end_user", "rep") or (role == "rep" and not rep):
+        await update.message.reply_text("⛔️ ارسال فیش فقط برای نقش کاربر نهایی یا نماینده مجاز است.")
+        return
 
     photo_id = update.message.photo[-1].file_id
     caption = (update.message.caption or "").strip()
     tr_code = context.user_data.get("active_receipt_code")
     amount = int(context.user_data.get("deposit_amount") or 0)
-    dep_role = context.user_data.get("deposit_role") or ("rep" if role == "rep" else "end_user")
-    target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
+    dep_role = context.user_data.get("deposit_role") or role
+    if dep_role != role:
+        await update.message.reply_text(
+            "⛔️ این فرایند ارسال فیش با نقش فعلی شما آغاز نشده است؛ از پنل همان نقش دوباره اقدام کنید."
+        )
+        return
+    target_rep_id = rep["id"] if role == "rep" else None
 
     if amount <= 0 and caption:
         import re
@@ -1278,6 +1286,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 or int(receipt["user_id"]) != int(user.id)
                 or receipt["status"] != "pending"
                 or receipt["role"] != dep_role
+                or (
+                    role == "rep"
+                    and int(receipt.get("rep_id") or -1) != int(rep["id"])
+                )
             ):
                 await update.message.reply_text("⛔️ فیش در انتظار ارسال برای این حساب یافت نشد یا دیگر قابل ویرایش نیست.")
                 return
@@ -1396,6 +1408,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check Financial FSM State (Card amount or rejection reason)
     fsm_state = context.user_data.get("fsm_state")
     if fsm_state == finance_manager.STATE_AWAITING_RECEIPT_AMOUNT:
+        expected_deposit_role = context.user_data.get("deposit_role") or role
+        if (
+            role not in ("end_user", "rep")
+            or expected_deposit_role != role
+            or (role == "rep" and not rep)
+        ):
+            await update.message.reply_text(
+                "⛔️ این فرایند شارژ متعلق به نقش فعلی شما نیست؛ از پنل همان نقش دوباره اقدام کنید."
+            )
+            return
         text_clean = msg_text.replace(",", "").strip()
         if text_clean.isdigit() and int(text_clean) > 0:
             amount = int(text_clean)
@@ -1990,12 +2012,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("send_receipt_"):
         tr_code = data.replace("send_receipt_", "")
+        if role not in ("end_user", "rep") or (role == "rep" and not rep):
+            await query.answer("⛔️ بارگذاری فیش فقط از مسیر کیف پول نقش معتبر مجاز است.", show_alert=True)
+            return
         receipt = database.get_payment_receipt(tr_code)
         if (
             not receipt or int(receipt["user_id"]) != int(user.id)
             or receipt["status"] != "pending"
+            or receipt.get("role") != role
+            or (
+                role == "rep"
+                and int(receipt.get("rep_id") or -1) != int(rep["id"])
+            )
         ):
-            await query.answer("⛔️ این شناسه فیش متعلق به شما نیست یا دیگر در انتظار ارسال نیست.", show_alert=True)
+            await query.answer("⛔️ این فیش متعلق به نقش/حساب فعلی شما نیست یا دیگر در انتظار ارسال نیست.", show_alert=True)
             return
         context.user_data["active_receipt_code"] = receipt["tracking_code"]
         context.user_data["deposit_amount"] = receipt["amount_toman"]
@@ -2011,8 +2041,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data in ("wallet_charge_start", "rep_deposit_start", "user_deposit_start"):
+        expected_role = "rep" if data == "rep_deposit_start" else "end_user"
+        if role != expected_role or (expected_role == "rep" and not rep):
+            await query.answer(
+                "⛔️ این دکمه شارژ متعلق به نقش دیگری است؛ از پنل حساب فعلی خود اقدام کنید.",
+                show_alert=True
+            )
+            return
         context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_AMOUNT
-        context.user_data["deposit_role"] = "rep" if data == "rep_deposit_start" else "end_user"
+        context.user_data["deposit_role"] = expected_role
         await query.answer("مبلغ را وارد کنید.")
         await query.message.reply_text(
             "💳 **لطفاً مبلغ مورد نظر جهت پرداخت را به تومان وارد کنید:**\n"
@@ -2029,6 +2066,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_code = context.user_data.get("active_receipt_code")
 
         if target_code:
+            if role not in ("end_user", "rep") or (role == "rep" and not rep):
+                await query.answer(
+                    "⛔️ این درخواست پرداخت متعلق به نقش فعلی شما نیست.",
+                    show_alert=True
+                )
+                return
+            stored_receipt = database.get_payment_receipt(target_code)
+            if (
+                not stored_receipt
+                or int(stored_receipt.get("user_id") or -1) != int(user.id)
+                or stored_receipt.get("role") != role
+                or (
+                    role == "rep"
+                    and int(stored_receipt.get("rep_id") or -1) != int(rep["id"])
+                )
+            ):
+                await query.answer(
+                    "⛔️ این درخواست پرداخت متعلق به نقش/حساب فعلی شما نیست.",
+                    show_alert=True
+                )
+                return
             try:
                 receipt = database.cancel_payment_receipt(target_code, user.id)
             except (ValueError, PermissionError):
@@ -2068,6 +2126,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if context.user_data.get("fsm_state") == finance_manager.STATE_AWAITING_RECEIPT_AMOUNT:
+            expected_role = context.user_data.get("deposit_role") or role
+            if role not in ("end_user", "rep") or expected_role != role or (role == "rep" and not rep):
+                await query.answer(
+                    "⛔️ این فرایند شارژ متعلق به نقش دیگری است.",
+                    show_alert=True
+                )
+                return
             for key in ("fsm_state", "deposit_amount", "deposit_role"):
                 context.user_data.pop(key, None)
             await query.answer("فرایند ورود مبلغ لغو شد.")
@@ -2154,6 +2219,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 0.2 End-User Portal Navigation
     if action == "user":
+        if role != "end_user":
+            await query.answer(
+                "⛔️ پورتال کاربری فقط برای نقش کاربر نهایی مجاز است.",
+                show_alert=True
+            )
+            return
         await user_portal.handle_user_callbacks(update, context)
         return
 
