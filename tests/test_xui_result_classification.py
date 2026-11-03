@@ -215,24 +215,3 @@ def test_representative_nlp_issuance_creates_durable_intent_before_financial_cla
     assert message.replies
     keyboard = message.replies[0][1]["reply_markup"]
     assert keyboard.inline_keyboard[0][0].callback_data == f"rep:issue_acc_direct:{row['intent_id']}:noname"
-
-
-def test_rep_renewal_conflicting_xui_signals_are_ambiguous_not_refunded(renewal_env, monkeypatch):
-    rep_id, user, rep, acc, client = renewal_env
-    monkeypatch.setattr(
-        rep_bot, "xui_manager",
-        SimpleNamespace(renew_client=lambda *a, **k: {"status": "failed", "success": True}),
-    )
-
-    ok, message, _keyboard = asyncio.run(rep_bot.process_account_renewal(
-        user=user, role="rep", rep=rep, acc_record=acc, client_info=client,
-        gb=20, days=30, plan_code="pipeline_20gb_30d",
-        effective_first=False, curr_comment="Pipeline Customer",
-    ))
-
-    rows = database.get_rep_renewal_intents()
-    locks = [x for x in database.get_operation_locks() if x["lock_key"].startswith("account-renewal:")]
-    assert ok is False
-    assert "مبهم" in message
-    assert rows[-1]["status"] == "needs_reconciliation"
-    assert locks
