@@ -45,6 +45,14 @@ logging.basicConfig(
 logger = logging.getLogger("HstAgentBot")
 
 
+def _is_private_super_admin(update: Update) -> bool:
+    """True only for the configured Super Admin in the bot's private chat."""
+    user = update.effective_user
+    chat = update.effective_chat
+    return bool(user and chat and user.id == ADMIN_TELEGRAM_ID and chat.type == "private")
+
+
+
 def _xui_operation_succeeded(result) -> bool:
     """Accept only an explicit successful response from the external panel."""
     return isinstance(result, dict) and (
@@ -164,7 +172,7 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
-    if role == "unauthorized_group":
+    if role != "end_user":
         return
 
     # Allow /link in Private DM (chat.id > 0) AND in End-User Sandbox topic
@@ -217,7 +225,8 @@ async def pricing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     args = context.args
     if len(args) < 3:
@@ -244,7 +253,16 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role not in ("super_admin", "rep"):
         return
 
+    # Global financial aggregates are private-chat-only.
+    if role == "super_admin" and rep is None and chat.type != "private":
+        return
+
     # If Super Admin in private DM (without specific rep context), show aggregated summary of all reps
+    if role == "super_admin" and rep is None and chat.type != "private":
+        return
+    if role not in ("super_admin", "rep") or (role == "rep" and not rep):
+        return
+
     if role == "super_admin" and rep is None:
         reps = database.get_all_active_reps()
         lines = ["📊 **گزارش تجمیعی صورت‌حساب کلیه نمایندگان:**\n"]
@@ -284,7 +302,8 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     args = context.args
     if len(args) < 2:
@@ -399,7 +418,8 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     args = context.args or []
     if len(args) >= 3:
@@ -430,7 +450,8 @@ async def card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show persistent or unexpired external-operation locks to the Super Admin."""
     user = update.effective_user
-    if not user or user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     locks = await asyncio.to_thread(database.get_operation_locks)
     if not locks:
@@ -490,7 +511,8 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unlock_operation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Release an unresolved-operation lock only with explicit admin evidence."""
     user = update.effective_user
-    if not user or user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     args = context.args or []
     if len(args) < 2:
@@ -532,7 +554,8 @@ async def unlock_operation_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 async def resolve_user_intent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Evidence-gated resolution of a user purchase/renewal with atomic wallet semantics."""
     user = update.effective_user
-    if not user or user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     args = context.args or []
     if len(args) < 2:
@@ -586,7 +609,8 @@ async def resolve_user_intent_cmd(update: Update, context: ContextTypes.DEFAULT_
 async def resolve_rep_intent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Evidence-gated resolution of a representative issuance precharge."""
     user = update.effective_user
-    if not user or user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     args = context.args or []
     if len(args) < 2:
@@ -639,7 +663,8 @@ async def resolve_rep_intent_cmd(update: Update, context: ContextTypes.DEFAULT_T
 async def resolve_admin_renewal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Evidence-gated resolution of an ambiguous Super Admin quick renewal."""
     user = update.effective_user
-    if not user or user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     args = context.args or []
     if len(args) < 2:
@@ -678,7 +703,8 @@ async def resolve_admin_renewal_cmd(update: Update, context: ContextTypes.DEFAUL
 async def resolve_reservation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Evidence-gated resolution of an ambiguous reserved-package activation."""
     user = update.effective_user
-    if not user or user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     args = context.args or []
     if len(args) < 2 or not args[0].isdigit():
@@ -723,7 +749,8 @@ async def resolve_reservation_cmd(update: Update, context: ContextTypes.DEFAULT_
 async def resolve_rep_renewal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Evidence-gated resolution of an uncertain representative renewal precharge."""
     user = update.effective_user
-    if not user or user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     args = context.args or []
     if len(args) < 2:
@@ -768,7 +795,8 @@ async def resolve_rep_renewal_cmd(update: Update, context: ContextTypes.DEFAULT_
 
 async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
+        return
         return
     result = await asyncio.to_thread(database.sync_all_active_reps_detailed)
     if result.get("status") != "success":
@@ -2147,7 +2175,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Old unprefixed account-card reservation callbacks executed immediately.
     # Representatives must use the new rep:confirm_* → rep:do_* flow instead.
-    if role == "rep" and action in ("force_res", "cancel_res"):
+    if role in ("rep", "super_admin") and action in ("force_res", "cancel_res"):
         await query.answer(
             "⚠️ این دکمه رزرو قدیمی است و اجرا نشد؛ کارت اکانت را تازه کنید و تأیید دو مرحله‌ای را انجام دهید.",
             show_alert=True
@@ -2219,12 +2247,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role == "rep" and rep:
             await rep_panel.handle_rep_callbacks(update, context, rep)
             return
-        elif role == "super_admin":
-            reps = database.get_all_reps()
-            if reps:
-                await rep_panel.handle_rep_callbacks(update, context, reps[0])
-                return
-        await query.answer("⛔️ دسترسی فقط برای نمایندگان مجاز است.", show_alert=True)
+        await query.answer(
+            "⛔️ برای ورود به پنل نمایندگی باید در تاپیک اختصاصی همان نماینده باشید.",
+            show_alert=True
+        )
         return
 
     # 0.2 End-User Portal Navigation
