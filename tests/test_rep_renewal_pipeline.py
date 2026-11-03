@@ -294,3 +294,89 @@ def test_super_admin_quick_confirmation_claims_direct_renewal_without_rep_debit(
     assert database.get_rep_balance(renewal_env[0]) == 0
     assert not any(item["lock_key"] == "account-renewal:admin-pipe" for item in database.get_operation_locks())
 
+def make_admin_confirmation():
+    database.upsert_account_record(
+        rep_id=None,
+        email="admin-pipe@example.test",
+        account_code="ADMIN-PIPE",
+        customer_name="Admin Customer",
+        sub_id="admin-pipe-sub",
+        enable=1,
+        total_gb=20,
+        expiry_time=0,
+    )
+    plan = database.get_plan("pipeline_20gb_30d")
+    return database.create_account_renewal_confirmation(
+        actor_id=9000, actor_role="super_admin", rep_id=None,
+        account_code="ADMIN-PIPE", account_email="admin-pipe@example.test",
+        plan_code=plan["plan_code"], plan_name=plan["name"],
+        gb=plan["gb"], days=plan["days"], amount=plan["rep_price"],
+    )
+
+
+def run_admin_confirmation(env, token, monkeypatch, response):
+    plan = database.get_plan("pipeline_20gb_30d")
+    admin_user = SimpleNamespace(id=9000, full_name="Super Admin", username="admin")
+    admin_acc = {
+        "rep_id": None, "account_code": "ADMIN-PIPE", "email": "admin-pipe@example.test",
+    }
+    admin_client = {
+        "remaining_gb": 0, "days_left": 0, "is_expired": True,
+        "is_depleted": False, "enabled": True,
+    }
+    monkeypatch.setattr(
+        rep_bot, "xui_manager",
+        SimpleNamespace(renew_client=lambda *args, **kwargs: response),
+    )
+    return asyncio.run(rep_bot.process_account_renewal(
+        user=admin_user, role="super_admin", rep=None, acc_record=admin_acc,
+        client_info=admin_client, gb=plan["gb"], days=plan["days"],
+        plan_code=plan["plan_code"], effective_first=False,
+        curr_comment="Admin Customer", confirmation_id=token,
+    ))
+
+
+def test_super_admin_quick_confirmation_is_failed_without_financial_mutation_on_xui_rejection(
+    renewal_env, monkeypatch
+):
+    rep_id = renewal_env[0]
+    token = make_admin_confirmation()
+    ok, message, _ = run_admin_confirmation(
+        renewal_env, token, monkeypatch, {"status": "failed", "message": "rejected"}
+    )
+    assert ok is False
+    assert "رد کرد" in message
+    confirmation = database.get_account_renewal_confirmation(token, 9000)
+    assert confirmation["status"] == "failed"
+    assert database.get_rep_balance(rep_id) == 0
+    assert not any(item["lock_key"] == "account-renewal:admin-pipe" for item in database.get_operation_locks())
+
+
+def test_super_admin_quick_confirmation_ambiguous_result_retains_lock_for_resolution(
+    renewal_env, monkeypatch
+):
+    rep_id = renewal_env[0]
+    token = make_admin_confirmation()
+    ok, message, _ = run_admin_confirmation(
+        renewal_env, token, monkeypatch, {"status": "pending", "message": "unknown"}
+    )
+    assert ok is False
+    assert "مبهم" in message or "نامشخص" in message
+    confirmation = database.get_account_renewal_confirmation(token, 9000)
+    assert confirmation["status"] == "needs_reconciliation"
+    lock = next(item for item in database.get_operation_locks() if item["lock_key"] == "account-renewal:admin-pipe")
+    assert lock["action_type"] == "admin_renewal"
+    assert lock["intent_id"] == token
+    with pytest.raises(ValueError, match="resolveadminrenewal"):
+        database.resolve_operation_lock(
+            lock["lock_key"], 9000, "Super Admin",
+            "RECONCILED: verified exact account state",
+        )
+    result = database.resolve_admin_renewal_confirmation(
+        token, 9000, "Super Admin", "NOT_APPLIED",
+        "NOT_APPLIED: checked exact X-UI account and renewal is absent",
+    )
+    assert result["status"] == "failed"
+    assert database.get_rep_balance(rep_id) == 0
+    assert not any(item["lock_key"] == "account-renewal:admin-pipe" for item in database.get_operation_locks())
+
