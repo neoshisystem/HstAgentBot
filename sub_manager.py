@@ -32,17 +32,15 @@ def generate_new_uuid() -> str:
 
 
 def get_subscription_url(sub_id: str) -> str:
-    """Returns the absolute HTTPS subscription URL based on active domain."""
-    sub_domain = getattr(config, "SUB_DOMAIN", "sub.example.com")
-    sub_port = getattr(config, "SUB_PORT", 2096)
-    sub_path = getattr(config, "SUB_PATH", "sub")
-
-    if sub_port in (80, 443):
-        port_part = ""
-    else:
-        port_part = f":{sub_port}"
-
-    return f"https://{sub_domain}{port_part}/{sub_path}/{sub_id}"
+    """Build a URL only when a real public subscription domain is configured."""
+    sub_domain = str(getattr(config, "SUB_DOMAIN", "") or "").strip()
+    if not sub_domain or not sub_id:
+        return ""
+    sub_port = int(getattr(config, "SUB_PORT", 443))
+    sub_path = str(getattr(config, "SUB_PATH", "sub") or "sub").strip("/")
+    port_part = "" if sub_port in (80, 443) else f":{sub_port}"
+    path_part = f"/{sub_path}" if sub_path else ""
+    return f"https://{sub_domain}{port_part}{path_part}/{sub_id}"
 
 
 def reset_client_sub_id(xui_module, email: str) -> tuple[bool, str, str]:
