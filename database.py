@@ -1143,12 +1143,118 @@ def sync_rep_accounts(rep_code=None):
         conn.commit()
         return count
 
-def sync_all_active_reps() -> int:
+def sync_all_active_reps_detailed() -> dict:
+    """Reconcile panel accounts against active representative scopes without arbitrary reassignment."""
     reps = get_all_active_reps()
-    total = 0
-    for r in reps:
-        total += sync_rep_accounts(r["rep_code"])
-    return total
+    if not reps:
+        return {"status": "success", "count": 0, "ambiguous": 0, "unmatched": 0, "message": "No active representatives"}
+
+    try:
+        session = xui_manager.get_session()
+        response = session.get(f"{xui_manager.BASE_URL}/panel/api/clients/list", timeout=20)
+        if not response.ok:
+            return {
+                "status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+                "message": f"3X-UI returned HTTP {response.status_code}"
+            }
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("obj"), list):
+            return {
+                "status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+                "message": "3X-UI response did not contain a client list"
+            }
+        clients = [c for c in payload["obj"] if isinstance(c, dict) and c.get("email")]
+    except Exception as exc:
+        return {
+            "status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+            "message": f"Failed to read 3X-UI clients: {exc}"
+        }
+
+    rep_scopes = []
+    for rep in reps:
+        scope = str(rep.get("scope_filter") or "").strip().lower()
+        tokens = [token.strip() for token in scope.split(",") if token.strip()]
+        rep_scopes.append((rep, scope, tokens))
+
+    count = ambiguous = unmatched = 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        existing_rows = cur.execute("SELECT email, rep_id, owner_tg_id FROM accounts").fetchall()
+        existing = {str(row["email"]).lower(): dict(row) for row in existing_rows}
+
+        for client in clients:
+            email = str(client["email"]).strip()
+            email_l = email.lower()
+            comment = str(client.get("comment") or "")
+            candidates = []
+            for rep, scope, tokens in rep_scopes:
+                if scope == "all" or any(
+                    token in email_l or token in comment.lower() for token in tokens
+                ):
+                    candidates.append(rep)
+
+            previous = existing.get(email_l)
+            previous_rep_id = previous.get("rep_id") if previous else None
+            selected_rep_id = None
+
+            if len(candidates) == 1:
+                selected_rep_id = candidates[0]["id"]
+            elif len(candidates) > 1:
+                candidate_ids = {item["id"] for item in candidates}
+                if previous_rep_id in candidate_ids:
+                    selected_rep_id = previous_rep_id
+                else:
+                    ambiguous += 1
+                    continue
+            else:
+                unmatched += 1
+                # Retain an existing assignment, but do not invent a new one.
+                selected_rep_id = previous_rep_id
+
+            code = xui_manager.extract_account_identifier(email) or email
+            total_gb = round(float(client.get("totalGB") or 0) / (1024 ** 3), 2)
+            expiry_time = int(client.get("expiryTime") or 0)
+            enabled = 1 if client.get("enable", True) else 0
+            sub_id = str(client.get("subId") or "")
+            tg_id = client.get("tgId") or (previous.get("owner_tg_id") if previous else None)
+
+            cur.execute("""
+                INSERT INTO accounts
+                    (rep_id, account_code, email, customer_name, sub_id, enable,
+                     total_gb, expiry_time, owner_tg_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(email) DO UPDATE SET
+                    rep_id = excluded.rep_id,
+                    account_code = excluded.account_code,
+                    customer_name = excluded.customer_name,
+                    sub_id = excluded.sub_id,
+                    enable = excluded.enable,
+                    total_gb = excluded.total_gb,
+                    expiry_time = excluded.expiry_time,
+                    owner_tg_id = CASE
+                        WHEN excluded.owner_tg_id IS NOT NULL THEN excluded.owner_tg_id
+                        ELSE accounts.owner_tg_id
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                selected_rep_id, str(code), email, comment, sub_id, enabled,
+                total_gb, expiry_time, tg_id
+            ))
+            count += 1
+
+    return {
+        "status": "success", "count": count, "ambiguous": ambiguous,
+        "unmatched": unmatched,
+        "message": "Reconciliation completed without arbitrary scope reassignment"
+    }
+
+
+def sync_all_active_reps() -> int:
+    """Backward-compatible wrapper for callers that only need a count."""
+    result = sync_all_active_reps_detailed()
+    return int(result.get("count", 0)) if result.get("status") == "success" else 0
+
 
 def upsert_account_record(rep_id, email, account_code, customer_name="", sub_id="", enable=1, total_gb=0, expiry_time=0, owner_tg_id=None):
     with get_db() as conn:
@@ -1206,8 +1312,6 @@ def log_audit(rep_id, account_code, email, action, actor_id, actor_name, details
         ))
         conn.commit()
 
-def sync_all_active_reps():
-    return sync_rep_accounts(None)
 
 # ==========================================
 # Phase 4: Financial & Dual-Wallet Operations
