@@ -753,39 +753,52 @@ async def process_account_renewal(
     if can_renew_immediate:
         countdown_param = True if effective_first else "auto"
         operation_lock_key = f"account-renewal:{account_code.lower()}"
-        operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=None)
-        if not operation_lock_token:
-            pending_res = database.get_pending_reservation(account_code)
-            keyboard = nlp_matcher.build_account_keyboard(
-                account_code, is_enabled=is_enabled, on_first_connect=effective_first,
-                role=role, pending_res=pending_res
-            )
-            return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
-
-        # Record the debit before the external side effect. SQLite serializes the
-        # credit-limit check and debit, so parallel renewals cannot exceed the limit.
+        operation_lock_token = None
+        rep_renewal_intent_id = None
         new_bal = None
+
         if not is_admin_exempt:
             try:
-                new_bal = database.record_ledger_entry(
+                started = database.begin_rep_renewal_intent(
                     rep_id=target_rep_id,
+                    actor_tg_id=user.id,
                     account_code=account_code,
-                    email=email,
+                    account_email=email,
                     plan_code=plan_code,
-                    tx_type="debit",
+                    plan_name=plan_name,
+                    gb=gb,
+                    days=days,
                     amount=charge,
-                    description=f"پیش‌پرداخت تمدید {plan_name} (در انتظار تأیید پنل)",
-                    actor_id=user.id,
-                    actor_name=user.full_name or user.username
                 )
             except ValueError as exc:
-                database.release_operation_lock(operation_lock_key, operation_lock_token)
                 pending_res = database.get_pending_reservation(account_code)
                 keyboard = nlp_matcher.build_account_keyboard(
                     account_code, is_enabled=is_enabled, on_first_connect=effective_first,
                     role=role, pending_res=pending_res
                 )
                 return False, f"⛔️ ثبت مالی تمدید انجام نشد: {exc}", keyboard
+
+            if started.get("status") != "started":
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
+
+            rep_renewal_intent_id = started["intent_id"]
+            operation_lock_key = started["lock_key"]
+            operation_lock_token = started["lock_token"]
+            new_bal = started["new_balance"]
+        else:
+            operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=None)
+            if not operation_lock_token:
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
 
         try:
             ren_res = await asyncio.to_thread(
@@ -795,8 +808,15 @@ async def process_account_renewal(
             )
         except Exception:
             logger.exception("X-UI renewal outcome is unknown for %s", account_code)
-            # Keep the debit hold and operation lease: the panel may have applied
-            # the renewal even though its response was lost.
+            # Keep the debit hold and exact operation lease for evidence-gated reconciliation.
+            if rep_renewal_intent_id:
+                try:
+                    database.mark_rep_renewal_for_reconciliation(
+                        rep_renewal_intent_id, target_rep_id, user.id,
+                        "X-UI renewal raised an exception; external outcome is unknown",
+                    )
+                except Exception:
+                    logger.exception("Could not mark representative renewal for reconciliation: %s", account_code)
             pending_res = database.get_pending_reservation(account_code)
             keyboard = nlp_matcher.build_account_keyboard(
                 account_code, is_enabled=is_enabled, on_first_connect=effective_first,
@@ -811,20 +831,27 @@ async def process_account_renewal(
             if _xui_operation_failed(ren_res):
                 if not is_admin_exempt:
                     try:
-                        database.register_rep_payment(
-                            target_rep_id, charge,
+                        database.refund_rep_renewal_intent(
+                            rep_renewal_intent_id, target_rep_id, user.id,
                             f"استرداد پیش‌پرداخت به دلیل رد قطعی تمدید {account_code}",
-                            actor_id=user.id, actor_name=user.full_name or user.username
                         )
                     except Exception:
-                        logger.exception("Could not refund representative renewal hold for %s", account_code)
+                        logger.exception("Could not refund representative renewal intent for %s", account_code)
+                        try:
+                            database.mark_rep_renewal_for_reconciliation(
+                                rep_renewal_intent_id, target_rep_id, user.id,
+                                "X-UI explicitly rejected renewal but atomic refund failed",
+                            )
+                        except Exception:
+                            logger.exception("Could not mark failed refund for reconciliation: %s", account_code)
                         pending_res = database.get_pending_reservation(account_code)
                         keyboard = nlp_matcher.build_account_keyboard(
                             account_code, is_enabled=is_enabled, on_first_connect=effective_first,
                             role=role, pending_res=pending_res
                         )
-                        return False, "⚠️ پنل تمدید را رد کرد اما استرداد مالی ثبت نشد؛ موضوع نیازمند بررسی مدیریت است.", keyboard
-                database.release_operation_lock(operation_lock_key, operation_lock_token)
+                        return False, "⚠️ پنل تمدید را رد کرد اما استرداد اتمیک انجام نشد؛ قفل و پیش‌پرداخت برای تطبیق مدیریت حفظ شدند.", keyboard
+                else:
+                    database.release_operation_lock(operation_lock_key, operation_lock_token)
                 pending_res = database.get_pending_reservation(account_code)
                 keyboard = nlp_matcher.build_account_keyboard(
                     account_code, is_enabled=is_enabled, on_first_connect=effective_first,
@@ -835,6 +862,14 @@ async def process_account_renewal(
                 ), keyboard
 
             # Unknown response: do not refund a possibly completed external operation.
+            if rep_renewal_intent_id:
+                try:
+                    database.mark_rep_renewal_for_reconciliation(
+                        rep_renewal_intent_id, target_rep_id, user.id,
+                        f"X-UI returned an ambiguous response: {str(ren_res)[:300]}",
+                    )
+                except Exception:
+                    logger.exception("Could not mark ambiguous representative renewal: %s", account_code)
             pending_res = database.get_pending_reservation(account_code)
             keyboard = nlp_matcher.build_account_keyboard(
                 account_code, is_enabled=is_enabled, on_first_connect=effective_first,
@@ -844,7 +879,29 @@ async def process_account_renewal(
                 "⚠️ پاسخ پنل موفقیت یا شکست قطعی را مشخص نمی‌کند؛ مبلغ محفوظ مانده و بررسی دستی لازم است."
             ), keyboard
 
-        database.release_operation_lock(operation_lock_key, operation_lock_token)
+        if rep_renewal_intent_id:
+            try:
+                database.complete_rep_renewal_intent(
+                    rep_renewal_intent_id, target_rep_id, user.id,
+                    "X-UI explicitly confirmed renewal success",
+                )
+            except Exception:
+                logger.exception("X-UI renewal succeeded but local intent finalization failed for %s", account_code)
+                try:
+                    database.mark_rep_renewal_for_reconciliation(
+                        rep_renewal_intent_id, target_rep_id, user.id,
+                        "X-UI explicitly succeeded but local finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark successful external renewal for reconciliation: %s", account_code)
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, "⚠️ پنل تمدید را با موفقیت انجام داد، اما ثبت نهایی محلی کامل نشد؛ قفل برای تطبیق حفظ شد.", keyboard
+        else:
+            database.release_operation_lock(operation_lock_key, operation_lock_token)
         report_text = ren_res.get("report", "")
         if comment_updated:
             report_text = f"👤 **نام مشتری روی اکانت ثبت شد:** `{curr_comment}`\n\n" + report_text
