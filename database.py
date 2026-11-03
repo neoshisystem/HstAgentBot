@@ -1328,23 +1328,21 @@ def upsert_account_record(rep_id, email, account_code, customer_name="", sub_id=
         conn.commit()
 
 def is_account_in_rep_scope(rep_id, query):
-    q = str(query).strip().lower()
+    """Resolve an exact account identifier only within the representative's scope."""
+    q = str(query or "").strip().lower()
+    if not q:
+        return None
     with get_db() as conn:
-        cur = conn.cursor()
-        row = cur.execute("""
-        SELECT * FROM accounts 
-        WHERE rep_id = ? AND (
-            LOWER(email) = ? OR 
-            LOWER(account_code) = ? OR 
-            LOWER(sub_id) = ? OR 
-            LOWER(email) LIKE ? OR
-            account_code LIKE ?
-        )
-        LIMIT 1
-        """, (rep_id, q, q, q, f"%{q}%", f"%{q}%")).fetchone()
-        if row:
-            return dict(row)
-    return None
+        row = conn.execute("""
+            SELECT * FROM accounts
+            WHERE rep_id = ? AND (
+                LOWER(email) = ? OR
+                LOWER(account_code) = ? OR
+                LOWER(sub_id) = ?
+            )
+            LIMIT 1
+        """, (rep_id, q, q, q)).fetchone()
+        return dict(row) if row else None
 
 def log_audit(rep_id, account_code, email, action, actor_id, actor_name, details, result_status):
     with get_db() as conn:
