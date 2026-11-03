@@ -333,6 +333,8 @@ def init_db():
             rejection_reason TEXT,
             reviewed_by INTEGER,
             reviewed_at TIMESTAMP,
+            cancelled_by INTEGER,
+            cancelled_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (rep_id) REFERENCES representatives(id)
         )
@@ -439,6 +441,12 @@ def init_db():
         cols_plans = [c[1] for c in cur.execute("PRAGMA table_info(pricing_plans)").fetchall()]
         if "is_active" not in cols_plans:
             cur.execute("ALTER TABLE pricing_plans ADD COLUMN is_active INTEGER DEFAULT 1")
+
+        cols_receipts = [c[1] for c in cur.execute("PRAGMA table_info(payment_receipts)").fetchall()]
+        if "cancelled_by" not in cols_receipts:
+            cur.execute("ALTER TABLE payment_receipts ADD COLUMN cancelled_by INTEGER")
+        if "cancelled_at" not in cols_receipts:
+            cur.execute("ALTER TABLE payment_receipts ADD COLUMN cancelled_at TIMESTAMP")
 
         led_info = cur.execute("PRAGMA table_info(financial_ledger)").fetchall()
         rep_col = next((c for c in led_info if c[1] == "rep_id"), None)
@@ -2654,6 +2662,45 @@ def approve_payment_receipt(receipt_id_or_code, admin_tg_id: int, admin_name: st
 
         updated = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt["id"],)).fetchone()
         return dict(updated)
+def cancel_payment_receipt(receipt_id_or_code, user_id: int) -> dict:
+    """Cancel an unsubmitted pending receipt owned by this user, without ledger effects."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+            row = cur.execute(
+                "SELECT * FROM payment_receipts WHERE id = ?", (int(receipt_id_or_code),)
+            ).fetchone()
+        else:
+            row = cur.execute(
+                "SELECT * FROM payment_receipts WHERE tracking_code = ?", (str(receipt_id_or_code),)
+            ).fetchone()
+        if not row:
+            raise ValueError("Receipt not found")
+        receipt = dict(row)
+        if int(receipt["user_id"]) != int(user_id):
+            raise PermissionError("Receipt does not belong to this user")
+
+        # Replays by the original owner are read-only and idempotent.
+        if receipt["status"] == "cancelled" and int(receipt.get("cancelled_by") or -1) == int(user_id):
+            return receipt
+
+        # Only an unreviewed receipt without an uploaded photo can be cancelled.
+        # Once a photo is attached, the receipt must remain available for admin review.
+        if receipt["status"] != "pending" or receipt.get("receipt_photo_id"):
+            return receipt
+
+        cur.execute("""
+            UPDATE payment_receipts
+            SET status = 'cancelled', cancelled_by = ?, cancelled_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND user_id = ? AND status = 'pending' AND receipt_photo_id IS NULL
+        """, (int(user_id), receipt["id"], int(user_id)))
+        latest = cur.execute(
+            "SELECT * FROM payment_receipts WHERE id = ?", (receipt["id"],)
+        ).fetchone()
+        return dict(latest) if latest else receipt
+
+
 def reject_payment_receipt(receipt_id_or_code, admin_tg_id: int, reason: str = "عدم تطابق با گردش حساب") -> dict:
     """Reject a pending receipt once; repeated callbacks are read-only."""
     with get_db() as conn:
@@ -3086,7 +3133,7 @@ def get_receipts_paginated(status: str | None = None, page: int = 1, page_size: 
     """Return a stable newest-first receipt page plus total count and page count."""
     page_size = max(1, min(int(page_size), 100))
     page = max(1, int(page))
-    allowed_statuses = {None, "pending", "approved", "rejected"}
+    allowed_statuses = {None, "pending", "approved", "rejected", "cancelled"}
     if status not in allowed_statuses:
         raise ValueError("Unsupported receipt status")
     with get_db() as conn:
