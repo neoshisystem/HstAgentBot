@@ -341,6 +341,34 @@ def init_db():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_status ON payment_receipts(status)")
 
+        # Durable delivery state for each submitted receipt's admin notification.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS receipt_notification_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            receipt_id INTEGER NOT NULL UNIQUE,
+            recipient_chat_id INTEGER,
+            recipient_thread_id INTEGER,
+            sender_name TEXT NOT NULL DEFAULT '',
+            sender_username TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'sent', 'superseded')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL NOT NULL DEFAULT 0,
+            lease_token TEXT,
+            lease_until REAL,
+            delivery_method TEXT,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            delivered_at TIMESTAMP,
+            FOREIGN KEY (receipt_id) REFERENCES payment_receipts(id) ON DELETE CASCADE
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_receipt_notification_outbox_due "
+            "ON receipt_notification_outbox(status, next_attempt_at, lease_until, id)"
+        )
+
         # 13. Cross-process operation locks for sensitive portal actions
         cur.execute("""
         CREATE TABLE IF NOT EXISTS operation_locks (
@@ -3294,6 +3322,261 @@ def create_payment_receipt(user_id: int, role: str, amount_toman: int, rep_id: i
             except sqlite3.IntegrityError:
                 continue
         raise RuntimeError("Could not allocate a unique payment receipt tracking code")
+
+def _insert_receipt_notification_outbox_cur(
+    cur, receipt_id: int, recipient_chat_id=None, recipient_thread_id=None,
+    sender_name: str = "", sender_username: str = ""
+):
+    """Insert the single canonical admin notification row for a submitted receipt."""
+    cur.execute("""
+        INSERT OR IGNORE INTO receipt_notification_outbox
+        (receipt_id, recipient_chat_id, recipient_thread_id, sender_name, sender_username,
+         status, attempts, next_attempt_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', 0, 0)
+    """, (
+        int(receipt_id),
+        int(recipient_chat_id) if recipient_chat_id else None,
+        int(recipient_thread_id) if recipient_thread_id else None,
+        str(sender_name or "")[:200],
+        str(sender_username or "")[:100],
+    ))
+    row = cur.execute(
+        "SELECT * FROM receipt_notification_outbox WHERE receipt_id = ?",
+        (int(receipt_id),)
+    ).fetchone()
+    if not row:
+        raise RuntimeError("Receipt notification outbox row was not persisted")
+    return dict(row)
+
+
+def submit_payment_receipt(
+    user_id: int,
+    role: str,
+    amount_toman: int,
+    photo_id: str,
+    rep_id: int | None = None,
+    receipt_id_or_code=None,
+    note: str | None = None,
+    recipient_chat_id=None,
+    recipient_thread_id=None,
+    sender_name: str = "",
+    sender_username: str = "",
+) -> dict:
+    """Persist a submitted receipt and its admin notification in one SQLite transaction.
+
+    The existing FSM receipt is attached to its photo atomically with its outbox row.
+    A direct-photo submission creates both rows atomically. Replays with the same
+    Telegram file_id are idempotent; a different photo cannot silently replace a
+    receipt that has already been submitted.
+    """
+    user_id = int(user_id)
+    amount_toman = int(amount_toman)
+    role = str(role or "").strip()
+    photo_id = str(photo_id or "").strip()
+    if amount_toman <= 0:
+        raise ValueError("Receipt amount must be a positive integer")
+    if role not in ("rep", "end_user"):
+        raise ValueError("Invalid receipt role")
+    if role == "rep" and rep_id is None:
+        raise ValueError("Representative receipt requires a representative ID")
+    if not photo_id:
+        raise ValueError("A Telegram receipt photo file_id is required")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+
+        if receipt_id_or_code is None:
+            receipt_id = None
+            for _ in range(8):
+                code = f"RCP-{secrets.randbelow(100_000_000):08d}"
+                try:
+                    cur.execute("""
+                        INSERT INTO payment_receipts
+                        (tracking_code, user_id, role, rep_id, amount_toman,
+                         receipt_photo_id, receipt_note, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                    """, (code, user_id, role, rep_id, amount_toman, photo_id, note))
+                    receipt_id = cur.lastrowid
+                    break
+                except sqlite3.IntegrityError:
+                    continue
+            if receipt_id is None:
+                raise RuntimeError("Could not allocate a unique payment receipt tracking code")
+        else:
+            if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+                row = cur.execute(
+                    "SELECT * FROM payment_receipts WHERE id = ?",
+                    (int(receipt_id_or_code),)
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT * FROM payment_receipts WHERE tracking_code = ?",
+                    (str(receipt_id_or_code),)
+                ).fetchone()
+            if not row:
+                raise ValueError("Receipt not found")
+            existing = dict(row)
+            if int(existing["user_id"]) != user_id:
+                raise PermissionError("Receipt does not belong to this user")
+            if existing["role"] != role:
+                raise PermissionError("Receipt role does not match the active user role")
+            if role == "rep" and int(existing.get("rep_id") or -1) != int(rep_id):
+                raise PermissionError("Receipt does not belong to this representative")
+            if existing["status"] != "pending":
+                raise ValueError("Receipt is no longer pending")
+            existing_photo = existing.get("receipt_photo_id")
+            if existing_photo and str(existing_photo) != photo_id:
+                raise ValueError("A different photo is already attached to this receipt")
+            receipt_id = int(existing["id"])
+            if not existing_photo:
+                cur.execute("""
+                    UPDATE payment_receipts
+                    SET receipt_photo_id = ?, receipt_note = ?,
+                        amount_toman = CASE WHEN amount_toman = 0 THEN ? ELSE amount_toman END
+                    WHERE id = ? AND user_id = ? AND status = 'pending'
+                      AND receipt_photo_id IS NULL
+                """, (photo_id, note, amount_toman, receipt_id, user_id))
+                if cur.rowcount != 1:
+                    raise RuntimeError("Receipt changed while attaching its submitted photo")
+
+        stored = cur.execute(
+            "SELECT * FROM payment_receipts WHERE id = ?", (receipt_id,)
+        ).fetchone()
+        if not stored or stored["status"] != "pending" or not stored["receipt_photo_id"]:
+            raise RuntimeError("Submitted receipt could not be verified after persistence")
+
+        _insert_receipt_notification_outbox_cur(
+            cur,
+            receipt_id=receipt_id,
+            recipient_chat_id=recipient_chat_id,
+            recipient_thread_id=recipient_thread_id,
+            sender_name=sender_name,
+            sender_username=sender_username,
+        )
+        return dict(stored)
+
+
+def get_receipt_notification_outbox(receipt_id: int) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM receipt_notification_outbox WHERE receipt_id = ?",
+            (int(receipt_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def claim_next_receipt_notification(now: float | None = None, lease_seconds: int = 120) -> dict | None:
+    """Claim one due notification under an immediate transaction and a finite lease."""
+    now = time.time() if now is None else float(now)
+    lease_seconds = max(30, int(lease_seconds))
+    token = uuid.uuid4().hex
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        # Do not send stale review notifications after a receipt was already settled.
+        cur.execute("""
+            UPDATE receipt_notification_outbox
+            SET status = 'superseded', lease_token = NULL, lease_until = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'pending'
+              AND EXISTS (
+                  SELECT 1 FROM payment_receipts r
+                  WHERE r.id = receipt_notification_outbox.receipt_id
+                    AND r.status != 'pending'
+              )
+        """)
+        row = cur.execute("""
+            SELECT id
+            FROM receipt_notification_outbox
+            WHERE status = 'pending'
+              AND next_attempt_at <= ?
+              AND (lease_until IS NULL OR lease_until <= ?)
+            ORDER BY next_attempt_at ASC, id ASC
+            LIMIT 1
+        """, (now, now)).fetchone()
+        if not row:
+            return None
+        notification_id = int(row["id"])
+        cur.execute("""
+            UPDATE receipt_notification_outbox
+            SET attempts = attempts + 1, lease_token = ?, lease_until = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+              AND (lease_until IS NULL OR lease_until <= ?)
+        """, (token, now + lease_seconds, notification_id, now))
+        if cur.rowcount != 1:
+            return None
+        item = cur.execute("""
+            SELECT
+                n.id AS notification_id,
+                n.receipt_id,
+                n.recipient_chat_id,
+                n.recipient_thread_id,
+                n.sender_name,
+                n.sender_username,
+                n.attempts,
+                n.lease_token,
+                r.tracking_code,
+                r.user_id,
+                r.role,
+                r.rep_id,
+                r.amount_toman,
+                r.receipt_photo_id,
+                r.receipt_note,
+                r.created_at
+            FROM receipt_notification_outbox n
+            JOIN payment_receipts r ON r.id = n.receipt_id
+            WHERE n.id = ?
+        """, (notification_id,)).fetchone()
+        return dict(item) if item else None
+
+
+def mark_receipt_notification_sent(
+    notification_id: int, lease_token: str, delivery_method: str
+) -> bool:
+    if delivery_method not in ("photo", "text_fallback"):
+        raise ValueError("Unsupported receipt notification delivery method")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE receipt_notification_outbox
+            SET status = 'sent', delivery_method = ?, delivered_at = CURRENT_TIMESTAMP,
+                last_error = NULL, lease_token = NULL, lease_until = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending' AND lease_token = ?
+        """, (delivery_method, int(notification_id), str(lease_token)))
+        return cur.rowcount == 1
+
+
+def retry_receipt_notification(
+    notification_id: int, lease_token: str, error: str, now: float | None = None
+) -> bool:
+    """Release a failed claim and persist capped exponential retry backoff."""
+    now = time.time() if now is None else float(now)
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute("""
+            SELECT attempts FROM receipt_notification_outbox
+            WHERE id = ? AND status = 'pending' AND lease_token = ?
+        """, (int(notification_id), str(lease_token))).fetchone()
+        if not row:
+            return False
+        attempts = max(1, int(row["attempts"] or 1))
+        delay = min(60 * (2 ** min(attempts - 1, 6)), 3600)
+        cur.execute("""
+            UPDATE receipt_notification_outbox
+            SET next_attempt_at = ?, last_error = ?,
+                lease_token = NULL, lease_until = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending' AND lease_token = ?
+        """, (
+            now + delay, str(error or "unknown delivery failure")[:1000],
+            int(notification_id), str(lease_token)
+        ))
+        return cur.rowcount == 1
+
+
 def get_payment_receipt(receipt_id_or_code):
     with get_db() as conn:
         cur = conn.cursor()
