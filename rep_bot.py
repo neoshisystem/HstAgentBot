@@ -452,6 +452,8 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if action_type == "reservation_activation":
                 owner_label = "نماینده" if owner_type == "representative" else "مدیریت کل"
                 command = "/resolvereservation"
+            elif action_type == "admin_renewal":
+                owner_label, command = "مدیریت کل", "/resolveadminrenewal"
             elif owner_type == "representative" and action_type == "renew":
                 owner_label, command = "نماینده", "/resolvereprenewal"
             elif owner_type == "representative":
@@ -480,7 +482,7 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
     lines.append(
         "\nقفل‌های عادی را فقط پس از بررسی پنل و دیتابیس با /unlock حل کنید. "
-        "قفل‌های Intent کاربر با /resolveintent، صدور نماینده با /resolverepintent، تمدید نماینده با /resolvereprenewal و فعال‌سازی رزرو با /resolvereservation تعیین تکلیف می‌شوند."
+        "قفل‌های Intent کاربر با /resolveintent، صدور نماینده با /resolverepintent، تمدید نماینده با /resolvereprenewal، تمدید مستقیم مدیریت کل با /resolveadminrenewal و فعال‌سازی رزرو با /resolvereservation تعیین تکلیف می‌شوند."
     )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -632,6 +634,45 @@ async def resolve_rep_intent_cmd(update: Update, context: ContextTypes.DEFAULT_T
             f"{result['amount']:,} تومان به تراز نماینده {result['rep_id']} برگشت. "
             f"مانده جدید: {result['new_balance']:,} تومان؛ قفل نیز آزاد شد."
         )
+
+
+async def resolve_admin_renewal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of an ambiguous Super Admin quick renewal."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور (پس از تطبیق مستقیم اکانت در 3X-UI و دیتابیس):\n"
+            "`/resolveadminrenewal <confirmation-id> APPLIED: مدرک تمدید موفق`\n"
+            "یا\n"
+            "`/resolveadminrenewal <confirmation-id> NOT_APPLIED: مدرک عدم اعمال تمدید`\n\n"
+            "این دستور فقط وضعیت تأیید و قفل را تعیین تکلیف می‌کند و هیچ تغییر مالی ایجاد نمی‌کند."
+        )
+        return
+    confirmation_id = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("NOT_APPLIED:"):
+        resolution = "NOT_APPLIED"
+    else:
+        await update.message.reply_text("⛔️ مدرک باید با APPLIED: یا NOT_APPLIED: شروع شود.")
+        return
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_admin_renewal_confirmation,
+            confirmation_id, user.id, user.full_name or "Super Admin", resolution, evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف تمدید مدیریت کل انجام نشد: {exc}")
+        return
+    state_text = "موفق" if result["status"] == "succeeded" else "ناموفق و عدم اعمال تمدید"
+    await update.message.reply_text(
+        f"✅ تأیید تمدید `{confirmation_id}` با مدرک ثبت شد: {state_text}. "
+        f"قفل `{result['lock_key']}` آزاد شد؛ عملیات خارجی جدیدی ارسال نشد."
+    )
 
 
 async def resolve_reservation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2657,6 +2698,7 @@ def main():
     app.add_handler(CommandHandler("resolverepintent", resolve_rep_intent_cmd))
     app.add_handler(CommandHandler("resolvereprenewal", resolve_rep_renewal_cmd))
     app.add_handler(CommandHandler("resolvereservation", resolve_reservation_cmd))
+    app.add_handler(CommandHandler("resolveadminrenewal", resolve_admin_renewal_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
