@@ -249,8 +249,6 @@ def init_db():
             FOREIGN KEY (rep_id) REFERENCES representatives(id)
         )
         """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_rep ON financial_ledger(rep_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user ON financial_ledger(user_id)")
         
         # 7. User Settings (e.g. On First Connect toggle per user/session)
         cur.execute("""
@@ -549,12 +547,14 @@ def init_db():
             """)
             cur.execute("DROP TABLE financial_ledger")
             cur.execute("ALTER TABLE financial_ledger_migration RENAME TO financial_ledger")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_rep ON financial_ledger(rep_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user ON financial_ledger(user_id)")
         else:
             cols_led = [c[1] for c in led_info]
             if "user_id" not in cols_led:
                 cur.execute("ALTER TABLE financial_ledger ADD COLUMN user_id INTEGER DEFAULT NULL")
+
+        # Indexes are created only after legacy financial_ledger columns/table are migrated.
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_rep ON financial_ledger(rep_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user ON financial_ledger(user_id)")
 
         # Seed default settings
         for s in DEFAULT_SETTINGS:
