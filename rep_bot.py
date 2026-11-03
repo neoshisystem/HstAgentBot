@@ -204,7 +204,7 @@ async def pricing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
-    if role == "unauthorized_group":
+    if role == "unauthorized_group" or (role == "super_admin" and chat.type != "private"):
         return
         
     plans = database.get_pricing_plans()
@@ -1397,6 +1397,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if database.is_user_blocked(user.id):
         await update.message.reply_text("⛔️ دسترسی شما به این بات توسط مدیریت مسدود شده است.")
         return
+    if role == "super_admin" and chat.type != "private":
+        return
 
     # Text triggers for glass dashboard
     clean_text = msg_text.strip().lower()
@@ -1897,6 +1899,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if database.is_user_blocked(user.id):
         await query.answer("⛔️ دسترسی شما به این بات مسدود شده است.", show_alert=True)
+        return
+    if role == "super_admin" and chat.type != "private":
+        await query.answer(
+            "⛔️ عملیات مدیریت کل فقط در گفت‌وگوی خصوصی ربات مجاز است.",
+            show_alert=True
+        )
         return
 
     data = query.data or ""
