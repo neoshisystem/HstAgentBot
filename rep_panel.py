@@ -504,8 +504,16 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("صف بسته‌های رزرو")
 
-    # 6.1 Force Activate or Cancel Reserve
+    # 6.1 Legacy single-click reservation callbacks are read-only.
     elif action in ("force_res", "cancel_res"):
+        await query.answer(
+            "⚠️ این دکمه قدیمی است و اجرا نشد. صف رزرو یا کارت اکانت را تازه کنید و مرحله تأیید را انجام دهید.",
+            show_alert=True
+        )
+        return
+
+    # 6.2 First click: display second-stage confirmation without side effects.
+    elif action in ("confirm_force_res", "confirm_cancel_res"):
         try:
             res_id = int(parts[2])
         except (IndexError, ValueError):
@@ -514,15 +522,67 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         acc_code = parts[3] if len(parts) > 3 else ""
         res_item = database.get_reservation_by_id(res_id)
         if (
-            not res_item
-            or res_item["status"] != "pending"
+            not res_item or res_item.get("status") != "pending"
             or res_item.get("rep_id") != rep.get("id")
             or str(res_item.get("account_code", "")).lower() != acc_code.lower()
         ):
             await query.answer("⛔️ رزرو در انتظار و متعلق به نمایندگی شما یافت نشد.", show_alert=True)
             return
 
-        if action == "force_res":
+        if action == "confirm_force_res":
+            confirm_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🚀 تأیید فعال‌سازی فوری (بسته فعلی مصرف می‌شود)",
+                    callback_data=f"rep:do_force_res:{res_id}:{acc_code}"
+                )],
+                [InlineKeyboardButton("❌ انصراف / بازگشت به صف", callback_data="rep:reserves")]
+            ])
+            confirm_text = (
+                f"⚠️ **تأیید فعال‌سازی فوری بسته رزرو**\n\n"
+                f"اکانت: {acc_code}\n"
+                f"پلن رزرو: **{res_item['plan_name']}** ({res_item['gb']}G / {res_item['days']}D)\n\n"
+                "با تأیید، بسته فعلی اکانت کنار گذاشته می‌شود و درخواست تمدید فوراً به پنل ارسال خواهد شد."
+            )
+        else:
+            confirm_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"🗑 تأیید لغو و عودت {int(res_item.get('charge_amount') or 0):,} تومان",
+                    callback_data=f"rep:do_cancel_res:{res_id}:{acc_code}"
+                )],
+                [InlineKeyboardButton("❌ انصراف / بازگشت به صف", callback_data="rep:reserves")]
+            ])
+            confirm_text = (
+                f"⚠️ **تأیید لغو بسته رزرو و عودت وجه**\n\n"
+                f"اکانت: {acc_code}\n"
+                f"پلن رزرو: **{res_item['plan_name']}**\n"
+                f"مبلغ قابل عودت به تراز نمایندگی: **{int(res_item.get('charge_amount') or 0):,} تومان**\n\n"
+                "با تأیید، رزرو لغو و اعتبار نمایندگی به‌روزرسانی می‌شود."
+            )
+        await query.edit_message_text(
+            confirm_text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=confirm_keyboard
+        )
+        await query.answer("برای اجرای عملیات، تأیید دوم را بزنید.")
+        return
+
+    # 6.3 Second click: revalidate identity and pending status before mutation.
+    elif action in ("do_force_res", "do_cancel_res"):
+        try:
+            res_id = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("شناسه رزرو نامعتبر است.", show_alert=True)
+            return
+        acc_code = parts[3] if len(parts) > 3 else ""
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or res_item.get("rep_id") != rep.get("id")
+            or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+        ):
+            await query.answer("⛔️ رزرو تغییر کرده یا دیگر در محدوده نمایندگی شما نیست.", show_alert=True)
+            return
+
+        if action == "do_force_res":
             lock_key = f"reservation-activation:{res_id}"
             lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
             if not lock_token:
@@ -572,9 +632,11 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             database.release_operation_lock(lock_key, lock_token)
             result_msg = f"🚀 بسته رزرو اکانت {acc_code} فعال شد."
         else:
-            cancel_result = database.cancel_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
+            cancel_result = database.cancel_reservation(
+                res_id, actor_id=user.id, actor_name=user.full_name or "Rep"
+            )
             if not cancel_result:
-                await query.answer("⚠️ رزرو قبلاً تغییر وضعیت داده است.", show_alert=True)
+                await query.answer("⚠️ رزرو قبلاً تغییر وضعیت داده است یا در حال فعال‌سازی است.", show_alert=True)
                 return
             res_data, new_bal = cancel_result
             result_msg = f"🗑 رزرو {acc_code} لغو و {res_data['charge_amount']:,} تومان به تراز نماینده عودت داده شد."
