@@ -85,7 +85,7 @@ def test_setprice_command_does_not_mutate_from_group_even_for_admin_id(monkeypat
 
 
 def test_super_admin_cannot_enter_first_representative_panel_by_implicit_fallback(monkeypatch):
-    update, query, _ = make_update("rep:main", chat_type="supergroup")
+    update, query, _ = make_update("rep:main", chat_type="private")
     monkeypatch.setattr(rep_bot.database, "get_user_role", lambda *args, **kwargs: ("super_admin", None))
     monkeypatch.setattr(rep_bot.database, "is_user_blocked", lambda _uid: False)
     monkeypatch.setattr(rep_bot.database, "get_all_reps", lambda: [{"id": 1, "name": "First"}])
@@ -205,10 +205,9 @@ def test_super_admin_global_callbacks_are_rejected_outside_private_chat(monkeypa
     update, query, _ = make_update("status:ABCD", chat_type="supergroup")
     monkeypatch.setattr(rep_bot.database, "get_user_role", lambda *args, **kwargs: ("super_admin", None))
     monkeypatch.setattr(rep_bot.database, "is_user_blocked", lambda _uid: False)
-    monkeypatch.setattr(
-        rep_bot.xui_manager, "inspect_client",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("global admin callback must stop before X-UI")),
-    )
+    monkeypatch.setattr(rep_bot, "xui_manager", SimpleNamespace(
+        inspect_client=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("global admin callback must stop before X-UI"))
+    ))
 
     asyncio.run(rep_bot.handle_callback(update, SimpleNamespace(user_data={})))
 
