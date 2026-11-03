@@ -255,8 +255,8 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
 
             sub_id = alloc_res.get("sub_id")
-            code = xui_manager.extract_account_identifier(email) or email
             try:
+                code = xui_manager.extract_account_identifier(email) or email
                 database.upsert_account_record(
                     rep_id=rep["id"], email=email, account_code=code,
                     customer_name=cust_name, sub_id=sub_id, enable=1,
