@@ -2610,7 +2610,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
             return
 
-        activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or user.username)
+        try:
+            activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or user.username)
+        except Exception:
+            logger.exception("Reservation persistence failed after confirmed panel renewal: %s", res_id)
+            await query.answer("⚠️ پنل بسته را فعال کرد اما ثبت محلی انجام نشد؛ قفل برای بررسی محفوظ است.", show_alert=True)
+            return
         if not activated:
             await query.answer("⚠️ پنل عملیات را انجام داد اما ثبت فعال‌سازی ناموفق بود؛ قفل تطبیق حفظ شد.", show_alert=True)
             return
@@ -2849,9 +2854,16 @@ async def watchdog_worker(application: Application):
                             )
                             continue
 
-                        activated = database.activate_reservation(
-                            res_id, actor_id=0, actor_name="watchdog"
-                        )
+                        try:
+                            activated = database.activate_reservation(
+                                res_id, actor_id=0, actor_name="watchdog"
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Watchdog X-UI activation succeeded but local reservation state write failed: %s",
+                                res_id,
+                            )
+                            continue
                         if not activated:
                             logger.error(
                                 "X-UI renewed reservation %s but database activation failed; lease retained",
