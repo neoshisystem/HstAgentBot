@@ -1130,7 +1130,21 @@ def get_user_first_connect_mode(user_id: int) -> bool:
         row = cur.execute("SELECT first_connect_mode FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
         return bool(row["first_connect_mode"]) if row else False
 
+def set_user_first_connect_mode(user_id: int, enabled: bool) -> bool:
+    """Set an explicit per-user renewal mode; replaying the same callback is harmless."""
+    value = 1 if bool(enabled) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO user_settings (user_id, first_connect_mode)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET first_connect_mode = excluded.first_connect_mode
+        """, (int(user_id), value))
+        return bool(value)
+
+
 def toggle_user_first_connect_mode(user_id: int) -> bool:
+    """Legacy helper retained for non-callback callers."""
     with get_db() as conn:
         cur = conn.cursor()
         curr = get_user_first_connect_mode(user_id)
