@@ -1729,6 +1729,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else (parts[1] if len(parts) > 1 else "")
     )
 
+    # One-time confirmation for a quick-renew action. The token is owner-bound
+    # and consumed before the existing renewal/reservation pipeline is entered.
+    if action == "qrenew_confirm":
+        if role not in ("super_admin", "rep"):
+            await query.answer("⛔️ تمدید سریع فقط برای نماینده و مدیریت مجاز است.", show_alert=True)
+            return
+        intent_id = parts[1] if len(parts) > 1 else ""
+        intent = database.get_account_renewal_confirmation(intent_id, user.id)
+        if not intent:
+            await query.answer("⛔️ درخواست تمدید یافت نشد یا متعلق به شما نیست.", show_alert=True)
+            return
+        if intent["actor_role"] != role:
+            await query.answer("⛔️ سطح دسترسی این درخواست تغییر کرده است؛ از کارت اکانت دوباره اقدام کنید.", show_alert=True)
+            return
+
+        if role == "rep":
+            if not rep or int(intent.get("rep_id") or -1) != int(rep["id"]):
+                await query.answer("⛔️ این درخواست متعلق به محدوده نمایندگی شما نیست.", show_alert=True)
+                return
+            scoped = database.is_account_in_rep_scope(
+                rep["id"], intent.get("account_code") or intent.get("account_email") or ""
+            )
+            if (
+                not scoped
+                or str(scoped.get("email", "")).lower() != str(intent["account_email"]).lower()
+            ):
+                await query.answer("⛔️ مالکیت یا محدوده اکانت برای این تمدید قابل تأیید نیست.", show_alert=True)
+                return
+
+        consumed = database.consume_account_renewal_confirmation(
+            intent_id, user.id, role, rep["id"] if rep else None
+        )
+        if consumed["status"] != "consumed":
+            messages = {
+                "not_found": "⛔️ درخواست تمدید معتبر نیست.",
+                "wrong_role": "⛔️ سطح دسترسی درخواست با حساب فعلی تطبیق ندارد.",
+                "wrong_representative": "⛔️ درخواست متعلق به نمایندگی دیگری است.",
+                "already_processed": "⛔️ این تأیید تمدید قبلاً استفاده شده است؛ برای تمدید تازه از منوی پلن اقدام کنید.",
+                "expired": "⌛️ تأیید تمدید منقضی شده است؛ دوباره از منوی پلن اقدام کنید.",
+                "plan_changed": "⚠️ تعرفه پس از نمایش تأیید تغییر کرده است؛ دوباره از منوی پلن اقدام کنید.",
+            }
+            await query.answer(messages.get(consumed["status"], "❌ تأیید تمدید قابل اجرا نیست."), show_alert=True)
+            return
+
+        confirmed = consumed["intent"]
+        account_code = confirmed["account_email"]
+        parts = ["qrenew_execute", account_code, confirmed["plan_code"]]
+        action = "qrenew_execute"
+
     # 0. Admin Navigation
     if action == "admin":
         if role != "super_admin":
@@ -1757,7 +1806,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Strict End-User Isolation in Callbacks
     if role == "end_user":
-        if action in ("suspend", "activate", "qrenew", "force_res", "cancel_res", "toggle_mode", "set_mode", "more_plans"):
+        if action in ("suspend", "activate", "qrenew", "qrenew_confirm", "qrenew_execute", "force_res", "cancel_res", "toggle_mode", "set_mode", "more_plans"):
             await query.answer("⛔️ این عملیات فقط برای نماینده و مدیریت مجاز است.", show_alert=True)
             return
 
@@ -1940,7 +1989,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("✅ اتصال اکانت مجدداً برقرار گردید.")
             await asyncio.to_thread(send_admin_log, f"✅ برقراری اتصال اکانت `{email}` از دکمه شیشه‌ای")
 
-    # 7. Quick Renewal via Button (qrenew:<account_code>:<plan_code>)
+    # 7. Quick Renewal button opens an expiring one-time confirmation.
     elif action == "qrenew":
         if role not in ("super_admin", "rep"):
             await query.answer("⛔️ عدم دسترسی", show_alert=True)
@@ -1948,15 +1997,65 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         plan_code = parts[2] if len(parts) > 2 else "20gb_30d"
         plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ پلن مورد نظر تعریف نشده است.", show_alert=True)
+        if not plan or not plan.get("is_active", 1):
+            await query.answer("❌ پلن مورد نظر تعریف نشده یا غیرفعال است.", show_alert=True)
+            return
+        try:
+            confirmation_id = database.create_account_renewal_confirmation(
+                actor_id=user.id,
+                actor_role=role,
+                rep_id=rep["id"] if rep else None,
+                account_code=acc_record.get("account_code") or email,
+                account_email=email,
+                plan_code=plan["plan_code"],
+                plan_name=plan["name"],
+                gb=plan["gb"],
+                days=plan["days"],
+                amount=plan["rep_price"],
+            )
+        except ValueError as exc:
+            await query.answer(f"❌ ایجاد تأیید تمدید ممکن نشد: {exc}", show_alert=True)
             return
 
-        gb = plan["gb"]
-        days = plan["days"]
+        if role == "rep" and acc_record.get("rep_id") is not None:
+            charge_line = f"• هزینه نمایندگی: **{plan['rep_price']:,} تومان**\n"
+        else:
+            charge_line = "• هزینه: **بدون صورت‌حساب نمایندگی (مدیریت کل)**\n"
+        confirmation_text = (
+            f"⚡️ **تأیید تمدید سرویس {email}**\n\n"
+            f"• بسته: **{plan['name']}** ({plan['gb']} گیگابایت / {plan['days']} روز)\n"
+            f"{charge_line}"
+            "این تأیید تا ۱۰ دقیقه معتبر است و فقط یک بار قابل اجراست.\n"
+            "در صورت تمایل، عملیات تمدید یا ثبت رزرو را تأیید کنید."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "✅ تأیید تمدید",
+                callback_data=f"qrenew_confirm:{confirmation_id}"
+            )],
+            [InlineKeyboardButton(
+                "❌ انصراف",
+                callback_data=f"main_menu:{email}"
+            )]
+        ])
+        await safe_edit_message(query, confirmation_text, reply_markup=keyboard)
+        await query.answer("تأیید یک‌بارمصرف تمدید ایجاد شد.")
+
+    # qrenew_confirm has consumed its one-time token before reaching this branch.
+    # The existing direct-vs-reserve decision and accounting pipeline are preserved.
+    elif action == "qrenew_execute":
+        if role not in ("super_admin", "rep"):
+            await query.answer("⛔️ عدم دسترسی", show_alert=True)
+            return
+        plan_code = parts[2] if len(parts) > 2 else ""
+        plan = database.get_plan(plan_code)
+        if not plan:
+            await query.answer("❌ پلن مورد نظر دیگر در دسترس نیست.", show_alert=True)
+            return
+
         ok, msg_out, keyboard = await process_account_renewal(
             user=user, role=role, rep=rep, acc_record=acc_record, client_info=client_info,
-            gb=gb, days=days, plan_code=plan_code, effective_first=on_first,
+            gb=plan["gb"], days=plan["days"], plan_code=plan_code, effective_first=on_first,
             curr_comment=curr_comment, comment_updated=False
         )
         await safe_edit_message(query, msg_out, reply_markup=keyboard)
