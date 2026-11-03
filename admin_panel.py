@@ -114,7 +114,7 @@ async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYP
         
     dashboard_text = (
         "👑 **پیشخوان مدیریت جامع سیستم (Super Admin Dashboard)**\n\n"
-        "⚡️ وضعیت سامانه: **آنلاین و پایدار** (Zero Token Cost)\n"
+        "⚙️ وضعیت پنل: **مدیریت و نظارت سامانه**\n"
         f"• کل اکانت‌های ثبت‌شده در دیتابیس: **{total_accs}**\n"
         f"• اکانت‌های فعال: **{active_accs}** | غیرفعال: **{total_accs - active_accs}**\n"
         f"• تعداد کل نماینده‌ها: **{len(reps)}**\n"
@@ -248,7 +248,28 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         user_id = int(sub_action)
         new_val = database.toggle_user_block(user_id)
         await query.answer(f"✅ وضعیت کاربر به {'مسدود' if new_val else 'فعال'} تغییر یافت.", show_alert=True)
-        await handle_admin_callbacks(update, context)
+        u_info = database.get_bot_user_by_tg_id(user_id)
+        if not u_info:
+            await query.edit_message_text("❌ کاربر یافت نشد.", reply_markup=build_back_to_admin_keyboard())
+            return
+        is_blocked = bool(u_info.get("is_blocked", 0))
+        toggle_text = "🟢 رفع مسدودی" if is_blocked else "🚫 مسدود کردن"
+        lines = [
+            "👤 **شناسنامه کاربر نهایی:**\n",
+            f"• **نام:** {u_info.get('full_name') or 'ثبت نشده'}",
+            f"• **یوزرنیم:** @{u_info['username']}" if u_info.get("username") else "• **یوزرنیم:** ندارد",
+            f"• **شناسه تلگرام:** `{u_info['telegram_id']}`",
+            f"• **وضعیت دسترسی:** **{'🔴 مسدود' if is_blocked else '🟢 فعال'}**",
+            f"• **موجودی کیف پول:** **{u_info['wallet_balance']:,} تومان**",
+            f"• **تعداد اکانت‌های متصل:** **{u_info['linked_accounts_count']}**"
+        ]
+        keyboard = build_back_to_admin_keyboard([
+            [InlineKeyboardButton("💰 شارژ / کسر کیف پول", callback_data=f"admin:prompt_charge_user:{user_id}")],
+            [InlineKeyboardButton(toggle_text, callback_data=f"admin:toggle_block_user:{user_id}")],
+            [InlineKeyboardButton("🏠 بازگشت به کاربران", callback_data="admin:users:1")]
+        ])
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        return
 
     # 5. Financial Management Center
     elif action == "finance":
@@ -341,8 +362,25 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
     elif action == "toggle_plan_quick":
         plan_code = sub_action
         new_val = database.toggle_plan_quick(plan_code)
-        await query.answer(f"✅ وضعیت نمایش سریع پلن تغییر کرد.", show_alert=True)
-        await handle_admin_callbacks(update, context)
+        await query.answer("✅ وضعیت نمایش سریع پلن تغییر کرد.", show_alert=True)
+        plan = database.get_plan(plan_code)
+        if plan:
+            quick_text = "⚡️ نمایش سریع" if plan.get("is_quick") else "📦 نمایش عادی"
+            lines = [
+                f"⚙️ **مشخصات و مدیریت پلن: {plan['name']}**\n",
+                f"• کد پلن: `{plan['plan_code']}`",
+                f"• مشخصات: **{plan['gb']} گیگابایت / {plan['days']} روز**",
+                f"• قیمت نماینده: **{plan['rep_price']:,} تومان**",
+                f"• قیمت کاربر نهایی: **{plan['user_price']:,} تومان**",
+                f"• حالت نمایش: **{quick_text}**"
+            ]
+            keyboard = build_back_to_admin_keyboard([
+                [InlineKeyboardButton("✏️ ویرایش قیمت‌ها", callback_data=f"admin:prompt_edit_plan:{plan_code}")],
+                [InlineKeyboardButton("⚡️ تغییر حالت سریع/عادی", callback_data=f"admin:toggle_plan_quick:{plan_code}")],
+                [InlineKeyboardButton("🗑 حذف این تعرفه", callback_data=f"admin:confirm_del_plan:{plan_code}")]
+            ])
+            await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        return
 
     elif action == "confirm_del_plan":
         plan_code = sub_action
@@ -366,7 +404,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             active_tag = "🟢" if p.get("is_active", 1) else "🔴 [غیرفعال]"
             lines.append(
                 f"{active_tag} {quick_tag} **{p['name']}** (`{p['plan_code']}`):\n"
-                f"   • {p['traffic_gb']}GB / {p['period_days']} روز | خرید: **{p['rep_price']:,} ت** | فروش: **{p['user_price']:,} ت**"
+                f"   • {p['gb']}GB / {p['days']} روز | خرید: **{p['rep_price']:,} ت** | فروش: **{p['user_price']:,} ت**"
             )
             extra_btns.append([
                 InlineKeyboardButton(f"⚙️ مدیریت {p['name']}", callback_data=f"admin:plan_detail:{p['plan_code']}")
@@ -543,10 +581,20 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             email, gb, days, comment=None, rollover=False, countdown=True if on_first else "auto",
             scope="all", by_code_only=True
         )
-        database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Admin")
-        await query.answer(f"🚀 بسته رزرو اکانت {acc_code} با موفقیت فعال شد.", show_alert=True)
-        # Refresh reserves view
-        await handle_admin_callbacks(update, context)
+        if not isinstance(ren_res, dict) or not (
+            ren_res.get("status") in ("success", "ok") or ren_res.get("success") is True
+        ):
+            await query.answer("⚠️ پنل موفقیت فعال‌سازی را تایید نکرد؛ رزرو در صف باقی ماند.", show_alert=True)
+            return
+        activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Admin")
+        if not activated:
+            await query.answer("⚠️ وضعیت رزرو هم‌زمان تغییر کرده است؛ دوباره اجرا نکنید.", show_alert=True)
+            return
+        await query.answer(f"🚀 بسته رزرو اکانت {acc_code} فعال شد.", show_alert=True)
+        await query.edit_message_text(
+            f"✅ فعال‌سازی رزرو `{acc_code}` ثبت شد. برای مشاهده صف به‌روزشده، از دکمه زیر استفاده کنید.",
+            reply_markup=build_back_to_admin_keyboard([[InlineKeyboardButton("📦 بازخوانی صف رزرو", callback_data="admin:reserves")]])
+        )
         return
 
     elif action == "cancel_res":
@@ -558,8 +606,10 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer(f"🗑 بسته رزرو اکانت {acc_code} لغو و {res_data['charge_amount']:,} تومان عودت داده شد.", show_alert=True)
         else:
             await query.answer("⚠️ این بسته قبلاً لغو یا فعال شده است.", show_alert=True)
-        # Refresh reserves view
-        await handle_admin_callbacks(update, context)
+        await query.edit_message_text(
+            "✅ عملیات لغو رزرو پردازش شد. برای مشاهده صف به‌روزشده از دکمه زیر استفاده کنید.",
+            reply_markup=build_back_to_admin_keyboard([[InlineKeyboardButton("📦 بازخوانی صف رزرو", callback_data="admin:reserves")]])
+        )
         return
 
     # 15. New CRUD Admin Sections (v4.0.0-beta.2)
@@ -590,12 +640,35 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         rep_id = int(sub_action)
         new_val = database.toggle_rep_active(rep_id)
         await query.answer(f"✅ وضعیت نماینده به {'فعال' if new_val else 'معلق'} تغییر یافت.", show_alert=True)
-        await handle_admin_callbacks(update, context) # Refresh
-
-        if chat.type != "private":
-            await query.answer("⚠️ این عملیات منحصراً در چت خصوصی (پیوی) ربات در دسترس است تا چت تاپیک شلوغ نشود.", show_alert=True)
+        rep = database.get_rep_by_id(rep_id)
+        if not rep:
+            await query.edit_message_text("❌ نماینده یافت نشد.", reply_markup=build_back_to_admin_keyboard())
             return
+        lines = [
+            f"👤 **شناسنامه نماینده: {rep['name']}**\n",
+            f"• کد: `{rep['rep_code']}` | آیدی: `{rep['telegram_id']}`",
+            f"• وضعیت: {'🟢 فعال' if rep['is_active'] else '🔴 معلق'}",
+            f"• سقف اعتبار: `{int(rep.get('credit_limit_toman') or 0):,} تومان`",
+            f"• بدهی جاری: `{int(rep.get('balance_toman') or 0):,} تومان`"
+        ]
+        keyboard = build_back_to_admin_keyboard([
+            [InlineKeyboardButton("🟢 تسویه / تعدیل تراز", callback_data=f"admin:prompt_pay:{rep['rep_code']}"),
+             InlineKeyboardButton("💳 تغییر سقف اعتبار", callback_data=f"admin:prompt_edit_credit:{rep_id}")],
+            [InlineKeyboardButton("✏️ ویرایش مشخصات", callback_data=f"admin:prompt_edit_rep:{rep_id}")],
+            [InlineKeyboardButton("⏸ تعلیق / فعال‌سازی", callback_data=f"admin:toggle_rep:{rep_id}"),
+             InlineKeyboardButton("🗑 حذف نماینده", callback_data=f"admin:confirm_del_rep:{rep_id}")]
+        ])
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        return
 
+    elif action in {
+        "prompt_card_settings", "prompt_charge_user", "prompt_edit_credit",
+        "prompt_setting", "prompt_pay", "prompt_add_rep", "prompt_edit_plan",
+        "prompt_transfer", "prompt_inspect", "prompt_add_plan", "prompt_link_user"
+    }:
+        if chat.type != "private":
+            await query.answer("⚠️ این عملیات منحصراً در چت خصوصی ربات در دسترس است.", show_alert=True)
+            return
         now_ts = time.time()
         if action == "prompt_card_settings":
             context.user_data["admin_state"] = {"action": "edit_card_settings", "ts": now_ts}
@@ -760,16 +833,37 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             keyboard = build_back_to_admin_keyboard()
             await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             await query.answer()
-
     elif action == "recent_tx":
-        recent_tx = database.get_recent_ledger_entries(limit=10)
-        lines = ["📑 **۱۰ تراکنش اخیر سیستم:**\n"]
-        for tx in recent_tx:
-            sign = "🔺" if tx["transaction_type"] == "debit" else "🟢"
-            lines.append(f"{sign} `{tx['created_at'][:16]}` | **{tx['amount']:,} ت** | {tx['description']} (مانده: {tx['balance_after']:,})")
-        keyboard = build_back_to_admin_keyboard()
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        entries, total, total_pages = database.get_financial_ledger_paginated(
+            rep_id=None, page=page, page_size=10
+        )
+        lines = [f"📑 **تاریخچه تراکنش‌های سیستم ({total} مورد) — صفحه {page}/{total_pages}:**\n"]
+        for tx in entries:
+            sign = "🔺 بدهکار" if tx["transaction_type"] == "debit" else "🟢 بستانکار"
+            if tx.get("rep_id") is not None:
+                identity = f"نماینده: {tx.get('rep_name') or tx['rep_id']}"
+            elif tx.get("user_id") is not None:
+                identity_name = tx.get("user_full_name") or (
+                    f"@{tx['user_username']}" if tx.get("user_username") else str(tx["user_id"])
+                )
+                identity = f"کاربر: {identity_name}"
+            else:
+                identity = f"عامل: {tx.get('actor_name') or tx.get('actor_id')}"
+            lines.append(
+                f"• {sign} | {identity}\n"
+                f"  `{tx['created_at'][:16]}` | **{tx['amount']:,} تومان**\n"
+                f"  {tx['description']} | مانده: `{tx['balance_after']:,}`"
+            )
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"admin:recent_tx:{page-1}"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"admin:recent_tx:{page+1}"))
+        extra = [nav] if nav else []
+        keyboard = build_back_to_admin_keyboard(extra)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        await query.answer("تراکنش‌های اخیر")
+        await query.answer("تاریخچه تراکنش‌ها")
 
 async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
