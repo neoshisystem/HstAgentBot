@@ -1367,7 +1367,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     parts = data.split(":")
     action = parts[0]
-    account_code = parts[1] if len(parts) > 1 else ""
+    # Reserve callbacks carry <reservation_id>:<account_email>; other account
+    # callbacks carry the account identifier in parts[1].
+    account_code = (
+        parts[2] if action in ("force_res", "cancel_res") and len(parts) > 2
+        else (parts[1] if len(parts) > 1 else "")
+    )
 
     # 0. Admin Navigation
     if action == "admin":
@@ -1602,16 +1607,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         res_email = res_item["email"]
+        if (
+            str(res_email).lower() != str(email).lower()
+            or (rep and res_item.get("rep_id") != rep.get("id"))
+        ):
+            await query.answer("⛔️ این رزرو متعلق به اکانت یا نمایندگی شما نیست.", show_alert=True)
+            return
         gb = res_item["gb"]
         days = res_item["days"]
         on_first_res = bool(res_item.get("on_first_connect", 0))
 
-        ren_res = await asyncio.to_thread(
-            xui_manager.renew_client,
-            res_email, gb, days, comment=None, rollover=False,
-            countdown=True if on_first_res else "auto",
-            scope=scope_flt, by_code_only=True
-        )
+        try:
+            ren_res = await asyncio.to_thread(
+                xui_manager.renew_client,
+                res_email, gb, days, comment=None, rollover=False,
+                countdown=True if on_first_res else "auto",
+                scope=scope_flt, by_code_only=True
+            )
+        except Exception:
+            logger.exception("Force reservation outcome is unknown: %s", res_id)
+            await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو در صف باقی ماند و نیاز به بررسی دارد.", show_alert=True)
+            return
         if not _xui_operation_succeeded(ren_res):
             await query.answer("⚠️ پنل موفقیت فعال‌سازی را تایید نکرد؛ رزرو در صف باقی ماند.", show_alert=True)
             return
@@ -1633,6 +1649,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 9. Cancel Reserved Package and Refund
     elif action == "cancel_res":
         res_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("email", "")).lower() != str(email).lower()
+            or (rep and res_item.get("rep_id") != rep.get("id"))
+        ):
+            await query.answer("⛔️ رزرو در انتظار متعلق به اکانت یا نمایندگی شما نیست.", show_alert=True)
+            return
         cancel_res = database.cancel_reservation(res_id, actor_id=user.id, actor_name=user.full_name or user.username)
         if not cancel_res:
             await query.answer("⚠️ این بسته قبلاً لغو یا فعال شده است.", show_alert=True)
