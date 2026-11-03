@@ -44,6 +44,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("HstAgentBot")
 
+
+def _xui_operation_succeeded(result) -> bool:
+    """Accept only an explicit successful response from the external panel."""
+    return isinstance(result, dict) and (
+        result.get("status") in ("success", "ok") or result.get("success") is True
+    )
+
+
 async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=ParseMode.MARKDOWN):
     """
     Safely edits a message text or caption (for photo messages like QR codes),
@@ -278,6 +286,9 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rep_code = args[0].lower()
     amount = int(args[1])
+    if amount <= 0:
+        await update.message.reply_text("❌ مبلغ تسویه باید عددی مثبت باشد.")
+        return
     desc = " ".join(args[2:]) if len(args) > 2 else "تسویه حساب / واریزی نماینده"
 
     rep_info = database.get_rep_by_code(rep_code)
@@ -362,19 +373,18 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     card_info = database.get_card_info()
-    tr_code = finance_manager.generate_tracking_code()
-    context.user_data["active_receipt_code"] = tr_code
-    context.user_data["deposit_amount"] = amount
-    context.user_data["deposit_role"] = "rep" if role == "rep" else "end_user"
-
     dep_role = "rep" if role == "rep" else "end_user"
     target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
-    database.create_payment_receipt(
+    tr_code = database.create_payment_receipt(
         user_id=user.id,
         role=dep_role,
         amount_toman=amount,
         rep_id=target_rep_id
     )
+    context.user_data["active_receipt_code"] = tr_code
+    context.user_data["deposit_amount"] = amount
+    context.user_data["deposit_role"] = dep_role
+    context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_PHOTO
 
     msg = finance_manager.format_card_instructions(amount, tr_code, card_info)
     keyboard = finance_manager.build_card_payment_keyboard(tr_code)
@@ -546,6 +556,17 @@ async def process_account_renewal(
             email, gb, days, comment=curr_comment, rollover=True, countdown=countdown_param,
             scope=scope_flt, by_code_only=by_code_only
         )
+        if not _xui_operation_succeeded(ren_res):
+            pending_res = database.get_pending_reservation(account_code)
+            keyboard = nlp_matcher.build_account_keyboard(
+                account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                role=role, pending_res=pending_res
+            )
+            return False, (
+                "⚠️ پاسخ پنل، موفقیت تمدید را تأیید نکرد. هیچ هزینه یا وضعیت مالی جدیدی ثبت نشد؛ "
+                "وضعیت اکانت را در پنل بررسی کنید."
+            ), keyboard
+
         report_text = ren_res.get("report", "")
         if comment_updated:
             report_text = f"👤 **نام مشتری روی اکانت ثبت شد:** `{curr_comment}`\n\n" + report_text
@@ -620,31 +641,10 @@ async def process_account_renewal(
         )
 
         if is_admin_exempt:
-            database.log_audit(
-                rep_id=None, account_code=account_code, email=email,
-                action="admin_reserve_package", actor_id=user.id, actor_name=user.full_name or user.username,
-                details={"gb": gb, "days": days, "mode": "on_connect" if effective_first else "rollover", "charge": 0, "res_id": res_id, "exempt": True},
-                result_status="success"
-            )
             fin_info = "• وضعیت مالی: 👑 **عملیات مستقیم مدیریت کل (معاف از صورت‌حساب نمایندگی)**"
         else:
-            new_bal = database.record_ledger_entry(
-                rep_id=target_rep_id,
-                account_code=account_code,
-                email=email,
-                plan_code=plan_code,
-                tx_type="debit",
-                amount=charge,
-                description=f"رزرو بسته {plan_name} (حالت: {'با اولین اتصال' if effective_first else 'رول‌اوور'})",
-                actor_id=user.id,
-                actor_name=user.full_name or user.username
-            )
-            database.log_audit(
-                rep_id=target_rep_id, account_code=account_code, email=email,
-                action="reserve_package", actor_id=user.id, actor_name=user.full_name or user.username,
-                details={"gb": gb, "days": days, "mode": "on_connect" if effective_first else "rollover", "charge": charge, "balance_after": new_bal, "res_id": res_id},
-                result_status="success"
-            )
+            # Reservation and representative debit were committed atomically by create_reservation.
+            new_bal = database.get_rep_balance(target_rep_id)
             fin_info = f"• فاکتور رزرو: `{charge:,} تومان` | **مانده بدهی نماینده:** `{new_bal:,} تومان`"
 
         pending_dict = database.get_reservation_by_id(res_id)
@@ -686,67 +686,84 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
     if role == "unauthorized_group":
         return
+    if database.is_user_blocked(user.id):
+        await update.message.reply_text("⛔️ دسترسی شما به این بات مسدود شده است.")
+        return
 
-    fsm_state = context.user_data.get("fsm_state")
-    photo = update.message.photo[-1]
-    photo_id = photo.file_id
+    photo_id = update.message.photo[-1].file_id
     caption = (update.message.caption or "").strip()
     tr_code = context.user_data.get("active_receipt_code")
-    amount = context.user_data.get("deposit_amount", 0)
-    dep_role = context.user_data.get("deposit_role", "end_user" if role == "end_user" else "rep")
+    amount = int(context.user_data.get("deposit_amount") or 0)
+    dep_role = context.user_data.get("deposit_role") or ("rep" if role == "rep" else "end_user")
     target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
 
-    # If amount is 0, attempt to parse amount from caption text if provided
-    if amount == 0 and caption:
+    if amount <= 0 and caption:
         import re
-        digits_match = re.findall(r'\b\d[\d,]{3,}\b', caption)
+        digits_match = re.findall(r"\b\d[\d,]{3,}\b", caption)
         if digits_match:
             try:
-                amount = int(digits_match[0].replace(',', ''))
+                amount = int(digits_match[0].replace(",", ""))
             except ValueError:
                 amount = 0
 
-    if not tr_code:
-        tr_code = finance_manager.generate_tracking_code()
-
-    existing_rcp = database.get_payment_receipt(tr_code)
-    if not existing_rcp:
-        database.create_payment_receipt(
-            user_id=user.id,
-            role=dep_role,
-            amount_toman=amount,
-            rep_id=target_rep_id,
-            photo_id=photo_id,
-            note=caption
+    if amount <= 0:
+        await update.message.reply_text(
+            "⚠️ مبلغ فیش مشخص نیست. ابتدا از گزینه ثبت فیش یا دستور /deposit مبلغ را ثبت کنید."
         )
-    else:
-        with database.get_db() as conn:
-            conn.execute(
-                "UPDATE payment_receipts SET receipt_photo_id = ?, receipt_note = ?, amount_toman = CASE WHEN amount_toman = 0 THEN ? ELSE amount_toman END WHERE id = ?",
-                (photo_id, caption, amount, existing_rcp["id"])
+        return
+
+    try:
+        if tr_code:
+            receipt = database.get_payment_receipt(tr_code)
+            if (
+                not receipt
+                or int(receipt["user_id"]) != int(user.id)
+                or receipt["status"] != "pending"
+                or receipt["role"] != dep_role
+            ):
+                await update.message.reply_text("⛔️ فیش در انتظار ارسال برای این حساب یافت نشد یا دیگر قابل ویرایش نیست.")
+                return
+            with database.get_db() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE payment_receipts
+                    SET receipt_photo_id = ?, receipt_note = ?,
+                        amount_toman = CASE WHEN amount_toman = 0 THEN ? ELSE amount_toman END
+                    WHERE id = ? AND user_id = ? AND status = 'pending'
+                """, (photo_id, caption, amount, receipt["id"], user.id))
+                if cur.rowcount != 1:
+                    await update.message.reply_text("⚠️ فیش هم‌زمان تغییر کرده است؛ لطفاً وضعیت را بررسی کنید.")
+                    return
+        else:
+            # Support a direct photo only when its amount can be established.
+            tr_code = database.create_payment_receipt(
+                user_id=user.id, role=dep_role, amount_toman=amount,
+                rep_id=target_rep_id, photo_id=photo_id, note=caption
             )
-            conn.commit()
+        receipt = database.get_payment_receipt(tr_code)
+        if not receipt:
+            raise RuntimeError("Persisted receipt could not be reloaded")
+    except Exception:
+        logger.exception("Could not persist incoming payment receipt")
+        await update.message.reply_text("❌ ثبت فیش انجام نشد. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+        return
 
-    rcp = database.get_payment_receipt(tr_code)
-    context.user_data.pop("fsm_state", None)
-    context.user_data.pop("active_receipt_code", None)
-    context.user_data.pop("deposit_amount", None)
+    for key in ("fsm_state", "active_receipt_code", "deposit_amount", "deposit_role"):
+        context.user_data.pop(key, None)
 
-    amount_disp = f"**{rcp['amount_toman']:,} تومان**" if rcp['amount_toman'] > 0 else "ثبت‌شده روی تصویر فیش"
-
+    amount_disp = f"**{receipt['amount_toman']:,} تومان**"
     await update.message.reply_text(
         f"🚀 **رسید پرداخت شما با موفقیت دریافت و ثبت گردید.**\n\n"
-        f"• کد پیگیری: `{tr_code}`\n"
+        f"• کد پیگیری: `{receipt['tracking_code']}`\n"
         f"• مبلغ واریزی: {amount_disp}\n\n"
         "به محض بررسی و تایید توسط مدیریت، حساب شما شارژ یا تسویه خواهد شد.",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Send card to Super Admin
     admin_tg_id = database.get_setting("admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int)
     admin_dm_top = database.get_setting("admin_dm_topic_id", default=ADMIN_DM_LOGS_TOPIC_ID, cast_type=int)
-    card_text = finance_manager.format_admin_receipt_card(rcp, user.full_name, user.username)
-    review_keyboard = finance_manager.build_admin_receipt_review_keyboard(rcp["id"])
+    card_text = finance_manager.format_admin_receipt_card(receipt, user.full_name, user.username)
+    review_keyboard = finance_manager.build_admin_receipt_review_keyboard(receipt["id"])
 
     if admin_tg_id:
         try:
@@ -758,8 +775,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=review_keyboard
             )
-        except Exception as e:
-            logger.error(f"Failed to forward receipt photo to admin: {e}")
+        except Exception:
+            logger.exception("Failed to forward receipt image; sending text fallback")
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_tg_id,
+                    message_thread_id=admin_dm_top if admin_dm_top else None,
+                    text=card_text + "\n\n⚠️ ارسال تصویر ناموفق بود؛ فیش در پایگاه داده ثبت است.",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=review_keyboard
+                )
+            except Exception:
+                logger.exception("Failed to send receipt review fallback to admin")
 
 # --- Message & NLP Router ---
 
@@ -816,17 +843,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = int(text_clean)
             context.user_data["deposit_amount"] = amount
             card_info = database.get_card_info()
-            tr_code = finance_manager.generate_tracking_code()
-            context.user_data["active_receipt_code"] = tr_code
             dep_role = context.user_data.get("deposit_role", "end_user" if role == "end_user" else "rep")
             target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
-
-            database.create_payment_receipt(
+            tr_code = database.create_payment_receipt(
                 user_id=user.id,
                 role=dep_role,
                 amount_toman=amount,
                 rep_id=target_rep_id
             )
+            context.user_data["active_receipt_code"] = tr_code
+            context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_PHOTO
 
             msg = finance_manager.format_card_instructions(amount, tr_code, card_info)
             keyboard = finance_manager.build_card_payment_keyboard(tr_code)
@@ -1301,7 +1327,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("send_receipt_"):
         tr_code = data.replace("send_receipt_", "")
-        context.user_data["active_receipt_code"] = tr_code
+        receipt = database.get_payment_receipt(tr_code)
+        if (
+            not receipt or int(receipt["user_id"]) != int(user.id)
+            or receipt["status"] != "pending"
+        ):
+            await query.answer("⛔️ این شناسه فیش متعلق به شما نیست یا دیگر در انتظار ارسال نیست.", show_alert=True)
+            return
+        context.user_data["active_receipt_code"] = receipt["tracking_code"]
+        context.user_data["deposit_amount"] = receipt["amount_toman"]
+        context.user_data["deposit_role"] = receipt["role"]
         context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_PHOTO
         await query.answer("📸 منتظر ارسال تصویر فیش...")
         await query.message.reply_text(
@@ -1577,7 +1612,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             countdown=True if on_first_res else "auto",
             scope=scope_flt, by_code_only=True
         )
-        database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or user.username)
+        if not _xui_operation_succeeded(ren_res):
+            await query.answer("⚠️ پنل موفقیت فعال‌سازی را تایید نکرد؛ رزرو در صف باقی ماند.", show_alert=True)
+            return
+        activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or user.username)
+        if not activated:
+            await query.answer("⚠️ وضعیت رزرو تغییر کرده است؛ از اجرای دوباره خودداری شد.", show_alert=True)
+            return
         report_text = ren_res.get("report", "")
         report_text = f"🚀 **بسته رزرو به صورت فوری فعال شد (اعتبار قبلی صفر و دوره جدید آغاز گردید):**\n\n" + report_text
         keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=on_first_res, role=role, pending_res=None)
@@ -1760,7 +1801,17 @@ async def watchdog_worker(application: Application):
                             countdown=True if on_first else "auto",
                             scope="all", by_code_only=True
                         )
-                        database.activate_reservation(res["id"], actor_id=0, actor_name="watchdog")
+                        if not _xui_operation_succeeded(ren_res):
+                            logger.error(
+                                "Watchdog did not receive a confirmed X-UI success for reservation %s; "
+                                "leaving it pending for reconciliation (response=%r)",
+                                res["id"], ren_res
+                            )
+                            continue
+                        activated = database.activate_reservation(res["id"], actor_id=0, actor_name="watchdog")
+                        if not activated:
+                            logger.warning("Reservation %s changed state before watchdog commit", res["id"])
+                            continue
 
                         account_code = res["account_code"]
                         plan_name = res["plan_name"]
@@ -1794,7 +1845,7 @@ async def watchdog_worker(application: Application):
                                 logger.error(f"Failed to send rep auto-activation notice: {e}")
 
         except Exception as e:
-            logger.error(f"Error in watchdog worker cycle: {e}")
+            logger.error(f"Error in watchdog worker cycle: {e}", exc_info=True)
 
         interval = database.get_setting("watchdog_interval_sec", default=300, cast_type=int)
         await asyncio.sleep(interval)
