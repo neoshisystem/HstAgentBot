@@ -398,6 +398,6 @@ def test_rep_renewal_conflicting_xui_signals_are_ambiguous_not_refunded(renewal_
     rows = renewal_rows()
     locks = renewal_locks()
     assert ok is False
-    assert "مبهم" in message
+    assert "موفقیت یا شکست قطعی" in message
     assert rows[-1]["status"] == "needs_reconciliation"
     assert locks
