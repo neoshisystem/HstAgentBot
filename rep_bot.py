@@ -1144,8 +1144,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_super_admin:
         with database.get_db() as conn:
             row = conn.cursor().execute(
-                "SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) = ? OR LOWER(email) LIKE ? LIMIT 1",
-                (account_code.lower(), account_code.lower(), f"%{account_code.lower()}%")
+                "SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) = ? LIMIT 1",
+                (account_code.lower(), account_code.lower())
             ).fetchone()
             if row:
                 acc_record = dict(row)
@@ -1622,8 +1622,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_super_admin:
         with database.get_db() as conn:
             row = conn.cursor().execute(
-                "SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) = ? OR LOWER(email) LIKE ? LIMIT 1",
-                (account_code.lower(), account_code.lower(), f"%{account_code.lower()}%")
+                "SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) = ? LIMIT 1",
+                (account_code.lower(), account_code.lower())
             ).fetchone()
             if row:
                 acc_record = dict(row)
