@@ -393,8 +393,16 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 3.1 View Specific Account Card
     elif action == "view_acc":
-        acc_code = parts[2] if len(parts) > 2 else ""
-        insp = await asyncio.to_thread(xui_manager.inspect_client, acc_code, scope=rep.get("scope_filter", "all"), by_code_only=True)
+        requested_code = parts[2] if len(parts) > 2 else ""
+        owned_account = database.is_account_in_rep_scope(rep["id"], requested_code)
+        if not owned_account:
+            await query.answer("⛔️ این اکانت در محدوده ثبت‌شده نمایندگی شما نیست.", show_alert=True)
+            return
+        acc_code = owned_account["account_code"]
+        insp = await asyncio.to_thread(
+            xui_manager.inspect_client, owned_account["email"],
+            scope=rep.get("scope_filter", "all"), by_code_only=True
+        )
         if insp.get("status") == "ok":
             client_info = insp["data"]
             report_text = xui_manager.format_status_report(client_info, is_admin=False)
@@ -488,8 +496,8 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"  هزینه: `{r['charge_amount']:,} ت` | ثبت: `{r['created_at'][:16]}`"
                 )
                 extra_btns.append([
-                    InlineKeyboardButton(f"🚀 فعال‌سازی {r['account_code']}", callback_data=f"rep:force_res:{r['id']}:{r['account_code']}"),
-                    InlineKeyboardButton(f"🗑 لغو و عودت {r['account_code']}", callback_data=f"rep:cancel_res:{r['id']}:{r['account_code']}")
+                    InlineKeyboardButton(f"🚀 فعال‌سازی {r['account_code']}", callback_data=f"rep:confirm_force_res:{r['id']}:{r['account_code']}"),
+                    InlineKeyboardButton(f"🗑 لغو و عودت {r['account_code']}", callback_data=f"rep:confirm_cancel_res:{r['id']}:{r['account_code']}")
                 ])
 
         keyboard = build_back_to_rep_keyboard(extra_btns)
@@ -621,6 +629,14 @@ async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_T
     if not rep_state:
         return False
 
+    if int(rep_state.get("rep_id") or -1) != int(rep.get("id") or -2):
+        context.user_data.pop("rep_state", None)
+        await update.message.reply_text(
+            "⛔️ زمینه این درخواست متعلق به نمایندگی دیگری است یا دیگر معتبر نیست؛ از پیشخوان نمایندگی دوباره شروع کنید.",
+            reply_markup=build_rep_main_keyboard(),
+        )
+        return True
+
     # Check timeout (90s)
     if time.time() - rep_state.get("ts", 0) > 90:
         context.user_data.pop("rep_state", None)
@@ -669,13 +685,20 @@ async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_T
         insp = await asyncio.to_thread(xui_manager.inspect_client, msg_text, scope=rep.get("scope_filter", "all"), by_code_only=False)
         if insp.get("status") == "ok":
             client_info = insp["data"]
-            acc_code = client_info["email"]
+            owned_account = database.is_account_in_rep_scope(rep["id"], client_info.get("email", ""))
+            if not owned_account:
+                await update.message.reply_text(
+                    f"⚠️ اکانت {msg_text} در محدوده ثبت‌شده نمایندگی شما یافت نشد.",
+                    reply_markup=build_rep_main_keyboard(),
+                )
+                return True
+            acc_code = owned_account["account_code"]
             report_text = xui_manager.format_status_report(client_info, is_admin=False)
             pending_res = database.get_pending_reservation(acc_code)
             keyboard = nlp_matcher.build_account_keyboard(acc_code, is_enabled=bool(client_info["raw"].get("enable", True)), role="rep", pending_res=pending_res)
             await update.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         else:
-            await update.message.reply_text(f"⚠️ اکانت `{msg_text}` در محدوده نمایندگی شما یافت نشد.", reply_markup=build_rep_main_keyboard())
+            await update.message.reply_text(f"⚠️ اکانت {msg_text} در محدوده نمایندگی شما یافت نشد.", reply_markup=build_rep_main_keyboard())
         return True
 
     return False
