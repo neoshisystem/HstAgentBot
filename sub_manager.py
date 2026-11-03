@@ -32,15 +32,32 @@ def generate_new_uuid() -> str:
 
 
 def get_subscription_url(sub_id: str) -> str:
-    """Build a URL only when a real public subscription domain is configured."""
-    sub_domain = str(getattr(config, "SUB_DOMAIN", "") or "").strip()
-    if not sub_domain or not sub_id:
+    """Build a URL only from a valid configured public host and path."""
+    from urllib.parse import quote, urlsplit
+
+    domain = str(getattr(config, "SUB_DOMAIN", "") or "").strip()
+    if not domain or not isinstance(sub_id, str) or not sub_id.strip():
         return ""
-    sub_port = int(getattr(config, "SUB_PORT", 443))
-    sub_path = str(getattr(config, "SUB_PATH", "sub") or "sub").strip("/")
-    port_part = "" if sub_port in (80, 443) else f":{sub_port}"
-    path_part = f"/{sub_path}" if sub_path else ""
-    return f"https://{sub_domain}{port_part}{path_part}/{sub_id}"
+    try:
+        parsed = urlsplit("https://" + domain)
+        if (
+            not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.path
+            or parsed.query or parsed.fragment or parsed.port is not None
+        ):
+            return ""
+        port = int(getattr(config, "SUB_PORT", 443))
+        if not 1 <= port <= 65535:
+            return ""
+    except (TypeError, ValueError):
+        return ""
+
+    raw_path = str(getattr(config, "SUB_PATH", "sub") or "").strip("/")
+    path = "/".join(quote(part, safe="-._~") for part in raw_path.split("/") if part)
+    token = quote(sub_id.strip(), safe="-._~")
+    port_part = "" if port == 443 else f":{port}"
+    path_part = f"/{path}" if path else ""
+    return f"https://{parsed.netloc}{port_part}{path_part}/{token}"
 
 
 def reset_client_sub_id(xui_module, email: str) -> tuple[bool, str, str]:
