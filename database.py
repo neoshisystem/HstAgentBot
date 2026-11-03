@@ -636,22 +636,26 @@ def get_plan(plan_code):
         return dict(row) if row else None
 
 def update_plan_price(plan_code, rep_price=None, user_price=None):
+    if rep_price is not None and int(rep_price) <= 0:
+        raise ValueError("Representative price must be positive")
+    if user_price is not None and int(user_price) <= 0:
+        raise ValueError("User price must be positive")
     with get_db() as conn:
         cur = conn.cursor()
         if rep_price is not None and user_price is not None:
-            cur.execute("UPDATE pricing_plans SET rep_price = ?, user_price = ? WHERE plan_code = ?", (rep_price, user_price, plan_code))
+            cur.execute(
+                "UPDATE pricing_plans SET rep_price = ?, user_price = ? WHERE plan_code = ?",
+                (int(rep_price), int(user_price), plan_code)
+            )
         elif rep_price is not None:
-            cur.execute("UPDATE pricing_plans SET rep_price = ? WHERE plan_code = ?", (rep_price, plan_code))
+            cur.execute("UPDATE pricing_plans SET rep_price = ? WHERE plan_code = ?", (int(rep_price), plan_code))
         elif user_price is not None:
-            cur.execute("UPDATE pricing_plans SET user_price = ? WHERE plan_code = ?", (user_price, plan_code))
-        conn.commit()
-        log_audit(
-            rep_id=None, account_code=plan_code, email=None, action="update_plan_price",
-            actor_id=0, actor_name="admin", details={"rep_price": rep_price, "user_price": user_price},
-            result_status="success"
-        )
-        return get_plan(plan_code)
-
+            cur.execute("UPDATE pricing_plans SET user_price = ? WHERE plan_code = ?", (int(user_price), plan_code))
+        else:
+            raise ValueError("At least one price must be supplied")
+        if cur.rowcount != 1:
+            return None
+    return get_plan(plan_code)
 def add_or_update_plan(plan_code, name, gb, days, rep_price, user_price, is_quick=0):
     with get_db() as conn:
         cur = conn.cursor()
@@ -674,14 +678,18 @@ def add_or_update_plan(plan_code, name, gb, days, rep_price, user_price, is_quic
         )
         return get_plan(plan_code)
 
-def delete_plan(plan_code):
+def delete_plan(plan_code: str) -> bool:
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        pending = cur.execute(
+            "SELECT 1 FROM reserved_packages WHERE plan_code = ? AND status = 'pending' LIMIT 1",
+            (plan_code,)
+        ).fetchone()
+        if pending:
+            raise ValueError("Cannot delete a plan while pending reservations use it")
         cur.execute("DELETE FROM pricing_plans WHERE plan_code = ?", (plan_code,))
-        conn.commit()
-
-# --- Representatives & User Management ---
-
+        return cur.rowcount == 1
 def get_all_reps():
     with get_db() as conn:
         cur = conn.cursor()
@@ -742,42 +750,35 @@ def get_all_bot_users():
         return [dict(r) for r in rows]
 
 def reassign_account(account_code, new_rep_id=None, new_owner_tg_id=None):
+    if not account_code or ((new_rep_id is None) == (new_owner_tg_id is None)):
+        return {"status": "error", "message": "یک مقصد معتبر (نماینده یا کاربر) باید مشخص شود."}
     with get_db() as conn:
         cur = conn.cursor()
-        acc = cur.execute("SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) LIKE ? LIMIT 1", (account_code.lower(), f"%{account_code.lower()}%")).fetchone()
-        if not acc:
-            return {"status": "error", "message": "اکانت یافت نشد"}
-        
-        updates = []
-        params = []
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM accounts
+            WHERE LOWER(account_code) = LOWER(?) OR LOWER(email) = LOWER(?)
+            LIMIT 1
+        """, (account_code, account_code)).fetchone()
+        if not row:
+            return {"status": "error", "message": "اکانت یافت نشد."}
         if new_rep_id is not None:
-            updates.append("rep_id = ?")
-            params.append(new_rep_id)
-        if new_owner_tg_id is not None:
-            updates.append("owner_tg_id = ?")
-            params.append(new_owner_tg_id)
-            
-        if not updates:
-            return {"status": "ok", "account": dict(acc)}
-            
-        params.append(acc["id"])
-        sql = f"UPDATE accounts SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-        cur.execute(sql, tuple(params))
-        conn.commit()
-        
-        updated = cur.execute("SELECT * FROM accounts WHERE id = ?", (acc["id"],)).fetchone()
-        log_audit(
-            rep_id=new_rep_id, account_code=account_code, email=acc["email"],
-            action="reassign_account", actor_id=0, actor_name="admin",
-            details={"new_rep_id": new_rep_id, "new_owner_tg_id": new_owner_tg_id},
-            result_status="success"
-        )
-        return {"status": "ok", "account": dict(updated)}
-
-# --- Idempotency & Accidental Double-Click Guard ---
-
-_RENEWAL_LOCKS = {}
-
+            rep = cur.execute("SELECT id FROM representatives WHERE id = ? AND is_active = 1", (new_rep_id,)).fetchone()
+            if not rep:
+                return {"status": "error", "message": "نماینده مقصد یافت نشد یا فعال نیست."}
+            cur.execute(
+                "UPDATE accounts SET rep_id = ?, owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_rep_id, row["id"])
+            )
+        else:
+            user = cur.execute("SELECT telegram_id FROM bot_users WHERE telegram_id = ?", (int(new_owner_tg_id),)).fetchone()
+            if not user:
+                return {"status": "error", "message": "کاربر مقصد در سیستم ثبت نشده است."}
+            cur.execute(
+                "UPDATE accounts SET owner_tg_id = ?, rep_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (int(new_owner_tg_id), row["id"])
+            )
+        return {"status": "ok", "account_code": row["account_code"]}
 def acquire_renewal_lock(account_code: str, ttl_seconds: int = 20) -> bool:
     """
     Prevents accidental double-clicks or rapid successive duplicate renewal requests.
@@ -1384,11 +1385,14 @@ def get_rep_credit_limit(rep_id: int) -> int:
         return row["credit_limit_toman"] if row and row["credit_limit_toman"] is not None else 5000000
 
 def update_rep_credit_limit(rep_id: int, credit_limit: int):
+    credit_limit = int(credit_limit)
+    if credit_limit < 0:
+        raise ValueError("Credit limit cannot be negative; use 0 for unlimited")
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE representatives SET credit_limit_toman = ? WHERE id = ?", (credit_limit, rep_id))
-        conn.commit()
-
+        if cur.rowcount != 1:
+            raise ValueError("Representative not found")
 def check_rep_credit_limit(rep_id: int, pending_charge: int) -> tuple[bool, int, int]:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1529,24 +1533,52 @@ def unlink_account_owner(account_code_or_email: str, user_tg_id: int | None = No
         cur.execute(sql, tuple(params))
         return cur.rowcount > 0
 def change_user_tg_id(old_tg_id: int, new_tg_id: int) -> bool:
+    old_tg_id, new_tg_id = int(old_tg_id), int(new_tg_id)
+    if old_tg_id <= 0 or new_tg_id <= 0:
+        raise ValueError("Telegram IDs must be positive")
+    if old_tg_id == new_tg_id:
+        return True
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        existing = cur.execute(
+            "SELECT 1 FROM bot_users WHERE telegram_id = ?", (new_tg_id,)
+        ).fetchone()
+        wallet_exists = cur.execute(
+            "SELECT 1 FROM user_wallets WHERE user_id = ?", (new_tg_id,)
+        ).fetchone()
+        settings_exists = cur.execute(
+            "SELECT 1 FROM user_settings WHERE user_id = ?", (new_tg_id,)
+        ).fetchone()
+        owned_exists = cur.execute(
+            "SELECT 1 FROM accounts WHERE owner_tg_id = ? LIMIT 1", (new_tg_id,)
+        ).fetchone()
+        if existing or wallet_exists or settings_exists or owned_exists:
+            raise ValueError("The new Telegram ID is already present in the system")
+        changed = cur.execute("SELECT 1 FROM bot_users WHERE telegram_id = ?", (old_tg_id,)).fetchone()
+        if not changed:
+            raise ValueError("Original Telegram user was not found")
         cur.execute("UPDATE bot_users SET telegram_id = ? WHERE telegram_id = ?", (new_tg_id, old_tg_id))
         cur.execute("UPDATE accounts SET owner_tg_id = ? WHERE owner_tg_id = ?", (new_tg_id, old_tg_id))
         cur.execute("UPDATE user_wallets SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
+        cur.execute("UPDATE user_settings SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
         cur.execute("UPDATE financial_ledger SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
         cur.execute("UPDATE payment_receipts SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
-        conn.commit()
         return True
-
 def delete_bot_user(tg_id: int) -> bool:
+    """Remove portal profile and links while retaining financial history and wallet records."""
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE accounts SET owner_tg_id = NULL WHERE owner_tg_id = ?", (tg_id,))
+        cur.execute("BEGIN IMMEDIATE")
+        exists = cur.execute("SELECT 1 FROM bot_users WHERE telegram_id = ?", (tg_id,)).fetchone()
+        if not exists:
+            return False
+        cur.execute(
+            "UPDATE accounts SET owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE owner_tg_id = ?",
+            (tg_id,)
+        )
         cur.execute("DELETE FROM bot_users WHERE telegram_id = ?", (tg_id,))
-        conn.commit()
-        return True
-
+        return cur.rowcount == 1
 def toggle_rep_active(rep_id: int) -> int:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1557,13 +1589,15 @@ def toggle_rep_active(rep_id: int) -> int:
         return new_val
 
 def delete_rep(rep_id: int) -> bool:
+    """Archive a representative instead of destroying financial/audit references."""
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE accounts SET rep_id = NULL WHERE rep_id = ?", (rep_id,))
-        cur.execute("DELETE FROM representatives WHERE id = ?", (rep_id,))
-        conn.commit()
-        return True
-
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE representatives SET is_active = 0 WHERE id = ?",
+            (rep_id,)
+        )
+        return cur.rowcount == 1
 def update_rep_full(rep_id: int, name: str, rep_code: str, telegram_id: int, group_id: int, topic_id: int, scope_filter: str):
     with get_db() as conn:
         cur = conn.cursor()
@@ -1584,6 +1618,14 @@ def toggle_plan_quick(plan_code: str) -> int:
         return new_val
 
 def update_plan_specs(plan_code: str, name: str, gb: float, days: int, rep_price: int = None, user_price: int = None):
+    name = str(name or "").strip()
+    gb, days = float(gb), int(days)
+    if not name or gb <= 0 or days <= 0:
+        raise ValueError("Plan name, volume and duration must be positive")
+    if rep_price is not None and int(rep_price) <= 0:
+        raise ValueError("Representative price must be positive")
+    if user_price is not None and int(user_price) <= 0:
+        raise ValueError("User price must be positive")
     with get_db() as conn:
         cur = conn.cursor()
         if rep_price is not None and user_price is not None:
@@ -1591,15 +1633,15 @@ def update_plan_specs(plan_code: str, name: str, gb: float, days: int, rep_price
             UPDATE pricing_plans
             SET name = ?, gb = ?, days = ?, rep_price = ?, user_price = ?
             WHERE plan_code = ?
-            """, (name, gb, days, rep_price, user_price, plan_code))
+            """, (name, gb, days, int(rep_price), int(user_price), plan_code))
         else:
             cur.execute("""
             UPDATE pricing_plans
             SET name = ?, gb = ?, days = ?
             WHERE plan_code = ?
             """, (name, gb, days, plan_code))
-        conn.commit()
-
+        if cur.rowcount != 1:
+            raise ValueError("Plan not found")
 def get_rep_accounts_paginated(rep_id: int, filter_type: str = 'all', page: int = 1, page_size: int = 10) -> tuple[list, int, int]:
     import time
     now_ms = int(time.time() * 1000)
