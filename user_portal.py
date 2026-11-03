@@ -23,6 +23,7 @@ import database
 import nlp_matcher
 import finance_manager
 import sub_manager
+from xui_result import XUIResult, classify_xui_result
 
 from server_integrations import load_integration
 xui_manager = load_integration("xui_manager")
@@ -494,7 +495,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        if isinstance(alloc_res, dict) and alloc_res.get("status") == "success":
+        if classify_xui_result(alloc_res) == XUIResult.SUCCESS:
             email = alloc_res.get("email")
             sub_id = alloc_res.get("sub_id")
             if not email:
@@ -592,10 +593,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=build_user_portal_keyboard()
                 )
             await query.answer("🎉 خرید با موفقیت انجام شد!")
-        elif isinstance(alloc_res, dict) and (
-            alloc_res.get("status") in ("error", "failed", "failure")
-            or alloc_res.get("success") is False
-        ):
+        elif classify_xui_result(alloc_res) == XUIResult.FAILURE:
             try:
                 database.refund_user_wallet_and_release_operation_lock(
                     user_id=user.id,
@@ -803,9 +801,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        if isinstance(renew_res, dict) and (
-            renew_res.get("status") in ("success", "ok") or renew_res.get("success") is True
-        ):
+        if classify_xui_result(renew_res) == XUIResult.SUCCESS:
             try:
                 database.complete_user_action_intent(
                     intent_id, user.id, lock_key, lock_token,
@@ -835,10 +831,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=build_user_portal_keyboard()
             )
             await query.answer("سرویس با موفقیت تمدید شد.")
-        elif isinstance(renew_res, dict) and (
-            renew_res.get("status") in ("error", "failed", "failure")
-            or renew_res.get("success") is False
-        ):
+        elif classify_xui_result(renew_res) == XUIResult.FAILURE:
             try:
                 database.refund_user_wallet_and_release_operation_lock(
                     user_id=user.id,
