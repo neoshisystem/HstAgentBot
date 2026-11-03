@@ -474,12 +474,25 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             or alloc_res.get("success") is False
         ):
             try:
-                database.record_user_payment(
-                    user.id, price, "استرداد وجه به دلیل شکست قطعی تخصیص اکانت",
-                    actor_id=user.id, actor_name="SystemRefund"
+                database.refund_user_wallet_and_release_operation_lock(
+                    user_id=user.id,
+                    amount=price,
+                    description="استرداد وجه به دلیل شکست قطعی تخصیص اکانت",
+                    actor_id=user.id,
+                    actor_name="SystemRefund",
+                    lock_key=lock_key,
+                    token=lock_token,
                 )
-            finally:
-                database.release_operation_lock(lock_key, lock_token)
+            except Exception:
+                logger.exception(
+                    "User purchase refund failed; persistent operation lock retained for reconciliation (user=%s)",
+                    user.id,
+                )
+                await query.answer(
+                    "⚠️ صدور ناموفق بود اما استرداد در دیتابیس ثبت نشد؛ قفل عملیات برای بررسی مدیریت محفوظ مانده است.",
+                    show_alert=True,
+                )
+                return
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except BadRequest:
@@ -669,12 +682,25 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             or renew_res.get("success") is False
         ):
             try:
-                database.record_user_payment(
-                    user.id, price, f"استرداد به دلیل شکست قطعی تمدید {acc_code}",
-                    actor_id=user.id, actor_name="RenewRefund"
+                database.refund_user_wallet_and_release_operation_lock(
+                    user_id=user.id,
+                    amount=price,
+                    description=f"استرداد به دلیل شکست قطعی تمدید {acc_code}",
+                    actor_id=user.id,
+                    actor_name="RenewRefund",
+                    lock_key=lock_key,
+                    token=lock_token,
                 )
-            finally:
-                database.release_operation_lock(lock_key, lock_token)
+            except Exception:
+                logger.exception(
+                    "User renewal refund failed; persistent operation lock retained for reconciliation (account=%s)",
+                    acc_code,
+                )
+                await query.answer(
+                    "⚠️ تمدید ناموفق بود اما استرداد در دیتابیس ثبت نشد؛ قفل عملیات برای بررسی مدیریت محفوظ مانده است.",
+                    show_alert=True,
+                )
+                return
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except BadRequest:
