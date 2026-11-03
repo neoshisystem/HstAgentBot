@@ -157,3 +157,76 @@ def test_pending_receipt_queue_paginates_without_dropping_older_submissions(isol
     assert page1[0]["tracking_code"] == codes[-1]
     assert page2[-1]["tracking_code"] == codes[0]
     assert {item["tracking_code"] for item in page1 + page2} == set(codes)
+
+def test_user_can_cancel_only_unsubmitted_pending_receipt_and_replay_is_safe(isolated_db):
+    receipt_code = database.create_payment_receipt(
+        user_id=84001,
+        role="end_user",
+        amount_toman=125_000,
+    )
+
+    cancelled = database.cancel_payment_receipt(receipt_code, 84001)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancelled_by"] == 84001
+    assert cancelled["cancelled_at"] is not None
+    assert database.get_pending_payment_receipts() == []
+
+    page, total, _ = database.get_receipts_paginated("cancelled", page=1, page_size=10)
+    assert total == 1
+    assert page[0]["tracking_code"] == receipt_code
+
+    # A replay by the same owner is read-only and does not create financial entries.
+    replay = database.cancel_payment_receipt(receipt_code, 84001)
+    assert replay["status"] == "cancelled"
+    assert replay["cancelled_by"] == 84001
+    assert database.get_user_wallet_balance(84001) == 0
+    assert scalar("SELECT COUNT(*) FROM financial_ledger WHERE user_id=?", (84001,)) == 0
+
+
+def test_receipt_cancellation_rejects_wrong_owner_without_mutation(isolated_db):
+    receipt_code = database.create_payment_receipt(
+        user_id=84002,
+        role="end_user",
+        amount_toman=80_000,
+    )
+
+    with pytest.raises(PermissionError, match="does not belong"):
+        database.cancel_payment_receipt(receipt_code, 99999)
+
+    stored = database.get_payment_receipt(receipt_code)
+    assert stored["status"] == "pending"
+    assert stored["cancelled_by"] is None
+    assert stored["cancelled_at"] is None
+
+
+def test_uploaded_or_reviewed_receipt_cannot_be_cancelled_by_user(isolated_db):
+    uploaded_code = database.create_payment_receipt(
+        user_id=84003,
+        role="end_user",
+        amount_toman=90_000,
+        photo_id="already-uploaded-photo",
+    )
+    uploaded_result = database.cancel_payment_receipt(uploaded_code, 84003)
+    assert uploaded_result["status"] == "pending"
+    assert uploaded_result["receipt_photo_id"] == "already-uploaded-photo"
+    assert uploaded_result["cancelled_by"] is None
+
+    reviewed_code = database.create_payment_receipt(
+        user_id=84004,
+        role="end_user",
+        amount_toman=95_000,
+    )
+    database.approve_payment_receipt(reviewed_code, 9000, "Super Admin")
+    reviewed_result = database.cancel_payment_receipt(reviewed_code, 84004)
+    assert reviewed_result["status"] == "approved"
+    assert reviewed_result["cancelled_by"] is None
+    assert database.get_user_wallet_balance(84004) == 95_000
+
+
+def test_card_payment_cancel_button_is_bound_to_exact_receipt():
+    import finance_manager
+
+    receipt_code = "RCP-12345678"
+    keyboard = finance_manager.build_card_payment_keyboard(receipt_code)
+    assert keyboard.inline_keyboard[1][0].callback_data == f"cancel_payment:{receipt_code}"
+
