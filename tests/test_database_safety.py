@@ -311,7 +311,7 @@ def test_rep_archive_preserves_ledger_and_prevents_new_debits(isolated_db):
     )
     assert database.delete_rep(rep_id) is True
     assert scalar("SELECT COUNT(*) FROM financial_ledger WHERE rep_id=?", (rep_id,)) == 1
-    with pytest.raises(ValueError, match="Representative not found"):
+    with pytest.raises(ValueError, match="Representative is inactive"):
         database.record_ledger_entry(
             rep_id, "ARC2", "ARC2@example.test", "p2", "debit", 100,
             "post archive", 9000, "test"
