@@ -660,7 +660,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 7. Renew Account Via Wallet Selection
     elif action == "renew_plans":
-        acc_code = parts[2] if len(parts) > 2 else ""
+        acc_code = owned_account["account_code"]
         plans = database.get_pricing_plans(active_only=True)
         wallet_bal = database.get_user_wallet_balance(user.id)
         lines = [
@@ -671,9 +671,20 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         extra_btns = []
         row = []
         for p in plans:
+            intent_id = database.create_user_action_intent(
+                user_id=user.id,
+                action_type="renew",
+                plan_code=p["plan_code"],
+                plan_name=p["name"],
+                gb=p["gb"],
+                days=p["days"],
+                amount=p["user_price"],
+                account_code=owned_account["account_code"],
+                account_email=owned_account["email"],
+            )
             row.append(InlineKeyboardButton(
                 f"{p['name']} ({p['user_price']:,} ت)",
-                callback_data=f"user:do_renew:{acc_code}:{p['plan_code']}"
+                callback_data=f"user:do_renew:{intent_id}"
             ))
             if len(row) == 2:
                 extra_btns.append(row)
@@ -685,56 +696,58 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer()
 
-    # 7.1 Execute Renew with Wallet
+    # 7.1 Execute Renew with Wallet — intent token resolves the canonical owned account.
     elif action == "do_renew":
-        acc_code = parts[2] if len(parts) > 2 else ""
-        plan_code = parts[3] if len(parts) > 3 else "20gb_30d"
-        plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ تعرفه یافت نشد.", show_alert=True)
-            return
-
-        price = int(plan["user_price"])
-        if price <= 0:
-            await query.answer("❌ قیمت پلن معتبر نیست؛ با پشتیبانی تماس بگیرید.", show_alert=True)
-            return
-
-        lock_key = f"account-renewal:{owned_account['account_code'].lower()}"
-        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
-        if not lock_token:
-            await query.answer("⏳ درخواست تمدید دیگری برای این سرویس در حال پردازش است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
-            return
-
+        intent_id = parts[4] if len(parts) > 4 else ""
+        acc_code = owned_account["email"]
         try:
-            ok, new_bal = database.deduct_user_wallet(
-                user.id, price, f"تمدید سرویس {acc_code} ({plan['name']})",
-                plan_code=plan_code, account_code=owned_account["account_code"],
-                email=owned_account["email"]
-            )
+            started = database.begin_user_action_intent(intent_id, user.id, "renew")
         except Exception:
-            database.release_operation_lock(lock_key, lock_token)
-            logger.exception("Could not debit wallet for user renewal %s", acc_code)
-            await query.answer("❌ برداشت از کیف پول انجام نشد.", show_alert=True)
+            logger.exception("Could not claim user renewal intent for %s", intent_id)
+            await query.answer("❌ شروع تراکنش تمدید ممکن نشد؛ لطفاً منوی تمدید را دوباره باز کنید.", show_alert=True)
             return
-        if not ok:
-            database.release_operation_lock(lock_key, lock_token)
-            wallet_bal = database.get_user_wallet_balance(user.id)
-            await query.answer(
-                f"❌ موجودی کیف پول کافی نیست (موجودی: {wallet_bal:,} ت | مورد نیاز: {price:,} ت)",
-                show_alert=True
-            )
+
+        if started["status"] != "started":
+            messages = {
+                "not_found": "⛔️ درخواست تمدید پیدا نشد یا متعلق به شما نیست.",
+                "wrong_action": "⛔️ نوع درخواست تمدید معتبر نیست.",
+                "already_processed": "⛔️ این درخواست تمدید قبلاً اجرا یا برای بررسی ثبت شده است؛ برداشت مجدد انجام نمی‌شود.",
+                "expired": "⌛️ درخواست تمدید منقضی شده است؛ منوی تمدید را دوباره باز کنید.",
+                "plan_changed": "⚠️ تعرفه پس از نمایش منو تغییر کرده است؛ لطفاً منوی تمدید را تازه کنید.",
+                "busy": "⏳ عملیات دیگری روی این سرویس در جریان است؛ منوی تمدید را پس از پایان آن دوباره باز کنید.",
+                "not_owned": "⛔️ مالکیت سرویس برای این درخواست قابل تأیید نیست.",
+            }
+            if started["status"] == "insufficient_funds":
+                msg = f"❌ موجودی کافی نیست (موجودی: {started['balance']:,} ت | موردنیاز: {started['required']:,} ت)."
+            else:
+                msg = messages.get(started["status"], "❌ درخواست تمدید قابل اجرا نیست.")
+            await query.answer(msg, show_alert=True)
             return
+
+        intent = started["intent"]
+        plan_name = intent["plan_name"]
+        price = int(intent["amount"])
+        lock_key = started["lock_key"]
+        lock_token = started["lock_token"]
+        new_bal = started["new_balance"]
 
         try:
             renew_res = await asyncio.to_thread(
                 xui_manager.renew_client,
-                acc_code, float(plan["gb"]), int(plan["days"]),
+                acc_code, float(intent["gb"]), int(intent["days"]),
                 comment=None, rollover=True, countdown="auto", scope="all", by_code_only=True
             )
         except Exception:
             logger.exception("User renewal outcome is unknown for %s", acc_code)
+            try:
+                database.mark_user_action_intent_for_reconciliation(
+                    intent_id, user.id, lock_key, lock_token,
+                    "X-UI renewal raised an exception; external outcome must be reconciled",
+                )
+            except Exception:
+                logger.exception("Could not mark renewal intent for reconciliation (%s)", intent_id)
             await query.answer(
-                "⚠️ پاسخ پنل نامشخص است؛ مبلغ محفوظ مانده و درخواست نیازمند بررسی است. لطفاً مجدداً کلیک نکنید.",
+                "⚠️ پاسخ پنل نامشخص است؛ مبلغ محفوظ و عملیات برای تطبیق مدیریتی قفل شده است.",
                 show_alert=True
             )
             return
@@ -742,16 +755,31 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         if isinstance(renew_res, dict) and (
             renew_res.get("status") in ("success", "ok") or renew_res.get("success") is True
         ):
-            database.release_operation_lock(lock_key, lock_token)
+            try:
+                database.complete_user_action_intent(
+                    intent_id, user.id, lock_key, lock_token,
+                    result_note=f"Renewed account {intent['account_code']}",
+                )
+            except Exception:
+                logger.exception("Could not finalize successful renewal intent %s", intent_id)
+                try:
+                    database.mark_user_action_intent_for_reconciliation(
+                        intent_id, user.id, lock_key, lock_token,
+                        f"X-UI renewal succeeded for {intent['account_code']}, but intent finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark unfinalized renewal for reconciliation (%s)", intent_id)
+                await query.answer("⚠️ تمدید در پنل انجام شد اما نهایی‌سازی تراکنش کامل نشد؛ عملیات برای بررسی قفل باقی ماند.", show_alert=True)
+                return
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except BadRequest:
                 pass
             await query.message.reply_text(
                 f"✅ **سرویس {acc_code} با موفقیت تمدید شد!**\n\n"
-                f"• بسته: **{plan['name']}**\n"
-                f"• کسر از کیف پول: `{price:,} تومان`\n"
-                f"• موجودی باقیمانده: `{new_bal:,} تومان`",
+                f"• بسته: **{plan_name}**\n"
+                f"• کسر از کیف پول: {price:,} تومان\n"
+                f"• موجودی باقیمانده: {new_bal:,} تومان",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=build_user_portal_keyboard()
             )
@@ -769,6 +797,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
                     actor_name="RenewRefund",
                     lock_key=lock_key,
                     token=lock_token,
+                    intent_id=intent_id,
                 )
             except Exception:
                 logger.exception(
@@ -787,8 +816,15 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ پنل تمدید را رد کرد؛ مبلغ به کیف پول بازگشت داده شد.", show_alert=True)
         else:
             logger.error("Ambiguous X-UI renewal response for %s: %r", acc_code, renew_res)
+            try:
+                database.mark_user_action_intent_for_reconciliation(
+                    intent_id, user.id, lock_key, lock_token,
+                    f"Ambiguous X-UI renewal response: {renew_res!r}"[:500],
+                )
+            except Exception:
+                logger.exception("Could not mark ambiguous renewal intent for reconciliation (%s)", intent_id)
             await query.answer(
-                "⚠️ پاسخ پنل برای تایید یا رد تمدید کافی نیست؛ مبلغ محفوظ است و درخواست نیازمند بررسی است.",
+                "⚠️ پاسخ پنل برای تایید یا رد تمدید کافی نیست؛ مبلغ محفوظ و عملیات قفل شده است.",
                 show_alert=True
             )
 
