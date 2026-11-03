@@ -140,69 +140,86 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     elif action == "new_plan_chosen":
         plan_code = parts[2] if len(parts) > 2 else "20gb_30d"
         plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ پلن یافت نشد.", show_alert=True)
+        if not plan or not plan.get("is_active", 1):
+            await query.answer("❌ پلن یافت نشد یا غیرفعال است.", show_alert=True)
             return
 
-        # Check rep credit limit first
-        allowed, curr_debt, credit_limit = database.check_rep_credit_limit(rep["id"], plan["rep_price"])
-        if not allowed:
-            await query.answer(f"⛔️ سقف اعتبار تکمیل است (بدهی: {curr_debt:,} ت | سقف: {credit_limit:,} ت)", show_alert=True)
+        try:
+            intent_id = database.create_rep_action_intent(
+                rep_id=rep["id"], actor_tg_id=user.id,
+                plan_code=plan["plan_code"], plan_name=plan["name"],
+                gb=plan["gb"], days=plan["days"], amount=plan["rep_price"],
+            )
+        except ValueError as exc:
+            await query.answer(f"⛔️ ایجاد درخواست صدور ممکن نشد: {exc}", show_alert=True)
             return
 
         context.user_data["rep_state"] = {
             "action": "awaiting_new_acc_name",
-            "plan_code": plan_code,
+            "intent_id": intent_id,
             "rep_id": rep["id"],
             "ts": time.time()
         }
-
-        extra_btns = [
-            [InlineKeyboardButton("⏩ بدون نام / رد کردن", callback_data=f"rep:issue_acc_direct:{plan_code}:noname")]
-        ]
+        extra_btns = [[InlineKeyboardButton(
+            "⏩ بدون نام / رد کردن",
+            callback_data=f"rep:issue_acc_direct:{intent_id}:noname"
+        )]]
         keyboard = build_back_to_rep_keyboard(extra_btns)
         msg = (
             f"👤 **ثبت نام مشتری برای پلن {plan['name']}:**\n\n"
             f"• هزینه پلن: **{plan['rep_price']:,} تومان**\n\n"
-            f"لطفاً **نام مشتری** را ارسال فرمایید یا دکمه «بدون نام / رد کردن» را بزنید:"
+            "لطفاً **نام مشتری** را ارسال فرمایید یا دکمه «بدون نام / رد کردن» را بزنید:\n"
+            "این درخواست تا ۱۵ دقیقه معتبر است و فقط یک بار قابل اجراست."
         )
         await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer()
 
-    # 2.2 Issue account directly
+    # 2.2 Issue account using one durable representative action intent.
     elif action == "issue_acc_direct":
-        plan_code = parts[2] if len(parts) > 2 else "20gb_30d"
-        cust_name = "" if (len(parts) > 3 and parts[3] == "noname") else context.user_data.get("rep_temp_name", "")
-        plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ پلن یافت نشد.", show_alert=True)
-            return
-
-        amount = int(plan["rep_price"])
-        if amount <= 0:
-            await query.answer("❌ قیمت پلن معتبر نیست.", show_alert=True)
-            return
-        lock_key = f"rep-issue:{rep['id']}:{plan_code}"
-        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
-        if not lock_token:
-            await query.answer("⏳ درخواست صدور دیگری در حال پردازش است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
+        intent_id = parts[2] if len(parts) > 2 else ""
+        intent = database.get_rep_action_intent(intent_id, rep["id"], user.id)
+        if (
+            not intent or intent["action_type"] != "issue"
+            or intent["status"] != "pending"
+            or float(intent["expires_at"]) <= time.time()
+        ):
+            await query.answer(
+                "⛔️ درخواست صدور منقضی شده، قبلاً استفاده شده یا متعلق به شما نیست؛ از منوی صدور دوباره شروع کنید.",
+                show_alert=True
+            )
             return
 
         try:
-            new_bal = database.record_ledger_entry(
-                rep_id=rep["id"], account_code="", email="", plan_code=plan_code,
-                tx_type="debit", amount=amount,
-                description=f"پیش‌پرداخت صدور {plan['name']} (در انتظار تأیید پنل)",
-                actor_id=user.id, actor_name=user.full_name or "Rep"
-            )
+            started = database.begin_rep_action_intent(intent_id, rep["id"], user.id)
         except ValueError as exc:
-            database.release_operation_lock(lock_key, lock_token)
             await query.answer(f"⛔️ ثبت مالی صدور انجام نشد: {exc}", show_alert=True)
             return
+        except Exception:
+            logger.exception("Could not claim representative issuance intent %s", intent_id)
+            await query.answer("❌ شروع صدور انجام نشد؛ درخواست جدیدی از منوی صدور ایجاد کنید.", show_alert=True)
+            return
 
-        gb = float(plan["gb"])
-        days = int(plan["days"])
+        if started["status"] != "started":
+            messages = {
+                "not_found": "⛔️ درخواست صدور معتبر نیست یا متعلق به شما نیست.",
+                "already_processed": "⛔️ این درخواست قبلاً اجرا یا برای تطبیق ثبت شده است؛ بدهی مجدد ایجاد نمی‌شود.",
+                "expired": "⌛️ درخواست صدور منقضی شده است؛ منوی صدور را دوباره باز کنید.",
+                "plan_changed": "⚠️ تعرفه از زمان نمایش منو تغییر کرده است؛ منوی صدور را تازه کنید.",
+                "busy": "⏳ این درخواست در حال پردازش است؛ از اجرای مجدد خودداری کنید.",
+            }
+            await query.answer(messages.get(started["status"], "❌ درخواست صدور قابل اجرا نیست."), show_alert=True)
+            return
+
+        intent = started["intent"]
+        amount = int(intent["amount"])
+        gb = float(intent["gb"])
+        days = int(intent["days"])
+        cust_name = str(intent.get("customer_name") or "")
+        lock_key = started["lock_key"]
+        lock_token = started["lock_token"]
+        new_bal = started["new_balance"]
         scope_for_alloc = rep.get("scope_filter") or "all"
+
         try:
             alloc_res = await asyncio.to_thread(
                 xui_manager.allocate_pool_client, gb, days,
@@ -210,8 +227,15 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception:
             logger.exception("Representative allocation outcome is unknown for rep %s", rep["id"])
+            try:
+                database.mark_rep_action_intent_for_reconciliation(
+                    intent_id, rep["id"], user.id, lock_key, lock_token,
+                    "X-UI allocation raised an exception; external result must be reconciled",
+                )
+            except Exception:
+                logger.exception("Could not mark representative issuance intent for reconciliation (%s)", intent_id)
             await query.answer(
-                "⚠️ پاسخ پنل نامشخص است؛ مبلغ به‌صورت پیش‌پرداخت محفوظ مانده است. لطفاً مجدداً کلیک نکنید.",
+                "⚠️ پاسخ پنل نامشخص است؛ پیش‌پرداخت محفوظ و درخواست برای تطبیق مدیریتی قفل شده است.",
                 show_alert=True
             )
             return
@@ -219,9 +243,16 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         if isinstance(alloc_res, dict) and alloc_res.get("status") == "success":
             email = alloc_res.get("email")
             if not email:
-                logger.error("X-UI reported successful allocation without email: %r", alloc_res)
-                await query.answer("⚠️ پاسخ پنل ناقص است؛ مبلغ برای تطبیق محفوظ ماند.", show_alert=True)
+                try:
+                    database.mark_rep_action_intent_for_reconciliation(
+                        intent_id, rep["id"], user.id, lock_key, lock_token,
+                        "X-UI reported success without an account email",
+                    )
+                except Exception:
+                    logger.exception("Could not mark incomplete representative allocation result (%s)", intent_id)
+                await query.answer("⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ پیش‌پرداخت محفوظ و قفل شد.", show_alert=True)
                 return
+
             sub_id = alloc_res.get("sub_id")
             code = xui_manager.extract_account_identifier(email) or email
             try:
@@ -232,17 +263,42 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             except Exception:
                 logger.exception("X-UI allocated %s but local persistence failed", email)
+                try:
+                    database.mark_rep_action_intent_for_reconciliation(
+                        intent_id, rep["id"], user.id, lock_key, lock_token,
+                        f"X-UI created account {email}, but local persistence failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark local account persistence failure (%s)", intent_id)
                 await query.answer(
-                    "⚠️ اکانت در پنل ایجاد شد اما ثبت محلی کامل نشد؛ مبلغ محفوظ است و تطبیق لازم است.",
+                    "⚠️ اکانت در پنل ایجاد شد اما ثبت محلی کامل نشد؛ پیش‌پرداخت محفوظ و قفل تطبیق حفظ شد.",
                     show_alert=True
                 )
                 return
 
-            database.release_operation_lock(lock_key, lock_token)
+            try:
+                database.complete_rep_action_intent(
+                    intent_id, rep["id"], user.id, lock_key, lock_token, code, email
+                )
+            except Exception:
+                logger.exception("Could not finalize successful representative intent %s", intent_id)
+                try:
+                    database.mark_rep_action_intent_for_reconciliation(
+                        intent_id, rep["id"], user.id, lock_key, lock_token,
+                        f"Account {email} exists in panel and local database, but intent finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark representative intent finalization failure (%s)", intent_id)
+                await query.answer(
+                    "⚠️ اکانت ثبت شد اما نهایی‌سازی مالی کامل نشد؛ قفل برای تطبیق مدیریتی حفظ شده است.",
+                    show_alert=True
+                )
+                return
+
             deliv_text = alloc_res.get("deliverable", "")
             deliv_text += (
-                f"\n\n🧾 **فاکتور:** `{amount:,} تومان`"
-                f" | **مانده بدهی جدید:** `{new_bal:,} تومان`"
+                f"\n\n🧾 **فاکتور:** \`{amount:,} تومان\`"
+                f" | **مانده بدهی جدید:** \`{new_bal:,} تومان\`"
             )
             keyboard = nlp_matcher.build_account_keyboard(
                 code, is_enabled=True, on_first_connect=False, role="rep"
@@ -260,28 +316,35 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             or alloc_res.get("success") is False
         ):
             try:
-                database.register_rep_payment(
-                    rep["id"], amount,
-                    f"استرداد پیش‌پرداخت به دلیل شکست قطعی صدور {plan_code}",
-                    actor_id=user.id, actor_name=user.full_name or "Rep"
+                new_balance = database.refund_rep_action_intent(
+                    intent_id, rep["id"], user.id, lock_key, lock_token,
+                    actor_name=user.full_name or "Representative",
                 )
             except Exception:
-                logger.exception("Failed to reverse allocation precharge for rep %s", rep["id"])
-                await query.answer("⚠️ صدور رد شد اما استرداد ثبت نشد؛ موضوع به مدیریت ارجاع شد.", show_alert=True)
+                logger.exception("Representative issuance refund failed; lock retained (%s)", intent_id)
+                await query.answer(
+                    "⚠️ صدور ناموفق بود اما استرداد ثبت نشد؛ قفل برای تطبیق مدیریتی محفوظ مانده است.",
+                    show_alert=True
+                )
                 return
-            database.release_operation_lock(lock_key, lock_token)
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except BadRequest:
                 pass
             await query.answer(
-                f"❌ پنل صدور اکانت را رد کرد؛ پیش‌پرداخت {amount:,} تومان مسترد شد.",
+                f"❌ پنل صدور را رد کرد؛ پیش‌پرداخت {amount:,} تومان مسترد شد. مانده بدهی: {new_balance:,} تومان.",
                 show_alert=True
             )
         else:
-            logger.error("Ambiguous X-UI allocate response for rep %s: %r", rep["id"], alloc_res)
+            try:
+                database.mark_rep_action_intent_for_reconciliation(
+                    intent_id, rep["id"], user.id, lock_key, lock_token,
+                    f"Ambiguous X-UI allocation response: {alloc_res!r}"[:500],
+                )
+            except Exception:
+                logger.exception("Could not mark ambiguous representative allocation (%s)", intent_id)
             await query.answer(
-                "⚠️ پاسخ پنل برای تأیید یا رد صدور کافی نیست؛ مبلغ محفوظ است و بررسی دستی لازم است.",
+                "⚠️ پاسخ پنل مبهم است؛ پیش‌پرداخت محفوظ و قفل برای تطبیق مدیریتی حفظ شد.",
                 show_alert=True
             )
 
