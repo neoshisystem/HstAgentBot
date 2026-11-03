@@ -67,6 +67,20 @@ def build_back_to_user_keyboard(extra_buttons=None, back_callback="user:main") -
 async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message=False):
     """Renders or edits the end-user interactive portal."""
     user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+    role, _ = database.get_user_role(
+        user.id, chat.id,
+        update.effective_message.message_thread_id if update.effective_message else None,
+    )
+    if role != "end_user":
+        notice = "⛔️ پورتال کاربری فقط برای نقش کاربر نهایی در دسترس است."
+        if update.callback_query:
+            await update.callback_query.answer(notice, show_alert=True)
+        elif update.message:
+            await update.message.reply_text(notice)
+        return
     database.ensure_bot_user(user.id, user.username or "", user.full_name or "", role="end_user")
 
     if database.is_user_blocked(user.id):
@@ -105,6 +119,17 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     if database.is_user_blocked(user.id):
         await query.answer("⛔️ دسترسی شما به ربات مسدود شده است.", show_alert=True)
+        return
+
+    role, _ = database.get_user_role(
+        user.id, chat.id,
+        update.effective_message.message_thread_id if update.effective_message else None,
+    )
+    if role != "end_user":
+        await query.answer(
+            "⛔️ این مسیر فقط برای حساب‌های کاربر نهایی مجاز است.",
+            show_alert=True
+        )
         return
 
     data = query.data or ""
