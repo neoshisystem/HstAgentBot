@@ -303,7 +303,6 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not _is_private_super_admin(update):
         return
-        return
     args = context.args
     if len(args) < 2:
         await update.message.reply_text("⚠️ فرمت دستور تسویه:\n`/pay <rep_code> <amount_toman> [توضیحات]`\nمثال:\n`/pay demo_rep 500000 واریز کارت به کارت`", parse_mode=ParseMode.MARKDOWN)
@@ -419,7 +418,6 @@ async def card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not _is_private_super_admin(update):
         return
-        return
     args = context.args or []
     if len(args) >= 3:
         card_num = args[0]
@@ -450,7 +448,6 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show persistent or unexpired external-operation locks to the Super Admin."""
     user = update.effective_user
     if not _is_private_super_admin(update):
-        return
         return
     locks = await asyncio.to_thread(database.get_operation_locks)
     if not locks:
@@ -512,7 +509,6 @@ async def unlock_operation_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     if not _is_private_super_admin(update):
         return
-        return
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text(
@@ -554,7 +550,6 @@ async def resolve_user_intent_cmd(update: Update, context: ContextTypes.DEFAULT_
     """Evidence-gated resolution of a user purchase/renewal with atomic wallet semantics."""
     user = update.effective_user
     if not _is_private_super_admin(update):
-        return
         return
     args = context.args or []
     if len(args) < 2:
@@ -610,7 +605,6 @@ async def resolve_rep_intent_cmd(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user
     if not _is_private_super_admin(update):
         return
-        return
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text(
@@ -664,7 +658,6 @@ async def resolve_admin_renewal_cmd(update: Update, context: ContextTypes.DEFAUL
     user = update.effective_user
     if not _is_private_super_admin(update):
         return
-        return
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text(
@@ -703,7 +696,6 @@ async def resolve_reservation_cmd(update: Update, context: ContextTypes.DEFAULT_
     """Evidence-gated resolution of an ambiguous reserved-package activation."""
     user = update.effective_user
     if not _is_private_super_admin(update):
-        return
         return
     args = context.args or []
     if len(args) < 2 or not args[0].isdigit():
@@ -750,7 +742,6 @@ async def resolve_rep_renewal_cmd(update: Update, context: ContextTypes.DEFAULT_
     user = update.effective_user
     if not _is_private_super_admin(update):
         return
-        return
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text(
@@ -795,7 +786,6 @@ async def resolve_rep_renewal_cmd(update: Update, context: ContextTypes.DEFAULT_
 async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not _is_private_super_admin(update):
-        return
         return
     result = await asyncio.to_thread(database.sync_all_active_reps_detailed)
     if result.get("status") != "success":
