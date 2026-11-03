@@ -183,7 +183,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("❌ قیمت پلن معتبر نیست.", show_alert=True)
             return
         lock_key = f"rep-issue:{rep['id']}:{plan_code}"
-        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=300)
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
             await query.answer("⏳ درخواست صدور دیگری در حال پردازش است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
             return
@@ -453,7 +453,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
         if action == "force_res":
             lock_key = f"reservation-activation:{res_id}"
-            lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=900)
+            lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
             if not lock_token:
                 await query.answer("⏳ این رزرو در حال فعال‌سازی است یا نتیجه عملیات قبلی نیازمند بررسی است.", show_alert=True)
                 return
