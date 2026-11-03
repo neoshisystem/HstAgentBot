@@ -60,36 +60,63 @@ def get_subscription_url(sub_id: str) -> str:
     return f"https://{parsed.netloc}{port_part}{path_part}/{token}"
 
 
-def reset_client_sub_id(xui_module, email: str) -> tuple[bool, str, str]:
-    """
-    Resets client subId in 3X-UI panel to revoke old subscription link.
-    Returns (success, message, new_sub_id).
-    """
+def _read_remote_sub_id(xui_module, email: str):
+    """Return the currently stored ID, or None when an exact read is unavailable."""
     try:
-        new_sub = generate_secure_sub_id(16)
-        session = xui_module.get_session()
-        search_res = xui_module.find_client_by_code(email)
-        if not search_res or not search_res.get("found"):
+        found = xui_module.find_client_by_code(email)
+        if not isinstance(found, dict) or not found.get("found"):
+            return None
+        raw = (found.get("data") or {}).get("raw") or {}
+        value = raw.get("subId") or raw.get("sub_id")
+        return str(value) if value else ""
+    except Exception:
+        logger.exception("Could not verify remote subscription ID for %s", email)
+        return None
+
+
+def reset_client_sub_id(xui_module, email: str, initial_search=None) -> tuple[bool | None, str, str]:
+    """True=confirmed applied, False=verified not applied, None=unknown remote result."""
+    if not email:
+        return False, "شناسه اکانت مشخص نشده است.", ""
+    new_sub = generate_secure_sub_id(16)
+    original_sub = None
+    try:
+        search = initial_search or xui_module.find_client_by_code(email)
+        if not isinstance(search, dict) or not search.get("found"):
             return False, "اکانت موردنظر در پنل یافت نشد.", ""
-
-        client = search_res["data"]["raw"]
+        data = search.get("data") or {}
+        client = data.get("raw")
+        if not isinstance(client, dict):
+            return False, "اطلاعات پایه اکانت از پنل کامل نیست.", ""
         client_id = client.get("id") or client.get("uuid")
-        inbound_id = search_res["data"]["inbound_id"]
+        inbound_id = data.get("inbound_id")
+        original_sub = client.get("subId") or client.get("sub_id")
+        if not client_id or inbound_id is None:
+            return False, "شناسه داخلی اکانت در پنل کامل نیست.", ""
+        changed = dict(client)
+        changed["subId"] = new_sub
+        payload = {"id": inbound_id, "settings": json.dumps({"clients": [changed]})}
+        response = xui_module.get_session().post(
+            f"{xui_module.BASE_URL}/panel/api/inbounds/updateClient/{client_id}",
+            json=payload, timeout=10
+        )
+        try:
+            body = response.json()
+        except Exception:
+            body = None
+        if response.ok and isinstance(body, dict) and body.get("success") is True:
+            return True, "لینک سابسکریپشن با موفقیت بازنشانی شد.", new_sub
+        reason = "پاسخ پنل موفقیت را تأیید نکرد"
+    except Exception as exc:
+        logger.exception("Subscription reset outcome is uncertain for %s", email)
+        reason = f"نتیجه درخواست نامشخص است: {exc}"
 
-        # Update client subId via 3X-UI updateClient API
-        client["subId"] = new_sub
-        payload = {
-            "id": inbound_id,
-            "settings": json.dumps({"clients": [client]})
-        }
-        res = session.post(f"{xui_module.BASE_URL}/panel/api/inbounds/updateClient/{client_id}", json=payload, timeout=10)
-        if res.ok and res.json().get("success"):
-            return True, "لینک سابسکریپشن با موفقیت بازنشانی شد و لینک قبلی باطل گردید.", new_sub
-        else:
-            return False, f"خطا در ارتباط با سرور پنل: {res.text}", ""
-    except Exception as e:
-        logger.error(f"Failed to reset subId for {email}: {e}")
-        return False, str(e), ""
+    remote_sub = _read_remote_sub_id(xui_module, email)
+    if remote_sub == new_sub:
+        return True, "شناسه جدید در پنل تأیید شد.", new_sub
+    if original_sub is not None and remote_sub == str(original_sub):
+        return False, f"پنل شناسه قبلی را حفظ کرده است؛ {reason}.", ""
+    return None, f"{reason} و وضعیت شناسه در پنل قابل تأیید نیست.", new_sub
 
 
 def generate_qr_code(payload: str):
