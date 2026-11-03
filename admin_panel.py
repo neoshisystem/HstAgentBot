@@ -587,12 +587,25 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
                 reply_markup=keyboard
             )
             if archive_path and os.path.exists(archive_path):
-                with open(archive_path, "rb") as doc:
-                    await chat.send_document(
-                        document=doc,
-                        caption=f"💾 نسخه پشتیبان دیتابیس و تنظیمات ({size_kb} KB)"
+                try:
+                    with open(archive_path, "rb") as doc:
+                        await chat.send_document(
+                            document=doc,
+                            caption=f"💾 نسخه پشتیبان دیتابیس و تنظیمات ({size_kb} KB)"
+                        )
+                except Exception:
+                    logger.exception("Local archive was created but could not be delivered to the admin chat")
+                    await query.answer(
+                        "⚠️ فایل بکاپ روی سرور ساخته شد، اما ارسال فایل در همین چت ناموفق بود. مسیر محلی در پیام بالاست.",
+                        show_alert=True
                     )
-            await query.answer("بکاپ با موفقیت ایجاد شد.")
+                    return
+            await query.answer(
+                "✅ بکاپ محلی ساخته و ارسال تلگرام تأیید شد."
+                if upload_status == "sent" else
+                "⚠️ بکاپ محلی ساخته شد؛ وضعیت ارسال تلگرام را در پیام بالا بررسی کنید.",
+                show_alert=upload_status != "sent"
+            )
         except Exception as e:
             await query.answer(f"خطا در بکاپ: {e}", show_alert=True)
 
