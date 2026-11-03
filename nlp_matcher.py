@@ -176,7 +176,7 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
         # Controls Row
         keyboard.append([
             InlineKeyboardButton(toggle_conn_text, callback_data=f"{toggle_conn_action}:{account_code}"),
-            InlineKeyboardButton(mode_text, callback_data=f"toggle_mode:{account_code}")
+            InlineKeyboardButton(mode_text, callback_data=f"set_mode:{account_code}:{0 if on_first_connect else 1}")
         ])
     
     # Fixed Deliverables Row
