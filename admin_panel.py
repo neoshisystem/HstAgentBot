@@ -393,8 +393,12 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
     elif action == "do_del_plan":
         plan_code = sub_action
-        database.delete_plan(plan_code)
-        await query.answer("🗑 تعرفه با موفقیت حذف گردید.", show_alert=True)
+        try:
+            deleted = database.delete_plan(plan_code)
+        except ValueError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+        await query.answer("🗑 تعرفه حذف شد." if deleted else "تعرفه یافت نشد.", show_alert=True)
         # Refresh and return to plans list cleanly
         plans = database.get_pricing_plans()
         lines = ["⚙️ **تعرفه‌ها و پلن‌های سیستم:**\n"]
@@ -631,7 +635,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
              InlineKeyboardButton("💳 تغییر سقف اعتبار", callback_data=f"admin:prompt_edit_credit:{rep_id}")],
             [InlineKeyboardButton("✏️ ویرایش مشخصات", callback_data=f"admin:prompt_edit_rep:{rep_id}")],
             [InlineKeyboardButton("⏸ تعلیق / فعال‌سازی", callback_data=f"admin:toggle_rep:{rep_id}"),
-             InlineKeyboardButton("🗑 حذف نماینده", callback_data=f"admin:confirm_del_rep:{rep_id}")]
+             InlineKeyboardButton("📦 آرشیو نماینده", callback_data=f"admin:confirm_del_rep:{rep_id}")]
         ])
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer()
@@ -664,7 +668,9 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
     elif action in {
         "prompt_card_settings", "prompt_charge_user", "prompt_edit_credit",
         "prompt_setting", "prompt_pay", "prompt_add_rep", "prompt_edit_plan",
-        "prompt_transfer", "prompt_inspect", "prompt_add_plan", "prompt_link_user"
+        "prompt_transfer", "prompt_inspect", "prompt_add_plan", "prompt_link_user",
+        "prompt_search_user", "prompt_edit_user_id", "prompt_link_user_id",
+        "prompt_unlink_user_acc", "prompt_edit_rep", "prompt_edit_plan_specs"
     }:
         if chat.type != "private":
             await query.answer("⚠️ این عملیات منحصراً در چت خصوصی ربات در دسترس است.", show_alert=True)
@@ -833,6 +839,136 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             keyboard = build_back_to_admin_keyboard()
             await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             await query.answer()
+        elif action == "prompt_search_user":
+            context.user_data["admin_state"] = {"action": "search_user", "ts": now_ts}
+            await query.edit_message_text(
+                "🔍 **جستجوی کاربر:** شناسه تلگرام، نام یا یوزرنیم را ارسال کنید.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=build_back_to_admin_keyboard()
+            )
+            await query.answer()
+
+        elif action == "prompt_edit_user_id":
+            target_user_id = int(sub_action)
+            context.user_data["admin_state"] = {
+                "action": "edit_user_id", "target_user_id": target_user_id, "ts": now_ts
+            }
+            await query.edit_message_text(
+                f"✏️ **تغییر شناسه تلگرام کاربر `{target_user_id}`:**\nشناسه عددی جدید را ارسال کنید.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=build_back_to_admin_keyboard()
+            )
+            await query.answer()
+
+        elif action == "prompt_link_user_id":
+            target_user_id = int(sub_action)
+            context.user_data["admin_state"] = {
+                "action": "link_user_account", "target_user_id": target_user_id, "ts": now_ts
+            }
+            await query.edit_message_text(
+                f"🔗 **اتصال اکانت به کاربر `{target_user_id}`:**\nکد دقیق اکانت را ارسال کنید.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=build_back_to_admin_keyboard()
+            )
+            await query.answer()
+
+        elif action == "prompt_unlink_user_acc":
+            target_user_id = int(sub_action)
+            context.user_data["admin_state"] = {
+                "action": "unlink_user_account", "target_user_id": target_user_id, "ts": now_ts
+            }
+            await query.edit_message_text(
+                f"🔌 **قطع اتصال اکانت از کاربر `{target_user_id}`:**\nکد دقیق اکانت را ارسال کنید.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=build_back_to_admin_keyboard()
+            )
+            await query.answer()
+
+        elif action == "prompt_edit_rep":
+            target_rep_id = int(sub_action)
+            target_rep = database.get_rep_by_id(target_rep_id)
+            if not target_rep:
+                await query.answer("نماینده یافت نشد.", show_alert=True)
+                return
+            context.user_data["admin_state"] = {
+                "action": "edit_rep", "target_rep_id": target_rep_id, "ts": now_ts
+            }
+            await query.edit_message_text(
+                f"✏️ **ویرایش نماینده {target_rep['name']}**\n"
+                "اطلاعات را به ترتیب زیر بفرستید:\n"
+                "`<rep_code> <name> <telegram_id> <group_id> <topic_id> <scope_filter>`\n"
+                "نام باید بدون فاصله یا با زیرخط باشد.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=build_back_to_admin_keyboard()
+            )
+            await query.answer()
+
+        elif action == "prompt_edit_plan_specs":
+            plan_code = sub_action
+            plan = database.get_plan(plan_code)
+            if not plan:
+                await query.answer("پلن یافت نشد.", show_alert=True)
+                return
+            context.user_data["admin_state"] = {
+                "action": "edit_plan_specs", "plan_code": plan_code, "ts": now_ts
+            }
+            await query.edit_message_text(
+                f"📐 **ویرایش حجم و زمان پلن {plan['name']}**\n"
+                "فرمت: `<GB> <days> <نام جدید پلن>`\n"
+                "مثال: `25 30 بسته ویژه ماهانه`",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=build_back_to_admin_keyboard()
+            )
+            await query.answer()
+
+    elif action == "confirm_del_user":
+        target_user_id = int(sub_action)
+        u_info = database.get_bot_user_by_tg_id(target_user_id)
+        if not u_info:
+            await query.answer("کاربر یافت نشد.", show_alert=True)
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 بله، حذف دسترسی کاربر", callback_data=f"admin:do_del_user:{target_user_id}")],
+            [InlineKeyboardButton("❌ انصراف", callback_data=f"admin:user_detail:{target_user_id}")]
+        ])
+        await query.edit_message_text(
+            f"⚠️ **حذف پروفایل کاربر `{target_user_id}`؟**\n"
+            "اکانت‌های متصل از مالکیت او جدا می‌شوند؛ کیف پول، فیش‌ها و سوابق مالی برای حسابرسی حفظ خواهند شد.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+        await query.answer()
+
+    elif action == "do_del_user":
+        target_user_id = int(sub_action)
+        removed = database.delete_bot_user(target_user_id)
+        await query.answer("پروفایل کاربر حذف شد." if removed else "کاربر یافت نشد.", show_alert=True)
+        await query.edit_message_text(
+            "✅ پروفایل حذف شد؛ سوابق مالی و پرداختی حفظ شدند." if removed else "⚠️ تغییری انجام نشد.",
+            reply_markup=build_back_to_admin_keyboard([[InlineKeyboardButton("👥 بازگشت به کاربران", callback_data="admin:users:1")]])
+        )
+        return
+
+    elif action == "confirm_del_rep":
+        target_rep_id = int(sub_action)
+        target_rep = database.get_rep_by_id(target_rep_id)
+        if not target_rep:
+            await query.answer("نماینده یافت نشد.", show_alert=True)
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📦 بله، آرشیو نماینده", callback_data=f"admin:do_del_rep:{target_rep_id}")],
+            [InlineKeyboardButton("❌ انصراف", callback_data=f"admin:rep_detail:{target_rep_id}")]
+        ])
+        await query.edit_message_text(
+            f"⚠️ **آرشیو نماینده {target_rep['name']}؟**\n"
+            "برای حفظ دفترکل مالی و لاگ‌های حسابرسی، سابقه حذف فیزیکی نمی‌شود؛ دسترسی نماینده غیرفعال خواهد شد.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+        await query.answer()
+
+    elif action == "do_del_rep":
+        target_rep_id = int(sub_action)
+        archived = database.delete_rep(target_rep_id)
+        await query.answer("نماینده آرشیو شد." if archived else "نماینده یافت نشد.", show_alert=True)
+        await query.edit_message_text(
+            "✅ نماینده غیرفعال شد و سوابق او حفظ شدند." if archived else "⚠️ تغییری انجام نشد.",
+            reply_markup=build_back_to_admin_keyboard([[InlineKeyboardButton("👥 بازگشت به نمایندگان", callback_data="admin:reps")]])
+        )
+        return
+
     elif action == "recent_tx":
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
         entries, total, total_pages = database.get_financial_ledger_paginated(
@@ -899,17 +1035,8 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("❌ عملیات فرم لغو شد.", reply_markup=build_admin_main_keyboard())
         return True
 
-    # Priority to normal Account queries / Intent / Replies
-    reply_to = update.message.reply_to_message
-    reply_text = (reply_to.text or reply_to.caption or "") if reply_to else ""
-    detected_code = nlp_matcher.extract_account_code(reply_text, text)
-    detected_intent, _ = nlp_matcher.detect_intent(text)
-    
-    if detected_code or detected_intent != "unknown" or update.message.reply_to_message:
-        # Release FSM state immediately so router processes account/intent seamlessly
-        context.user_data.pop("admin_state", None)
-        return False
-
+    # Active form input takes precedence over account/NLP routing. To exit,
+    # the administrator explicitly cancels the form or lets it expire.
     action = admin_state.get("action")
 
     if action == "edit_card_settings":
@@ -1133,12 +1260,15 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text("⚠️ فیلدها ناقص بود و عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
             return True
         p_code = parts[0]
-        p_name = parts[1]
         try:
-            p_gb = float(parts[2])
-            p_days = int(parts[3])
-            p_rep_p = int(parts[4])
-            p_user_p = int(parts[5])
+            numeric = parts[-4:]
+            p_gb = float(numeric[0].translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
+            p_days = int(numeric[1].translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
+            p_rep_p = int(numeric[2].replace(",", "").translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
+            p_user_p = int(numeric[3].replace(",", "").translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
+            p_name = " ".join(parts[1:-4]).strip()
+            if not p_name:
+                raise ValueError("Plan name is required")
             database.add_or_update_plan(p_code, p_name, p_gb, p_days, p_rep_p, p_user_p)
             await update.message.reply_text(
                 f"✅ **پلن جدید با موفقیت اضافه شد.**\n\n"
@@ -1162,11 +1292,114 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text("⚠️ فرمت نامعتبر بود و عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
             return True
         chat_id, code = int(parts[0]), parts[1]
-        res = database.link_user_to_account(code, chat_id)
+        res = database.link_user_to_account(code, chat_id, allow_reassign=True)
         if res.get("status") == "ok":
             await update.message.reply_text(f"✅ اکانت `{code}` به Chat ID `{chat_id}` متصل گردید.", reply_markup=build_admin_main_keyboard())
         else:
             await update.message.reply_text(f"❌ خطا: {res.get('message')}")
+        context.user_data.pop("admin_state", None)
+        return True
+
+    elif action == "search_user":
+        matches = database.search_bot_users(text)
+        if not matches:
+            await update.message.reply_text("کاربری با این مشخصات پیدا نشد.", reply_markup=build_admin_main_keyboard())
+        else:
+            rows = []
+            for item in matches:
+                label = item.get("full_name") or item.get("username") or str(item["telegram_id"])
+                rows.append([InlineKeyboardButton(
+                    f"{label[:24]} ({item['telegram_id']})",
+                    callback_data=f"admin:user_detail:{item['telegram_id']}"
+                )])
+            await update.message.reply_text(
+                f"🔎 {len(matches)} نتیجه برای جستجوی شما:",
+                reply_markup=build_back_to_admin_keyboard(rows)
+            )
+        context.user_data.pop("admin_state", None)
+        return True
+
+    elif action == "edit_user_id":
+        old_id = int(admin_state["target_user_id"])
+        try:
+            new_id = int(text)
+            if new_id <= 0:
+                raise ValueError("Telegram ID must be positive")
+            database.change_user_tg_id(old_id, new_id)
+            await update.message.reply_text(
+                f"✅ شناسه کاربر از `{old_id}` به `{new_id}` تغییر کرد؛ سوابق و مالکیت‌های مرتبط منتقل شدند.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard()
+            )
+        except ValueError as exc:
+            await update.message.reply_text(f"❌ تغییر شناسه انجام نشد: {exc}", reply_markup=build_admin_main_keyboard())
+        context.user_data.pop("admin_state", None)
+        return True
+
+    elif action == "link_user_account":
+        target_user_id = int(admin_state["target_user_id"])
+        linked = database.link_user_to_account(
+            text, target_user_id, allow_reassign=True
+        )
+        if linked.get("status") == "ok":
+            database.log_audit(
+                rep_id=None, account_code=text, email=None, action="admin_link_user_account",
+                actor_id=update.effective_user.id, actor_name=update.effective_user.full_name or "Admin",
+                details={"target_user_id": target_user_id}, result_status="success"
+            )
+            response = f"✅ اکانت `{text}` به کاربر `{target_user_id}` متصل شد."
+        else:
+            response = f"❌ اتصال انجام نشد: {linked.get('message')}"
+        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard())
+        context.user_data.pop("admin_state", None)
+        return True
+
+    elif action == "unlink_user_account":
+        target_user_id = int(admin_state["target_user_id"])
+        unlinked = database.unlink_account_owner(text, target_user_id)
+        await update.message.reply_text(
+            "✅ اتصال اکانت قطع شد." if unlinked else "❌ اکانت متعلق به این کاربر نیست یا یافت نشد.",
+            reply_markup=build_admin_main_keyboard()
+        )
+        context.user_data.pop("admin_state", None)
+        return True
+
+    elif action == "edit_rep":
+        target_rep_id = int(admin_state["target_rep_id"])
+        parts = text.split(maxsplit=5)
+        if len(parts) != 6:
+            await update.message.reply_text(
+                "فرمت باید شش بخش داشته باشد: rep_code name telegram_id group_id topic_id scope_filter",
+                reply_markup=build_admin_main_keyboard()
+            )
+            context.user_data.pop("admin_state", None)
+            return True
+        r_code, r_name, r_tg, r_group, r_topic, r_scope = parts
+        try:
+            database.update_rep_full(
+                target_rep_id, r_name, r_code, int(r_tg), int(r_group), int(r_topic), r_scope
+            )
+            await update.message.reply_text("✅ اطلاعات نماینده به‌روزرسانی شد.", reply_markup=build_admin_main_keyboard())
+        except ValueError:
+            await update.message.reply_text("❌ شناسه‌های تلگرام/گروه/تاپیک باید عددی باشند.", reply_markup=build_admin_main_keyboard())
+        context.user_data.pop("admin_state", None)
+        return True
+
+    elif action == "edit_plan_specs":
+        parts = text.split(maxsplit=2)
+        if len(parts) != 3:
+            await update.message.reply_text(
+                "فرمت نامعتبر است. نمونه: `25 30 بسته ویژه ماهانه`",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard()
+            )
+            context.user_data.pop("admin_state", None)
+            return True
+        try:
+            gb = float(parts[0].translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
+            days = int(parts[1].translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
+            database.update_plan_specs(admin_state["plan_code"], parts[2], gb, days)
+            await update.message.reply_text("✅ حجم، زمان و نام پلن به‌روزرسانی شد.", reply_markup=build_admin_main_keyboard())
+        except ValueError as exc:
+            await update.message.reply_text(f"❌ ویرایش پلن انجام نشد: {exc}", reply_markup=build_admin_main_keyboard())
         context.user_data.pop("admin_state", None)
         return True
 
