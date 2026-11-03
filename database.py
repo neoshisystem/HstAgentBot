@@ -404,6 +404,31 @@ def init_db():
             "ON rep_action_intents(rep_id, actor_tg_id, status, expires_at)"
         )
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS rep_renewal_intents (
+            intent_id TEXT PRIMARY KEY,
+            rep_id INTEGER NOT NULL,
+            actor_tg_id INTEGER NOT NULL,
+            account_code TEXT NOT NULL,
+            account_email TEXT NOT NULL,
+            plan_code TEXT NOT NULL,
+            plan_name TEXT NOT NULL,
+            gb REAL NOT NULL,
+            days INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'processing',
+            operation_lock_key TEXT NOT NULL,
+            operation_lock_token TEXT NOT NULL,
+            result_note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (rep_id) REFERENCES representatives(id)
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rep_renewal_intents_owner_status "
+            "ON rep_renewal_intents(rep_id, actor_tg_id, status, created_at)"
+        )
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS account_renewal_confirmations (
             intent_id TEXT PRIMARY KEY,
             actor_id INTEGER NOT NULL,
@@ -1872,6 +1897,243 @@ def mark_user_action_intent_for_reconciliation(
         if cur.rowcount != 1:
             raise RuntimeError("Could not mark user action for reconciliation")
         return True
+
+
+def begin_rep_renewal_intent(
+    rep_id: int,
+    actor_tg_id: int,
+    account_code: str,
+    account_email: str,
+    plan_code: str,
+    plan_name: str,
+    gb: float,
+    days: int,
+    amount: int,
+) -> dict:
+    """Atomically precharge a representative and bind the exact account renewal lock to a durable intent."""
+    rep_id, actor_tg_id = int(rep_id), int(actor_tg_id)
+    code = str(account_code or "").strip()
+    email = str(account_email or "").strip()
+    plan_code, plan_name = str(plan_code or "").strip(), str(plan_name or "").strip()
+    gb, days, amount = float(gb), int(days), int(amount)
+    if not code or not email or not plan_code or not plan_name or gb <= 0 or days <= 0 or amount <= 0:
+        raise ValueError("A complete positive representative renewal snapshot is required")
+
+    intent_id = secrets.token_hex(16)
+    lock_key = f"account-renewal:{code.lower()}"
+    lock_token = uuid.uuid4().hex
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (now,))
+        if cur.execute(
+            "SELECT 1 FROM operation_locks WHERE lock_key=?", (lock_key,)
+        ).fetchone():
+            return {"status": "busy"}
+
+        new_balance = _record_rep_ledger_entry(
+            cur, rep_id, code, email, plan_code, "debit", amount,
+            f"پیش‌پرداخت تمدید {plan_name} (در انتظار تأیید پنل)",
+            actor_tg_id, "Representative",
+        )
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (lock_key, lock_token, 253402300799.0),
+        )
+        cur.execute("""
+            INSERT INTO rep_renewal_intents
+            (intent_id, rep_id, actor_tg_id, account_code, account_email,
+             plan_code, plan_name, gb, days, amount, status,
+             operation_lock_key, operation_lock_token)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
+        """, (
+            intent_id, rep_id, actor_tg_id, code, email, plan_code, plan_name,
+            gb, days, amount, lock_key, lock_token,
+        ))
+        _insert_audit(
+            cur, rep_id, code, email, "rep_renewal_intent_started",
+            actor_tg_id, "Representative",
+            {"intent_id": intent_id, "plan_code": plan_code, "amount": amount,
+             "balance_after": new_balance, "lock_key": lock_key},
+            "success",
+        )
+        return {
+            "status": "started", "intent_id": intent_id, "rep_id": rep_id,
+            "lock_key": lock_key, "lock_token": lock_token,
+            "new_balance": new_balance,
+        }
+
+
+def _verify_rep_renewal_lock(cur, intent_id: str, rep_id: int, actor_tg_id: int):
+    row = cur.execute("""
+        SELECT * FROM rep_renewal_intents
+        WHERE intent_id=? AND rep_id=? AND actor_tg_id=?
+    """, (str(intent_id), int(rep_id), int(actor_tg_id))).fetchone()
+    if not row or row["status"] not in ("processing", "needs_reconciliation"):
+        raise ValueError("Representative renewal intent is not unresolved")
+    intent = dict(row)
+    lock = cur.execute(
+        "SELECT token, created_at FROM operation_locks WHERE lock_key=?",
+        (intent["operation_lock_key"],),
+    ).fetchone()
+    if not lock or not secrets.compare_digest(str(lock["token"]), str(intent["operation_lock_token"])):
+        raise ValueError("Representative renewal intent's exact operation lock is missing or ownership differs")
+    return intent, lock
+
+
+def complete_rep_renewal_intent(
+    intent_id: str, rep_id: int, actor_tg_id: int, result_note: str = "X-UI renewal succeeded"
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, lock = _verify_rep_renewal_lock(cur, intent_id, rep_id, actor_tg_id)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release exact representative renewal lock")
+        cur.execute("""
+            UPDATE rep_renewal_intents
+            SET status='succeeded', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(result_note)[:500], str(intent_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative renewal intent")
+        _insert_audit(
+            cur, int(rep_id), intent["account_code"], intent["account_email"],
+            "rep_renewal_intent_succeeded", int(actor_tg_id), "Representative",
+            {"intent_id": str(intent_id), "plan_code": intent["plan_code"],
+             "amount": int(intent["amount"]), "lock_key": intent["operation_lock_key"]},
+            "success",
+        )
+        return True
+
+
+def refund_rep_renewal_intent(
+    intent_id: str, rep_id: int, actor_tg_id: int, reason: str
+) -> dict:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, lock = _verify_rep_renewal_lock(cur, intent_id, rep_id, actor_tg_id)
+        new_balance = _record_rep_ledger_entry(
+            cur, int(rep_id), intent["account_code"], intent["account_email"],
+            intent["plan_code"], "credit", int(intent["amount"]),
+            str(reason or "استرداد پیش‌پرداخت تمدید"), int(actor_tg_id), "Representative",
+        )
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release exact representative renewal lock")
+        cur.execute("""
+            UPDATE rep_renewal_intents
+            SET status='refunded', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(reason or "Definite X-UI failure")[:500], str(intent_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative renewal refund")
+        _insert_audit(
+            cur, int(rep_id), intent["account_code"], intent["account_email"],
+            "rep_renewal_intent_refunded", int(actor_tg_id), "Representative",
+            {"intent_id": str(intent_id), "plan_code": intent["plan_code"],
+             "amount": int(intent["amount"]), "new_balance": new_balance,
+             "lock_key": intent["operation_lock_key"]},
+            "success",
+        )
+        return {"status": "refunded", "new_balance": new_balance, "amount": int(intent["amount"])}
+
+
+def mark_rep_renewal_for_reconciliation(
+    intent_id: str, rep_id: int, actor_tg_id: int, note: str
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, _ = _verify_rep_renewal_lock(cur, intent_id, rep_id, actor_tg_id)
+        cur.execute("""
+            UPDATE rep_renewal_intents
+            SET status='needs_reconciliation', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(note or "Ambiguous renewal result")[:500], str(intent_id)))
+        return cur.rowcount == 1
+
+
+def resolve_rep_renewal_intent(
+    intent_id: str, actor_id: int, actor_name: str, resolution: str, evidence_note: str
+) -> dict:
+    key = str(intent_id or "").strip()
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if not key:
+        raise ValueError("Representative renewal intent ID is required")
+    if choice not in ("APPLIED", "REFUND_NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or REFUND_NOT_APPLIED")
+    prefix = "APPLIED:" if choice == "APPLIED" else "REFUND_NOT_APPLIED:"
+    if not note.startswith(prefix) or len(note) < len(prefix) + 15:
+        raise ValueError(f"Evidence must start with {prefix} and contain at least 15 characters after it")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM rep_renewal_intents
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (key,)).fetchone()
+        if not row:
+            raise ValueError("No unresolved representative renewal intent with that ID was found")
+        intent = dict(row)
+        lock, = (cur.execute(
+            "SELECT token, created_at FROM operation_locks WHERE lock_key=?",
+            (intent["operation_lock_key"],),
+        ).fetchone(),)
+        if not lock or not secrets.compare_digest(str(lock["token"]), str(intent["operation_lock_token"])):
+            raise ValueError("Representative renewal intent's exact operation lock is missing or ownership differs")
+
+        new_balance = None
+        if choice == "REFUND_NOT_APPLIED":
+            new_balance = _record_rep_ledger_entry(
+                cur, int(intent["rep_id"]), intent["account_code"], intent["account_email"],
+                intent["plan_code"], "credit", int(intent["amount"]),
+                "استرداد پس از تطبیق مدیریتی؛ تمدید خارجی انجام نشده است",
+                int(actor_id), str(actor_name or "Super Admin"),
+            )
+            status, audit_action = "refunded", "resolve_rep_renewal_intent_refund"
+        else:
+            status, audit_action = "succeeded", "resolve_rep_renewal_intent_applied"
+
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume representative renewal lock")
+        cur.execute("""
+            UPDATE rep_renewal_intents
+            SET status=?, result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (status, note[:500], key))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative renewal resolution")
+        _insert_audit(
+            cur, int(intent["rep_id"]), intent["account_code"], intent["account_email"],
+            audit_action, int(actor_id), str(actor_name or "Super Admin"),
+            {"intent_id": key, "actor_tg_id": int(intent["actor_tg_id"]),
+             "plan_code": intent["plan_code"], "amount": int(intent["amount"]),
+             "resolution": choice, "evidence_note": note,
+             "lock_key": intent["operation_lock_key"], "lock_created_at": lock["created_at"],
+             "new_balance": new_balance},
+            "success",
+        )
+        return {
+            "status": status, "rep_id": int(intent["rep_id"]),
+            "amount": int(intent["amount"]), "new_balance": new_balance,
+            "lock_key": intent["operation_lock_key"],
+        }
 
 
 def create_account_renewal_confirmation(
