@@ -114,8 +114,8 @@ def test_reservation_force_and_cancel_require_a_second_confirmation(monkeypatch)
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("first click must not cancel/refund")),
     )
     monkeypatch.setattr(
-        admin_panel.xui_manager, "renew_client",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("first click must not call X-UI")),
+        admin_panel, "xui_manager",
+        SimpleNamespace(renew_client=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("side effect before confirmation"))),
     )
 
     asyncio.run(admin_panel.handle_admin_callbacks(update_force, context))
