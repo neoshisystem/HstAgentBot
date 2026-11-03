@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 import asyncio
+import html
 from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -1531,16 +1532,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         status_fa = "⏳ در انتظار بررسی" if rcp["status"] == "pending" else ("✅ تایید شده" if rcp["status"] == "approved" else "❌ رد شده")
         role_fa = "نماینده" if rcp["role"] == "rep" else "کاربر نهایی"
-        note_txt = rcp.get('receipt_note') or 'ندارد'
+        note_txt = html.escape(str(rcp.get("receipt_note") or "ندارد")[:400])
         text = (
-            f"🧾 **شناسنامه و جزئیات فیش پرداختی:**\n\n"
-            f"• کد پیگیری: `{rcp['tracking_code']}`\n"
-            f"• نقش: **{role_fa}**\n"
-            f"• شناسه کاربر: `{rcp['user_id']}`\n"
-            f"• مبلغ واریزی: **{rcp['amount_toman']:,} تومان**\n"
-            f"• وضعیت فعلی: **{status_fa}**\n"
-            f"• تاریخ ارسال: `{rcp['created_at'][:19]}`\n"
-            f"• توضیحات فرستنده: _{note_txt}_\n"
+            f"🧾 <b>شناسنامه و جزئیات فیش پرداختی:</b>\n\n"
+            f"• کد پیگیری: <code>{html.escape(str(rcp['tracking_code']))}</code>\n"
+            f"• نقش: <b>{html.escape(role_fa)}</b>\n"
+            f"• شناسه کاربر: <code>{int(rcp['user_id'])}</code>\n"
+            f"• مبلغ واریزی: <b>{int(rcp['amount_toman']):,} تومان</b>\n"
+            f"• وضعیت فعلی: <b>{html.escape(status_fa)}</b>\n"
+            f"• تاریخ ارسال: <code>{html.escape(str(rcp['created_at'])[:19])}</code>\n"
+            f"• توضیحات فرستنده: <i>{note_txt}</i>\n"
         )
         if rcp["status"] == "pending":
             btns = [
@@ -1551,7 +1552,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         else:
             btns = [[InlineKeyboardButton(status_fa, callback_data="noop")]]
-        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(btns))
+        await finance_manager.reply_with_receipt_detail(
+            query.message,
+            rcp,
+            text,
+            reply_markup=InlineKeyboardMarkup(btns),
+        )
         await query.answer()
         return
 
