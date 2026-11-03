@@ -113,7 +113,7 @@ def test_subscription_url_rejects_url_or_path_in_host_setting(monkeypatch, domai
     assert sub_manager.get_subscription_url("token-123") == ""
 
 
-@pytest.mark.parametrize("domain", ["sub example.test", "sub.example.test\\tinvalid"])
+@pytest.mark.parametrize("domain", ["sub example.test", "sub.example.test\tinvalid"])
 def test_subscription_url_rejects_whitespace_or_control_in_host(monkeypatch, domain):
     monkeypatch.setattr(sub_manager.config, "SUB_DOMAIN", domain)
     monkeypatch.setattr(sub_manager.config, "SUB_PORT", 443)
