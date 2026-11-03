@@ -342,3 +342,63 @@ def test_persistent_operation_lock_requires_audited_admin_resolution(isolated_db
         "SELECT COUNT(*) FROM audit_logs WHERE action = 'resolve_operation_lock' AND actor_id = ?",
         (9999,),
     ) == 1
+
+
+def test_financial_ledger_pagination_preserves_user_and_rep_identity(isolated_db):
+    rep_id = add_rep(rep_code="rep-ledger", name="Ledger Representative")
+    user_id = 7701
+    database.ensure_bot_user(user_id, username="ledger_user", full_name="Ledger User")
+
+    database.record_ledger_entry(
+        rep_id=rep_id,
+        account_code="REP-A1",
+        email="rep-a1@example.test",
+        plan_code="p1",
+        tx_type="credit",
+        amount=1_500,
+        description="representative settlement",
+        actor_id=9000,
+        actor_name="Admin",
+    )
+    database.record_user_payment(
+        user_id, 2_500, "end-user wallet top-up",
+        actor_id=9000, actor_name="Admin",
+    )
+    database.record_ledger_entry(
+        rep_id=rep_id,
+        account_code="REP-A2",
+        email="rep-a2@example.test",
+        plan_code="p2",
+        tx_type="debit",
+        amount=700,
+        description="representative account issuance",
+        actor_id=9000,
+        actor_name="Admin",
+    )
+
+    page1, total, total_pages = database.get_financial_ledger_paginated(page=1, page_size=1)
+    page2, total2, total_pages2 = database.get_financial_ledger_paginated(page=2, page_size=1)
+    page3, total3, total_pages3 = database.get_financial_ledger_paginated(page=3, page_size=1)
+
+    assert (total, total_pages) == (3, 3)
+    assert (total2, total_pages2) == (3, 3)
+    assert (total3, total_pages3) == (3, 3)
+    assert page1[0]["description"] == "representative account issuance"
+    assert page1[0]["rep_name"] == "Ledger Representative"
+    assert page1[0]["rep_code"] == "rep-ledger"
+    assert page1[0]["rep_id"] == rep_id
+
+    assert page2[0]["description"] == "end-user wallet top-up"
+    assert page2[0]["user_full_name"] == "Ledger User"
+    assert page2[0]["user_username"] == "ledger_user"
+    assert page2[0]["user_id"] == user_id
+
+    assert page3[0]["description"] == "representative settlement"
+    assert page3[0]["rep_code"] == "rep-ledger"
+
+    rep_page, rep_total, rep_pages = database.get_financial_ledger_paginated(
+        rep_id=rep_id, page=1, page_size=1
+    )
+    assert (rep_total, rep_pages) == (2, 2)
+    assert rep_page[0]["rep_id"] == rep_id
+    assert rep_page[0]["user_id"] is None
