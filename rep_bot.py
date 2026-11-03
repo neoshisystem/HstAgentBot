@@ -2144,6 +2144,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     parts = data.split(":")
     action = parts[0]
+
+    # Old unprefixed account-card reservation callbacks executed immediately.
+    # Representatives must use the new rep:confirm_* → rep:do_* flow instead.
+    if role == "rep" and action in ("force_res", "cancel_res"):
+        await query.answer(
+            "⚠️ این دکمه رزرو قدیمی است و اجرا نشد؛ کارت اکانت را تازه کنید و تأیید دو مرحله‌ای را انجام دهید.",
+            show_alert=True
+        )
+        return
+
     renewal_confirmation_id = None
     # Reserve callbacks carry <reservation_id>:<account_email>; other account
     # callbacks carry the account identifier in parts[1].
