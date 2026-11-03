@@ -1128,16 +1128,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check End-User access restriction
     if role == "end_user":
-        user_accs = database.get_user_accounts(user.id)
-        matched_user_acc = any(
-            a["account_code"].lower() == account_code.lower() or 
-            a["email"].lower() == account_code.lower() or
-            account_code.lower() in a["email"].lower()
-            for a in user_accs
-        )
-        if not matched_user_acc:
+        owned_account = database.get_user_owned_account(user.id, account_code)
+        if not owned_account:
             await update.message.reply_text("⛔️ شما به این اکانت دسترسی ندارید. ابتدا با دستور `/link <کد_اکانت>` آن را ثبت کنید.", parse_mode=ParseMode.MARKDOWN)
             return
+        account_code = owned_account["email"]
 
     # Super Admin vs Rep Scope Configuration
     is_super_admin = (role == "super_admin")
@@ -1575,16 +1570,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⛔️ این عملیات فقط برای نماینده و مدیریت مجاز است.", show_alert=True)
             return
 
-        user_accs = database.get_user_accounts(user.id)
-        matched_user_acc = any(
-            a["account_code"].lower() == account_code.lower() or 
-            a["email"].lower() == account_code.lower() or
-            account_code.lower() in a["email"].lower()
-            for a in user_accs
-        )
-        if not matched_user_acc:
+        owned_account = database.get_user_owned_account(user.id, account_code)
+        if not owned_account:
             await query.answer("⛔️ شما به این اکانت دسترسی ندارید. ابتدا با دستور /link آن را ثبت کنید.", show_alert=True)
             return
+        account_code = owned_account["email"]
     
     # 1. More Plans Menu
     if action == "more_plans":
