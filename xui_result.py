@@ -26,6 +26,8 @@ def classify_xui_result(result) -> XUIResult:
     raw_status = result.get("status")
     status = raw_status.strip().lower() if isinstance(raw_status, str) else ""
     success_flag = result.get("success")
+    if "success" in result and not isinstance(success_flag, bool):
+        return XUIResult.UNKNOWN
     success_signal = success_flag if isinstance(success_flag, bool) else None
 
     status_signal = None
