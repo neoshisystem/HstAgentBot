@@ -800,7 +800,8 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_account_renewal(
     user, role, rep, acc_record, client_info, gb: float, days: float,
-    plan_code: str, effective_first: bool, curr_comment: str, comment_updated: bool = False
+    plan_code: str, effective_first: bool, curr_comment: str, comment_updated: bool = False,
+    confirmation_id: str | None = None,
 ):
     account_code = acc_record["account_code"]
     email = acc_record["email"]
@@ -881,6 +882,8 @@ async def process_account_renewal(
                     gb=gb,
                     days=days,
                     amount=charge,
+                    confirmation_id=confirmation_id,
+                    actor_role=role,
                 )
             except ValueError as exc:
                 pending_res = database.get_pending_reservation(account_code)
@@ -1072,7 +1075,10 @@ async def process_account_renewal(
             on_first_connect=1 if effective_first else 0,
             charge_amount=res_charge,
             actor_id=user.id,
-            actor_name=user.full_name or user.username
+            actor_name=user.full_name or user.username,
+            confirmation_id=confirmation_id,
+            actor_role=role,
+            confirmation_rep_id=rep["id"] if rep else None,
         )
 
         if is_admin_exempt:
