@@ -1080,17 +1080,19 @@ def get_operation_locks() -> list[dict]:
     with get_db() as conn:
         rows = conn.execute("""
             SELECT o.lock_key, o.expires_at, o.created_at,
-                   COALESCE(i.intent_id, r.intent_id, rr.intent_id,
+                   COALESCE(i.intent_id, r.intent_id, rr.intent_id, ac.intent_id,
                        CASE WHEN rp.id IS NOT NULL THEN 'reservation:' || CAST(rp.id AS TEXT) END) AS intent_id,
                    COALESCE(i.action_type, r.action_type,
                        CASE WHEN rr.intent_id IS NOT NULL THEN 'renew'
+                            WHEN ac.intent_id IS NOT NULL THEN 'admin_renewal'
                             WHEN rp.id IS NOT NULL THEN 'reservation_activation' END) AS action_type,
-                   COALESCE(i.user_id, r.actor_tg_id, rr.actor_tg_id, rp.actor_id) AS user_id,
-                   COALESCE(i.account_code, r.account_code, rr.account_code, rp.account_code) AS account_code,
-                   COALESCE(i.status, r.status, rr.status, rp.status) AS intent_status,
+                   COALESCE(i.user_id, r.actor_tg_id, rr.actor_tg_id, ac.actor_id, rp.actor_id) AS user_id,
+                   COALESCE(i.account_code, r.account_code, rr.account_code, ac.account_code, rp.account_code) AS account_code,
+                   COALESCE(i.status, r.status, rr.status, ac.status, rp.status) AS intent_status,
                    CASE
                        WHEN r.intent_id IS NOT NULL OR rr.intent_id IS NOT NULL THEN 'representative'
                        WHEN i.intent_id IS NOT NULL THEN 'end_user'
+                       WHEN ac.intent_id IS NOT NULL THEN 'super_admin'
                        WHEN rp.id IS NOT NULL AND rp.rep_id IS NOT NULL THEN 'representative'
                        WHEN rp.id IS NOT NULL THEN 'super_admin'
                        ELSE 'unlinked'
@@ -1108,6 +1110,11 @@ def get_operation_locks() -> list[dict]:
              AND rr.operation_lock_token = o.token
             LEFT JOIN reserved_packages rp
               ON o.lock_key = 'reservation-activation:' || CAST(rp.id AS TEXT)
+            LEFT JOIN account_renewal_confirmations ac
+              ON ac.operation_lock_key = o.lock_key
+             AND ac.operation_lock_token = o.token
+             AND ac.operation_ref_type = 'admin_renewal'
+             AND ac.status IN ('processing', 'needs_reconciliation')
             WHERE o.expires_at > ?
             ORDER BY o.created_at ASC
         """, (time.time(),)).fetchall()
@@ -1160,11 +1167,22 @@ def resolve_operation_lock(
             FROM reserved_packages
             WHERE ('reservation-activation:' || CAST(id AS TEXT)) = ?
               AND status IN ('pending', 'activated')
+            UNION ALL
+            SELECT intent_id, status, 'super_admin' AS owner_type, 'admin_renewal' AS action_type
+            FROM account_renewal_confirmations
+            WHERE operation_lock_key = ?
+              AND operation_lock_token = (
+                  SELECT token FROM operation_locks WHERE lock_key = ?
+              )
+              AND operation_ref_type = 'admin_renewal'
+              AND status IN ('processing', 'needs_reconciliation')
             LIMIT 1
-        """, (key, key, key, key, key, key, key)).fetchone()
+        """, (key, key, key, key, key, key, key, key, key)).fetchone()
         if linked_intent:
             if linked_intent["action_type"] == "reservation_activation":
                 resolve_command = "/resolvereservation"
+            elif linked_intent["action_type"] == "admin_renewal":
+                resolve_command = "/resolveadminrenewal"
             elif linked_intent["owner_type"] == "end_user":
                 resolve_command = "/resolveintent"
             elif linked_intent["action_type"] == "renew":
