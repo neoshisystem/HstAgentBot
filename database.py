@@ -2840,6 +2840,34 @@ def get_all_receipts(status: str = None, limit: int = 30) -> list:
             rows = cur.execute("SELECT * FROM payment_receipts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
+
+def get_receipts_paginated(status: str | None = None, page: int = 1, page_size: int = 10) -> tuple[list, int, int]:
+    """Return a stable newest-first receipt page plus total count and page count."""
+    page_size = max(1, min(int(page_size), 100))
+    page = max(1, int(page))
+    allowed_statuses = {None, "pending", "approved", "rejected"}
+    if status not in allowed_statuses:
+        raise ValueError("Unsupported receipt status")
+    with get_db() as conn:
+        cur = conn.cursor()
+        if status is None:
+            total = cur.execute("SELECT COUNT(*) FROM payment_receipts").fetchone()[0]
+            where = ""
+            params = []
+        else:
+            total = cur.execute(
+                "SELECT COUNT(*) FROM payment_receipts WHERE status = ?", (status,)
+            ).fetchone()[0]
+            where = "WHERE status = ?"
+            params = [status]
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        rows = cur.execute(
+            f"SELECT * FROM payment_receipts {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, (page - 1) * page_size]),
+        ).fetchall()
+        return [dict(row) for row in rows], int(total), int(total_pages)
+
 if __name__ == "__main__":
     init_db()
     count = sync_all_active_reps()
