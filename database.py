@@ -401,6 +401,29 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_rep_action_intents_owner_status "
             "ON rep_action_intents(rep_id, actor_tg_id, status, expires_at)"
         )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS account_renewal_confirmations (
+            intent_id TEXT PRIMARY KEY,
+            actor_id INTEGER NOT NULL,
+            actor_role TEXT NOT NULL CHECK (actor_role IN ('rep', 'super_admin')),
+            rep_id INTEGER,
+            account_code TEXT NOT NULL,
+            account_email TEXT NOT NULL,
+            plan_code TEXT NOT NULL,
+            plan_name TEXT NOT NULL,
+            gb REAL NOT NULL,
+            days INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at REAL NOT NULL
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_account_renewal_confirmations_actor_status "
+            "ON account_renewal_confirmations(actor_id, status, expires_at)"
+        )
 
         # Migrations check
         cols_acc = [c[1] for c in cur.execute("PRAGMA table_info(accounts)").fetchall()]
@@ -1841,6 +1864,138 @@ def mark_user_action_intent_for_reconciliation(
         if cur.rowcount != 1:
             raise RuntimeError("Could not mark user action for reconciliation")
         return True
+
+
+def create_account_renewal_confirmation(
+    actor_id: int,
+    actor_role: str,
+    rep_id: int | None,
+    account_code: str,
+    account_email: str,
+    plan_code: str,
+    plan_name: str,
+    gb: float,
+    days: int,
+    amount: int,
+    ttl_seconds: int = 600,
+) -> str:
+    """Create a one-time confirmation token for a quick-renew button."""
+    role = str(actor_role or "").strip().lower()
+    code = str(account_code or "").strip()
+    email = str(account_email or "").strip()
+    plan_code = str(plan_code or "").strip()
+    gb, days, amount = float(gb), int(days), int(amount)
+    if role not in ("rep", "super_admin"):
+        raise ValueError("Only representatives and Super Admin can create quick-renew confirmations")
+    if role == "rep" and rep_id is None:
+        raise ValueError("Representative renewal confirmation requires a representative ID")
+    if not code or not email or not plan_code or gb <= 0 or days <= 0 or amount <= 0:
+        raise ValueError("Valid account and plan snapshot are required")
+    token = secrets.token_hex(16)
+    with get_db() as conn:
+        cur = conn.cursor()
+        plan = cur.execute("""
+            SELECT name, gb, days, rep_price, is_active
+            FROM pricing_plans WHERE plan_code = ?
+        """, (plan_code,)).fetchone()
+        if (
+            not plan or not int(plan["is_active"] or 0)
+            or str(plan["name"]) != str(plan_name)
+            or float(plan["gb"]) != gb or int(plan["days"]) != days
+            or int(plan["rep_price"]) != amount
+        ):
+            raise ValueError("Plan is not active or its current values differ from the displayed plan")
+        if role == "rep":
+            owned = cur.execute("""
+                SELECT 1 FROM accounts
+                WHERE rep_id = ?
+                  AND (LOWER(account_code) = LOWER(?) OR LOWER(email) = LOWER(?))
+                LIMIT 1
+            """, (int(rep_id), code, email)).fetchone()
+            if not owned:
+                raise ValueError("Account is no longer within this representative's scope")
+        cur.execute("""
+            INSERT INTO account_renewal_confirmations
+            (intent_id, actor_id, actor_role, rep_id, account_code, account_email,
+             plan_code, plan_name, gb, days, amount, status, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            token, int(actor_id), role, int(rep_id) if rep_id is not None else None,
+            code, email, plan_code, str(plan_name), gb, days, amount,
+            time.time() + max(60, int(ttl_seconds))
+        ))
+    return token
+
+
+def get_account_renewal_confirmation(intent_id: str, actor_id: int) -> dict | None:
+    token = str(intent_id or "").strip()
+    if not token:
+        return None
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT * FROM account_renewal_confirmations
+            WHERE intent_id = ? AND actor_id = ?
+        """, (token, int(actor_id))).fetchone()
+        return dict(row) if row else None
+
+
+def consume_account_renewal_confirmation(
+    intent_id: str, actor_id: int, actor_role: str, rep_id: int | None
+) -> dict:
+    """Atomically consume a one-time confirmation after role/scope checks."""
+    token = str(intent_id or "").strip()
+    role = str(actor_role or "").strip().lower()
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM account_renewal_confirmations
+            WHERE intent_id = ? AND actor_id = ?
+        """, (token, int(actor_id))).fetchone()
+        if not row:
+            return {"status": "not_found"}
+        intent = dict(row)
+        if intent["actor_role"] != role:
+            return {"status": "wrong_role"}
+        if intent.get("rep_id") is not None and int(intent["rep_id"]) != int(rep_id or -1):
+            return {"status": "wrong_representative"}
+        if intent["status"] != "pending":
+            return {"status": "already_processed", "intent_status": intent["status"]}
+        if float(intent["expires_at"]) <= time.time():
+            cur.execute("""
+                UPDATE account_renewal_confirmations
+                SET status='expired', updated_at=CURRENT_TIMESTAMP
+                WHERE intent_id=? AND status='pending'
+            """, (token,))
+            return {"status": "expired"}
+
+        plan = cur.execute("""
+            SELECT name, gb, days, rep_price, is_active
+            FROM pricing_plans WHERE plan_code = ?
+        """, (intent["plan_code"],)).fetchone()
+        if (
+            not plan or not int(plan["is_active"] or 0)
+            or str(plan["name"]) != str(intent["plan_name"])
+            or float(plan["gb"]) != float(intent["gb"])
+            or int(plan["days"]) != int(intent["days"])
+            or int(plan["rep_price"]) != int(intent["amount"])
+        ):
+            cur.execute("""
+                UPDATE account_renewal_confirmations
+                SET status='cancelled', updated_at=CURRENT_TIMESTAMP
+                WHERE intent_id=? AND status='pending'
+            """, (token,))
+            return {"status": "plan_changed"}
+
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='consumed', updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND actor_id=? AND status='pending'
+        """, (token, int(actor_id)))
+        if cur.rowcount != 1:
+            return {"status": "already_processed", "intent_status": "consumed"}
+        intent["status"] = "consumed"
+        return {"status": "consumed", "intent": intent}
 
 
 def create_rep_action_intent(
