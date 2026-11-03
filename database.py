@@ -1462,6 +1462,51 @@ def record_user_payment(user_id: int, amount: int, description: str, actor_id: i
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         return _credit_user_wallet(cur, user_id, amount, description, actor_id, actor_name)
+
+
+def refund_user_wallet_and_release_operation_lock(
+    user_id: int,
+    amount: int,
+    description: str,
+    actor_id: int,
+    actor_name: str,
+    lock_key: str,
+    token: str,
+) -> int:
+    """Atomically refund a user and consume the exact operation-lock token.
+
+    If the refund or lock resolution fails, the transaction rolls back and the
+    persistent lock remains available for audited reconciliation. Reusing a
+    consumed token cannot issue a second refund.
+    """
+    amount = int(amount)
+    key = str(lock_key or "").strip()
+    lock_token = str(token or "")
+    if amount <= 0:
+        raise ValueError("Refund amount must be a positive integer")
+    if not key or not lock_token:
+        raise ValueError("Operation lock key and token are required")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        lock = cur.execute(
+            "SELECT token FROM operation_locks WHERE lock_key = ?",
+            (key,),
+        ).fetchone()
+        if not lock or not secrets.compare_digest(str(lock["token"]), lock_token):
+            raise ValueError("Operation lock ownership mismatch; refund was not applied")
+
+        new_balance = _credit_user_wallet(
+            cur, user_id, amount, description, actor_id, actor_name
+        )
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ? AND token = ?",
+            (key, lock_token),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not atomically resolve the owned operation lock")
+        return new_balance
 def deduct_user_wallet(user_id: int, amount: int, description: str, plan_code: str = "", account_code: str = "", email: str = "") -> tuple[bool, int]:
     """Atomically debit a positive amount; return (success, resulting balance)."""
     amount = int(amount)
