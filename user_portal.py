@@ -389,6 +389,205 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer()
 
 
+    # 3.2 Execute Buy — durable intent token prevents a callback replay from charging twice.
+    elif action == "do_buy":
+        intent_id = parts[2] if len(parts) > 2 else ""
+        try:
+            started = database.begin_user_action_intent(intent_id, user.id, "buy")
+        except Exception:
+            logger.exception("Could not claim user purchase intent for user %s", user.id)
+            await query.answer("❌ شروع تراکنش خرید ممکن نشد؛ لطفاً دوباره منوی خرید را باز کنید.", show_alert=True)
+            return
+
+        if started["status"] != "started":
+            messages = {
+                "not_found": "⛔️ درخواست خرید پیدا نشد یا متعلق به شما نیست.",
+                "wrong_action": "⛔️ نوع درخواست خرید معتبر نیست.",
+                "already_processed": "⛔️ این درخواست قبلاً اجرا یا برای بررسی ثبت شده است؛ برداشت مجدد انجام نمی‌شود.",
+                "expired": "⌛️ درخواست خرید منقضی شده است؛ منوی خرید را دوباره باز کنید.",
+                "plan_changed": "⚠️ تعرفه پس از نمایش منو تغییر کرده است؛ لطفاً منوی خرید را تازه کنید.",
+                "busy": "⏳ درخواست دیگری در حال پردازش است؛ پس از پایان آن منوی خرید را دوباره باز کنید.",
+                "not_owned": "⛔️ مالکیت سرویس برای این درخواست قابل تأیید نیست.",
+            }
+            if started["status"] == "insufficient_funds":
+                msg = f"❌ موجودی کافی نیست (موجودی: {started['balance']:,} ت | موردنیاز: {started['required']:,} ت)."
+            else:
+                msg = messages.get(started["status"], "❌ درخواست خرید قابل اجرا نیست.")
+            await query.answer(msg, show_alert=True)
+            return
+
+        intent = started["intent"]
+        price = int(intent["amount"])
+        gb = float(intent["gb"])
+        days = int(intent["days"])
+        lock_key = started["lock_key"]
+        lock_token = started["lock_token"]
+        new_bal = started["new_balance"]
+        comment = f"User_{user.id}_{user.first_name or ''}"[:30]
+        try:
+            alloc_res = await asyncio.to_thread(
+                xui_manager.allocate_pool_client, gb, days, comment=comment, scope="all"
+            )
+        except Exception:
+            logger.exception("User purchase outcome is unknown for user %s", user.id)
+            try:
+                database.mark_user_action_intent_for_reconciliation(
+                    intent_id, user.id, lock_key, lock_token,
+                    "X-UI allocation raised an exception; external outcome must be reconciled",
+                )
+            except Exception:
+                logger.exception("Could not mark user purchase intent for reconciliation (%s)", intent_id)
+            await query.answer(
+                "⚠️ پاسخ پنل نامشخص است. مبلغ محفوظ مانده و درخواست برای تطبیق مدیریتی قفل شده است.",
+                show_alert=True
+            )
+            return
+
+        if isinstance(alloc_res, dict) and alloc_res.get("status") == "success":
+            email = alloc_res.get("email")
+            sub_id = alloc_res.get("sub_id")
+            if not email:
+                logger.error("X-UI reports success but has no email for user purchase %s: %r", user.id, alloc_res)
+                try:
+                    database.mark_user_action_intent_for_reconciliation(
+                        intent_id, user.id, lock_key, lock_token,
+                        "X-UI reported allocation success without an account email",
+                    )
+                except Exception:
+                    logger.exception("Could not mark incomplete purchase result for reconciliation (%s)", intent_id)
+                await query.answer("⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ مبلغ محفوظ و عملیات قفل شد.", show_alert=True)
+                return
+
+            code = xui_manager.extract_account_identifier(email) or email
+            try:
+                database.upsert_account_record(
+                    rep_id=None,
+                    email=email,
+                    account_code=code,
+                    customer_name=user.full_name or "EndUser",
+                    sub_id=sub_id,
+                    enable=1,
+                    total_gb=gb,
+                    expiry_time=alloc_res.get("data", {}).get("expiry_time", 0),
+                    owner_tg_id=user.id
+                )
+            except Exception:
+                logger.exception("X-UI allocated account %s but local persistence failed", email)
+                try:
+                    database.mark_user_action_intent_for_reconciliation(
+                        intent_id, user.id, lock_key, lock_token,
+                        f"X-UI created account {email}, but local account persistence failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark local persistence failure for reconciliation (%s)", intent_id)
+                await query.answer(
+                    "⚠️ اکانت در پنل ایجاد شده اما ثبت محلی کامل نشد؛ مبلغ محفوظ و عملیات قفل شد.",
+                    show_alert=True
+                )
+                return
+
+            try:
+                database.complete_user_action_intent(
+                    intent_id, user.id, lock_key, lock_token,
+                    result_note=f"Allocated account {code}",
+                )
+            except Exception:
+                logger.exception("Could not finalize successful purchase intent %s", intent_id)
+                try:
+                    database.mark_user_action_intent_for_reconciliation(
+                        intent_id, user.id, lock_key, lock_token,
+                        f"X-UI account {code} and local record exist, but intent finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark unfinalized successful purchase for reconciliation (%s)", intent_id)
+                await query.answer("⚠️ اکانت ثبت شد اما نهایی‌سازی تراکنش کامل نشد؛ عملیات برای تطبیق مدیریتی قفل باقی ماند.", show_alert=True)
+                return
+
+            sub_url = alloc_res.get("data", {}).get("sub_link") or sub_manager.get_subscription_url(sub_id or "")
+            delivered_link = (
+                f"🔗 **لینک اختصاصی شما:**\n{sub_url}\n\n"
+                if sub_url else
+                "⚠️ لینک عمومی سابسکریپشن در تنظیمات سرور تعریف نشده است. برای دریافت لینک با پشتیبانی تماس بگیرید.\n\n"
+            )
+            deliv_text = (
+                f"🎉 **سرویس شما با موفقیت فعال و متصل شد!**\n\n"
+                f"• کد شناسه سرویس: {code}\n"
+                f"• حجم: **{int(gb)} گیگابایت** | مدت: **{days} روز**\n"
+                f"• کسر از کیف پول: {price:,} تومان | مانده کیف پول: {new_bal:,} تومان\n\n"
+                f"{delivered_link}"
+                "💡 شناسه سرویس را برای پیگیری‌های بعدی نگهداری کنید."
+            )
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            if sub_url:
+                try:
+                    qr_bytes = sub_manager.generate_qr_code(sub_url)
+                    await query.message.reply_photo(
+                        photo=qr_bytes, caption=deliv_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=build_user_portal_keyboard()
+                    )
+                except Exception:
+                    logger.exception("Could not deliver purchase QR for %s; sending text fallback", code)
+                    await query.message.reply_text(
+                        deliv_text, parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=build_user_portal_keyboard()
+                    )
+            else:
+                await query.message.reply_text(
+                    deliv_text, parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=build_user_portal_keyboard()
+                )
+            await query.answer("🎉 خرید با موفقیت انجام شد!")
+        elif isinstance(alloc_res, dict) and (
+            alloc_res.get("status") in ("error", "failed", "failure")
+            or alloc_res.get("success") is False
+        ):
+            try:
+                database.refund_user_wallet_and_release_operation_lock(
+                    user_id=user.id,
+                    amount=price,
+                    description="استرداد وجه به دلیل شکست قطعی تخصیص اکانت",
+                    actor_id=user.id,
+                    actor_name="SystemRefund",
+                    lock_key=lock_key,
+                    token=lock_token,
+                    intent_id=intent_id,
+                )
+            except Exception:
+                logger.exception(
+                    "User purchase refund failed; persistent operation lock retained for reconciliation (user=%s)",
+                    user.id,
+                )
+                await query.answer(
+                    "⚠️ صدور ناموفق بود اما استرداد در دیتابیس ثبت نشد؛ قفل عملیات برای بررسی مدیریت محفوظ مانده است.",
+                    show_alert=True,
+                )
+                return
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            await query.message.reply_text(
+                f"❌ صدور سرویس توسط پنل رد شد. مبلغ {price:,} تومان به کیف پول بازگشت داده شد."
+            )
+            await query.answer("صدور سرویس ناموفق بود.", show_alert=True)
+        else:
+            logger.error("Ambiguous X-UI allocation response for user %s: %r", user.id, alloc_res)
+            try:
+                database.mark_user_action_intent_for_reconciliation(
+                    intent_id, user.id, lock_key, lock_token,
+                    f"Ambiguous X-UI allocation response: {alloc_res!r}"[:500],
+                )
+            except Exception:
+                logger.exception("Could not mark ambiguous purchase intent for reconciliation (%s)", intent_id)
+            await query.answer(
+                "⚠️ پاسخ پنل برای تایید یا رد خرید کافی نیست؛ مبلغ محفوظ و عملیات قفل شده است.",
+                show_alert=True
+            )
+
     # 4. User Wallet View
     elif action == "wallet":
         bal = database.get_user_wallet_balance(user.id)
