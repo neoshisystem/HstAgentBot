@@ -619,7 +619,12 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             if classify_xui_result(renew_result) != XUIResult.SUCCESS:
                 await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
                 return
-            activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
+            try:
+                activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
+            except Exception:
+                logger.exception("Reservation state write failed after confirmed panel renewal: %s", res_id)
+                await query.answer("⚠️ پنل بسته را فعال کرد اما ثبت محلی انجام نشد؛ قفل برای بررسی محفوظ است.", show_alert=True)
+                return
             if not activated:
                 await query.answer("⚠️ پنل عملیات را انجام داد اما ثبت فعال‌سازی ناموفق بود؛ قفل تطبیق حفظ شد.", show_alert=True)
                 return
