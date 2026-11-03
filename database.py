@@ -70,13 +70,15 @@ def _record_rep_ledger_entry(cur, rep_id, account_code, email, plan_code, tx_typ
     if tx_type not in ("debit", "credit"):
         raise ValueError("Unsupported representative transaction type")
     rep = cur.execute(
-        "SELECT balance_toman, credit_limit_toman FROM representatives WHERE id = ?",
+        "SELECT balance_toman, credit_limit_toman, is_active FROM representatives WHERE id = ?",
         (rep_id,)
     ).fetchone()
     if not rep:
         raise ValueError("Representative not found")
     current = int(rep["balance_toman"] or 0)
     if tx_type == "debit":
+        if not bool(rep["is_active"]):
+            raise ValueError("Representative is inactive; new debits are not allowed")
         limit = int(rep["credit_limit_toman"] if rep["credit_limit_toman"] is not None else 5_000_000)
         if limit > 0 and current + amount > limit:
             raise ValueError(
