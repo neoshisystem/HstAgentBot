@@ -1858,6 +1858,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data or ""
 
+    # Admin views and mutations can expose financial/personal records; they are
+    # restricted to the bot's private chat even when the super-admin ID is used
+    # from an otherwise authorized group topic.
+    admin_callback = (
+        data.startswith("admin:")
+        or data.startswith("admin_approve_rcp_")
+        or data.startswith("admin_reject_rcp_")
+        or data.startswith("admin_detail_rcp_")
+    )
+    if admin_callback and (not chat or chat.type != "private"):
+        await query.answer(
+            "⛔️ عملیات پنل مدیریت فقط در گفت‌وگوی خصوصی ربات مجاز است.",
+            show_alert=True
+        )
+        return
+
     # Admin Receipt Verification Callbacks
     if data.startswith("admin_approve_rcp_"):
         if role != "super_admin":
