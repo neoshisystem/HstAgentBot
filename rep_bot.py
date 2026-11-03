@@ -1713,11 +1713,60 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "cancel_payment":
-        context.user_data.pop("fsm_state", None)
-        context.user_data.pop("active_receipt_code", None)
-        await query.answer("پرداخت لغو شد.")
-        await safe_edit_message(query, "❌ عملیات پرداخت لغو شد.")
+    if data == "cancel_payment" or data.startswith("cancel_payment:"):
+        # New buttons carry their exact receipt code. The legacy static callback
+        # may cancel only the pre-receipt amount-entry state; it must not guess
+        # which persisted receipt an old/stale message refers to.
+        target_code = data.split(":", 1)[1] if data.startswith("cancel_payment:") else None
+        active_code = context.user_data.get("active_receipt_code")
+
+        if target_code:
+            try:
+                receipt = database.cancel_payment_receipt(target_code, user.id)
+            except (ValueError, PermissionError):
+                await query.answer(
+                    "⛔️ این درخواست پرداخت یافت نشد یا متعلق به شما نیست.",
+                    show_alert=True
+                )
+                return
+
+            if receipt.get("status") == "cancelled":
+                if active_code == target_code:
+                    for key in ("fsm_state", "active_receipt_code", "deposit_amount", "deposit_role"):
+                        context.user_data.pop(key, None)
+                await query.answer("درخواست پرداخت لغو و در سامانه ثبت شد.")
+                await safe_edit_message(query, "❌ درخواست پرداخت لغو شد.")
+                return
+
+            if receipt.get("status") == "pending" and receipt.get("receipt_photo_id"):
+                await query.answer(
+                    "این فیش قبلاً ارسال شده و برای بررسی مدیریت قابل لغو نیست.",
+                    show_alert=True
+                )
+                return
+
+            current_status = receipt.get("status", "unknown")
+            await query.answer(
+                f"این درخواست دیگر قابل لغو نیست؛ وضعیت فعلی: {current_status}",
+                show_alert=True
+            )
+            return
+
+        if active_code:
+            await query.answer(
+                "این دکمه قدیمی است و شناسه فیش را ندارد. از پیام جدید پرداخت استفاده کنید.",
+                show_alert=True
+            )
+            return
+
+        if context.user_data.get("fsm_state") == finance_manager.STATE_AWAITING_RECEIPT_AMOUNT:
+            for key in ("fsm_state", "deposit_amount", "deposit_role"):
+                context.user_data.pop(key, None)
+            await query.answer("فرایند ورود مبلغ لغو شد.")
+            await safe_edit_message(query, "❌ فرایند پرداخت لغو شد.")
+            return
+
+        await query.answer("درخواست پرداخت قابل شناسایی نیست؛ وضعیت فیش تغییر نکرد.", show_alert=True)
         return
 
     parts = data.split(":")
