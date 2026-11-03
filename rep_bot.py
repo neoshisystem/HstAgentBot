@@ -33,6 +33,7 @@ import rep_panel
 import user_portal
 import finance_manager
 import sub_manager
+from xui_result import XUIResult, classify_xui_result
 
 from server_integrations import load_integration
 xui_manager = load_integration("xui_manager")
@@ -54,17 +55,12 @@ def _is_private_super_admin(update: Update) -> bool:
 
 
 def _xui_operation_succeeded(result) -> bool:
-    """Accept only an explicit successful response from the external panel."""
-    return isinstance(result, dict) and (
-        result.get("status") in ("success", "ok") or result.get("success") is True
-    )
+    """True only for a consistent explicit success response."""
+    return classify_xui_result(result) == XUIResult.SUCCESS
 
 def _xui_operation_failed(result) -> bool:
-    """Return True only for an explicit negative response, never for an ambiguous one."""
-    return isinstance(result, dict) and (
-        result.get("status") in ("error", "failed", "failure")
-        or result.get("success") is False
-    )
+    """True only for a consistent explicit failure response."""
+    return classify_xui_result(result) == XUIResult.FAILURE
 
 
 async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=ParseMode.MARKDOWN):
@@ -1494,6 +1490,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ قیمت صدور اکانت معتبر نیست؛ با مدیریت تماس بگیرید.")
             return
 
+        # Representative NLP issuance is handed off to the same durable,
+        # actor-bound rep_action_intents flow used by the dashboard.
+        if role == "rep":
+            try:
+                intent_id = database.create_rep_action_intent(
+                    rep_id=rep["id"], actor_tg_id=user.id,
+                    plan_code=plan["plan_code"], plan_name=plan["name"],
+                    gb=plan["gb"], days=plan["days"], amount=charge,
+                )
+                if comment:
+                    database.set_rep_action_intent_customer_name(
+                        intent_id, rep["id"], user.id, comment
+                    )
+            except Exception:
+                logger.exception("Could not create durable NLP representative issuance intent")
+                await update.message.reply_text("❌ ثبت درخواست صدور ممکن نشد؛ لطفاً از پنل نمایندگی دوباره اقدام کنید.")
+                return
+
+            confirm_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"✅ تأیید صدور با هزینه {charge:,} تومان",
+                    callback_data=f"rep:issue_acc_direct:{intent_id}:noname"
+                )],
+                [InlineKeyboardButton("❌ انصراف", callback_data="rep:new_acc_plans")]
+            ])
+            await update.message.reply_text(
+                f"🆕 **درخواست صدور ثبت شد**\n\n"
+                f"• پلن: **{plan['name']}** ({plan['gb']} گیگ / {plan['days']} روز)\n"
+                f"• هزینه: **{charge:,} تومان**\n"
+                f"• نام مشتری: {comment or 'ثبت نشده'}\n\n"
+                "با تأیید دکمه زیر، پیش‌پرداخت و قفل پایدار به‌صورت اتمیک ثبت و سپس پنل فراخوانی می‌شود.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=confirm_keyboard,
+            )
+            return
+
         lock_key = f"new-account:{role}:{user.id}:{plan_code}"
         lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
@@ -1527,7 +1559,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if isinstance(alloc_res, dict) and alloc_res.get("status") == "success":
+        if classify_xui_result(alloc_res) == XUIResult.SUCCESS:
             email = alloc_res.get("email")
             if not email:
                 logger.error("X-UI reports account allocation success without email: %r", alloc_res)
@@ -1610,10 +1642,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if isinstance(alloc_res, dict) and (
-            alloc_res.get("status") in ("error", "failed", "failure")
-            or alloc_res.get("success") is False
-        ):
+        if classify_xui_result(alloc_res) == XUIResult.FAILURE:
             if not is_exempt:
                 try:
                     database.register_rep_payment(
