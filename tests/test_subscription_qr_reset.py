@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import sub_manager
+import config
 
 
 class FakeResponse:
@@ -77,6 +78,12 @@ class FakeXUI:
             },
         }
 
+
+
+@pytest.mark.parametrize(("raw_value", "expected"), [("443", 443), ("8443", 8443), ("0", 443), ("65536", 443), ("bad-port", 443)])
+def test_config_subscription_port_loader_uses_safe_default(monkeypatch, raw_value, expected):
+    monkeypatch.setenv("SUB_PORT", raw_value)
+    assert config._read_subscription_port() == expected
 
 def test_subscription_url_requires_valid_public_domain(monkeypatch):
     monkeypatch.setattr(sub_manager.config, "SUB_DOMAIN", "")
