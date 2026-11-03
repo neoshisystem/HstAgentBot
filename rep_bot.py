@@ -32,6 +32,7 @@ import admin_panel
 import rep_panel
 import user_portal
 import finance_manager
+from receipt_notifications import process_receipt_notification_outbox
 import sub_manager
 from xui_result import XUIResult, classify_xui_result
 
@@ -1295,43 +1296,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    admin_tg_id = database.get_setting("admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int)
+    admin_dm_top = database.get_setting("admin_dm_topic_id", default=ADMIN_DM_LOGS_TOPIC_ID, cast_type=int)
     try:
-        if tr_code:
-            receipt = database.get_payment_receipt(tr_code)
-            if (
-                not receipt
-                or int(receipt["user_id"]) != int(user.id)
-                or receipt["status"] != "pending"
-                or receipt["role"] != dep_role
-                or (
-                    role == "rep"
-                    and int(receipt.get("rep_id") or -1) != int(rep["id"])
-                )
-            ):
-                await update.message.reply_text("⛔️ فیش در انتظار ارسال برای این حساب یافت نشد یا دیگر قابل ویرایش نیست.")
-                return
-            with database.get_db() as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE payment_receipts
-                    SET receipt_photo_id = ?, receipt_note = ?,
-                        amount_toman = CASE WHEN amount_toman = 0 THEN ? ELSE amount_toman END
-                    WHERE id = ? AND user_id = ? AND status = 'pending'
-                """, (photo_id, caption, amount, receipt["id"], user.id))
-                if cur.rowcount != 1:
-                    await update.message.reply_text("⚠️ فیش هم‌زمان تغییر کرده است؛ لطفاً وضعیت را بررسی کنید.")
-                    return
-        else:
-            # Support a direct photo only when its amount can be established.
-            tr_code = database.create_payment_receipt(
-                user_id=user.id, role=dep_role, amount_toman=amount,
-                rep_id=target_rep_id, photo_id=photo_id, note=caption
-            )
-        receipt = database.get_payment_receipt(tr_code)
-        if not receipt:
-            raise RuntimeError("Persisted receipt could not be reloaded")
+        # Receipt submission and durable admin-notification enqueue share one DB transaction.
+        receipt = database.submit_payment_receipt(
+            user_id=user.id,
+            role=dep_role,
+            amount_toman=amount,
+            photo_id=photo_id,
+            rep_id=target_rep_id,
+            receipt_id_or_code=tr_code,
+            note=caption,
+            recipient_chat_id=admin_tg_id if admin_tg_id and int(admin_tg_id) > 0 else None,
+            recipient_thread_id=admin_dm_top if admin_dm_top and int(admin_dm_top) > 0 else None,
+            sender_name=user.full_name or "",
+            sender_username=user.username or "",
+        )
+        tr_code = receipt["tracking_code"]
+    except PermissionError:
+        logger.warning("Rejected receipt submission with mismatched owner/role for user %s", user.id)
+        await update.message.reply_text("⛔️ فیش در انتظار ارسال برای این حساب یافت نشد یا دیگر قابل ویرایش نیست.")
+        return
     except Exception:
-        logger.exception("Could not persist incoming payment receipt")
+        logger.exception("Could not persist incoming payment receipt and notification outbox")
         await update.message.reply_text("❌ ثبت فیش انجام نشد. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
         return
 
@@ -1347,33 +1335,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-    admin_tg_id = database.get_setting("admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int)
-    admin_dm_top = database.get_setting("admin_dm_topic_id", default=ADMIN_DM_LOGS_TOPIC_ID, cast_type=int)
-    card_text = finance_manager.format_admin_receipt_card(receipt, user.full_name, user.username)
-    review_keyboard = finance_manager.build_admin_receipt_review_keyboard(receipt["id"])
-
-    if admin_tg_id:
-        try:
-            await context.bot.send_photo(
-                chat_id=admin_tg_id,
-                message_thread_id=admin_dm_top if admin_dm_top else None,
-                photo=photo_id,
-                caption=card_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=review_keyboard
-            )
-        except Exception:
-            logger.exception("Failed to forward receipt image; sending text fallback")
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_tg_id,
-                    message_thread_id=admin_dm_top if admin_dm_top else None,
-                    text=card_text + "\n\n⚠️ ارسال تصویر ناموفق بود؛ فیش در پایگاه داده ثبت است.",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=review_keyboard
-                )
-            except Exception:
-                logger.exception("Failed to send receipt review fallback to admin")
+    # The durable outbox already exists; this is only the first delivery attempt.
+    # The background worker will retry after process restarts or delivery failures.
+    await process_receipt_notification_outbox(context.bot, limit=10)
 
 # --- Message & NLP Router ---
 
@@ -2969,6 +2933,22 @@ async def watchdog_worker(application: Application):
         interval = database.get_setting("watchdog_interval_sec", default=300, cast_type=int)
         await asyncio.sleep(interval)
 
+async def receipt_notification_worker(application: Application):
+    """Retry durable admin receipt notifications independently of the X-UI watchdog."""
+    logger.info("Starting durable receipt notification outbox worker...")
+    while True:
+        try:
+            result = await process_receipt_notification_outbox(application.bot, limit=10)
+            if result.get("attempted"):
+                logger.info(
+                    "Receipt notification worker attempted=%s sent=%s",
+                    result.get("attempted"), result.get("sent")
+                )
+        except Exception:
+            logger.exception("Receipt notification worker cycle failed")
+        await asyncio.sleep(30)
+
+
 def main():
     database.init_db()
     startup_sync = database.sync_all_active_reps_detailed()
@@ -2977,6 +2957,7 @@ def main():
     
     async def post_init(application: Application):
         asyncio.create_task(watchdog_worker(application))
+        asyncio.create_task(receipt_notification_worker(application))
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
