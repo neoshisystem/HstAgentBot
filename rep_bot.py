@@ -566,7 +566,7 @@ async def process_account_renewal(
     if can_renew_immediate:
         countdown_param = True if effective_first else "auto"
         operation_lock_key = f"rep-renew-pending:{account_code.lower()}"
-        operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=300)
+        operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=None)
         if not operation_lock_token:
             pending_res = database.get_pending_reservation(account_code)
             keyboard = nlp_matcher.build_account_keyboard(
@@ -971,7 +971,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         lock_key = f"new-account:{role}:{user.id}:{plan_code}"
-        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=300)
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
             await update.message.reply_text("⏳ درخواست صدور دیگری در حال پردازش است یا نتیجه قبلی نیازمند بررسی است؛ لطفاً دوباره اجرا نکنید.")
             return
@@ -1769,7 +1769,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         lock_key = f"reservation-activation:{res_id}"
-        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=900)
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
             await query.answer("⏳ این رزرو در حال فعال‌سازی است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
             return
@@ -1994,7 +1994,7 @@ async def watchdog_worker(application: Application):
                     if trigger:
                         res_id = int(res["id"])
                         lock_key = f"reservation-activation:{res_id}"
-                        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=900)
+                        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
                         if not lock_token:
                             logger.info(
                                 "Watchdog skipped reservation %s because another activation/reconciliation owns it",
