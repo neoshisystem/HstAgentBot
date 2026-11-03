@@ -170,3 +170,18 @@ def test_global_billing_aggregate_is_not_disclosed_in_group(monkeypatch):
     asyncio.run(rep_bot.billing_cmd(update, SimpleNamespace()))
 
     assert message.replies == []
+
+
+def test_super_admin_cannot_open_end_user_or_rep_deposit_command(monkeypatch):
+    update, _, message = make_update(chat_type="private", text="/deposit 500000")
+    context = SimpleNamespace(args=["500000"], user_data={})
+    monkeypatch.setattr(rep_bot.database, "get_user_role", lambda *args, **kwargs: ("super_admin", None))
+    monkeypatch.setattr(
+        rep_bot.database, "create_payment_receipt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("super admin is not a deposit role")),
+    )
+
+    asyncio.run(rep_bot.deposit_cmd(update, context))
+
+    assert message.replies == []
+    assert context.user_data == {}
