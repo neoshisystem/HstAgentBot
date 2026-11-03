@@ -1026,14 +1026,15 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         for tx in entries:
             sign = "🔺 بدهکار" if tx["transaction_type"] == "debit" else "🟢 بستانکار"
             if tx.get("rep_id") is not None:
-                identity = f"نماینده: {tx.get('rep_name') or tx['rep_id']}"
+                rep_name = tx.get("rep_name") or "بدون نام"
+                rep_code = tx.get("rep_code") or "بدون کد"
+                identity = f"نماینده: {rep_name} ({rep_code} | ID {tx['rep_id']})"
             elif tx.get("user_id") is not None:
-                identity_name = tx.get("user_full_name") or (
-                    f"@{tx['user_username']}" if tx.get("user_username") else str(tx["user_id"])
-                )
-                identity = f"کاربر: {identity_name}"
+                user_name = tx.get("user_full_name") or "بدون نام"
+                user_tag = f"@{tx['user_username']}" if tx.get("user_username") else "بدون یوزرنیم"
+                identity = f"کاربر: {user_name} ({user_tag} | Telegram ID {tx['user_id']})"
             else:
-                identity = f"عامل: {tx.get('actor_name') or tx.get('actor_id')}"
+                identity = f"عامل: {tx.get('actor_name') or tx.get('actor_id')} (ID {tx.get('actor_id')})"
             lines.append(
                 f"• {sign} | {identity}\n"
                 f"  `{tx['created_at'][:16]}` | **{tx['amount']:,} تومان**\n"
