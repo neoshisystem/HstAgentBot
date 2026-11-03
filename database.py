@@ -2186,6 +2186,181 @@ def begin_rep_renewal_intent(
         }
 
 
+def begin_admin_renewal_confirmation(
+    confirmation_id: str, actor_id: int, actor_role: str, confirmation_rep_id: int | None,
+    account_code: str, account_email: str, plan_code: str, plan_name: str,
+    gb: float, days: int, amount: int,
+) -> dict:
+    """Atomically claim a Super Admin quick-renew confirmation and its persistent operation lock."""
+    key = str(confirmation_id or "").strip()
+    code = str(account_code or "").strip()
+    lock_key = f"account-renewal:{code.lower()}"
+    lock_token = uuid.uuid4().hex
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        _validate_account_renewal_confirmation_for_claim(
+            cur, key, actor_id, actor_role, None, code, account_email,
+            plan_code, plan_name, gb, days, amount,
+            confirmation_rep_id=confirmation_rep_id,
+        )
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (time.time(),))
+        if cur.execute("SELECT 1 FROM operation_locks WHERE lock_key=?", (lock_key,)).fetchone():
+            return {"status": "busy"}
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (lock_key, lock_token, 253402300799.0),
+        )
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='processing', operation_ref_type='admin_renewal',
+                operation_ref_id=?, operation_lock_key=?, operation_lock_token=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND actor_id=? AND status='pending'
+        """, (key, lock_key, lock_token, key, int(actor_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not atomically claim Super Admin renewal confirmation")
+        _insert_audit(
+            cur, None, code, account_email, "admin_renewal_confirmation_started",
+            int(actor_id), "Super Admin",
+            {"confirmation_id": key, "plan_code": plan_code, "amount": int(amount), "lock_key": lock_key},
+            "success",
+        )
+        return {"status": "started", "confirmation_id": key, "lock_key": lock_key, "lock_token": lock_token}
+
+
+def _verify_admin_renewal_confirmation_lock(cur, confirmation_id: str, actor_id: int):
+    row = cur.execute("""
+        SELECT * FROM account_renewal_confirmations
+        WHERE intent_id=? AND actor_id=? AND actor_role='super_admin'
+          AND operation_ref_type='admin_renewal'
+          AND status IN ('processing', 'needs_reconciliation')
+    """, (str(confirmation_id), int(actor_id))).fetchone()
+    if not row:
+        raise ValueError("No unresolved Super Admin renewal confirmation was found")
+    intent = dict(row)
+    lock = cur.execute(
+        "SELECT token, created_at FROM operation_locks WHERE lock_key=?",
+        (intent["operation_lock_key"],),
+    ).fetchone()
+    if not lock or not secrets.compare_digest(str(lock["token"]), str(intent["operation_lock_token"] or "")):
+        raise ValueError("Super Admin renewal confirmation's exact operation lock is missing or ownership differs")
+    return intent, lock
+
+
+def complete_admin_renewal_confirmation(
+    confirmation_id: str, actor_id: int, result_note: str = "X-UI renewal succeeded"
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, _ = _verify_admin_renewal_confirmation_lock(cur, confirmation_id, actor_id)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release exact Super Admin renewal lock")
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='succeeded', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(result_note)[:500], str(confirmation_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize Super Admin renewal confirmation")
+        _insert_audit(
+            cur, None, intent["account_code"], intent["account_email"],
+            "admin_renewal_confirmation_succeeded", int(actor_id), "Super Admin",
+            {"confirmation_id": str(confirmation_id), "lock_key": intent["operation_lock_key"]},
+            "success",
+        )
+        return True
+
+
+def fail_admin_renewal_confirmation(
+    confirmation_id: str, actor_id: int, result_note: str
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, _ = _verify_admin_renewal_confirmation_lock(cur, confirmation_id, actor_id)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release exact Super Admin renewal lock")
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='failed', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(result_note)[:500], str(confirmation_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize Super Admin renewal failure")
+        _insert_audit(
+            cur, None, intent["account_code"], intent["account_email"],
+            "admin_renewal_confirmation_failed", int(actor_id), "Super Admin",
+            {"confirmation_id": str(confirmation_id), "lock_key": intent["operation_lock_key"],
+             "result_note": str(result_note)[:500]},
+            "success",
+        )
+        return True
+
+
+def mark_admin_renewal_confirmation_for_reconciliation(
+    confirmation_id: str, actor_id: int, note: str
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, _ = _verify_admin_renewal_confirmation_lock(cur, confirmation_id, actor_id)
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='needs_reconciliation', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(note or "Ambiguous Super Admin renewal")[:500], str(confirmation_id)))
+        return cur.rowcount == 1
+
+
+def resolve_admin_renewal_confirmation(
+    confirmation_id: str, actor_id: int, actor_name: str, resolution: str, evidence_note: str
+) -> dict:
+    key = str(confirmation_id or "").strip()
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if choice not in ("APPLIED", "NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or NOT_APPLIED")
+    prefix = "APPLIED:" if choice == "APPLIED" else "NOT_APPLIED:"
+    if not note.startswith(prefix) or len(note) < len(prefix) + 15:
+        raise ValueError(f"Evidence must start with {prefix} and contain at least 15 characters after it")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, lock = _verify_admin_renewal_confirmation_lock(cur, key, actor_id)
+        status = "succeeded" if choice == "APPLIED" else "failed"
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume exact Super Admin renewal lock")
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status=?, result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (status, note[:500], key))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize Super Admin renewal resolution")
+        _insert_audit(
+            cur, None, intent["account_code"], intent["account_email"],
+            "resolve_admin_renewal_confirmation", int(actor_id), str(actor_name or "Super Admin"),
+            {"confirmation_id": key, "resolution": choice, "evidence_note": note,
+             "lock_key": intent["operation_lock_key"], "lock_created_at": lock["created_at"]},
+            "success",
+        )
+        return {"status": status, "lock_key": intent["operation_lock_key"], "account_code": intent["account_code"]}
+
+
 def _sync_linked_renewal_confirmation(cur, intent: dict, status: str, result_note: str | None = None):
     confirmation_id = intent.get("confirmation_id")
     if not confirmation_id:
