@@ -215,3 +215,107 @@ def test_representative_nlp_issuance_creates_durable_intent_before_financial_cla
     assert message.replies
     keyboard = message.replies[0][1]["reply_markup"]
     assert keyboard.inline_keyboard[0][0].callback_data == f"rep:issue_acc_direct:{row['intent_id']}:noname"
+
+
+def test_rep_issue_conflicting_xui_signals_do_not_refund(monkeypatch):
+    update, query = callback_update("rep:issue_acc_direct:rep-intent:noname")
+    rep = {"id": 5, "name": "Rep", "scope_filter": "all"}
+    started_intent = {
+        "intent_id": "rep-intent",
+        "action_type": "issue",
+        "status": "processing",
+        "amount": 300000,
+        "gb": 20,
+        "days": 30,
+        "customer_name": "Customer",
+        "plan_name": "20G 30D",
+    }
+    monkeypatch.setattr(
+        rep_panel.database, "get_rep_action_intent",
+        lambda *a, **k: {**started_intent, "status": "pending", "expires_at": 9999999999},
+    )
+    monkeypatch.setattr(
+        rep_panel.database, "begin_rep_action_intent",
+        lambda *a, **k: {
+            "status": "started", "intent": started_intent,
+            "lock_key": "rep-intent:rep-intent", "lock_token": "token",
+            "new_balance": 300000,
+        },
+    )
+    monkeypatch.setattr(
+        rep_panel, "xui_manager",
+        SimpleNamespace(allocate_pool_client=lambda *a, **k: {"status": "failed", "success": True}),
+    )
+    reconciled = []
+    refunds = []
+    monkeypatch.setattr(
+        rep_panel.database, "mark_rep_action_intent_for_reconciliation",
+        lambda *a, **k: reconciled.append((a, k)) or True,
+    )
+    monkeypatch.setattr(
+        rep_panel.database, "refund_rep_action_intent",
+        lambda *a, **k: refunds.append((a, k)),
+    )
+
+    asyncio.run(rep_panel.handle_rep_callbacks(update, SimpleNamespace(user_data={}), rep))
+
+    assert reconciled
+    assert not refunds
+    assert query.answers and "پیش‌پرداخت محفوظ" in query.answers[-1][0]
+
+
+def test_rep_issue_success_with_local_upsert_failure_retains_intent_and_lock(monkeypatch):
+    update, query = callback_update("rep:issue_acc_direct:rep-intent:noname")
+    rep = {"id": 5, "name": "Rep", "scope_filter": "all"}
+    started_intent = {
+        "intent_id": "rep-intent",
+        "action_type": "issue",
+        "status": "processing",
+        "amount": 300000,
+        "gb": 20,
+        "days": 30,
+        "customer_name": "Customer",
+        "plan_name": "20G 30D",
+    }
+    monkeypatch.setattr(
+        rep_panel.database, "get_rep_action_intent",
+        lambda *a, **k: {**started_intent, "status": "pending", "expires_at": 9999999999},
+    )
+    monkeypatch.setattr(
+        rep_panel.database, "begin_rep_action_intent",
+        lambda *a, **k: {
+            "status": "started", "intent": started_intent,
+            "lock_key": "rep-intent:rep-intent", "lock_token": "token",
+            "new_balance": 300000,
+        },
+    )
+    monkeypatch.setattr(
+        rep_panel, "xui_manager",
+        SimpleNamespace(
+            allocate_pool_client=lambda *a, **k: {
+                "status": "success", "email": "allocated@example.test",
+                "sub_id": "new-sub", "data": {},
+            },
+            extract_account_identifier=lambda _email: "ALLOC-1",
+        ),
+    )
+    monkeypatch.setattr(
+        rep_panel.database, "upsert_account_record",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected local write failure")),
+    )
+    reconciled = []
+    refunds = []
+    monkeypatch.setattr(
+        rep_panel.database, "mark_rep_action_intent_for_reconciliation",
+        lambda *a, **k: reconciled.append((a, k)) or True,
+    )
+    monkeypatch.setattr(
+        rep_panel.database, "refund_rep_action_intent",
+        lambda *a, **k: refunds.append((a, k)),
+    )
+
+    asyncio.run(rep_panel.handle_rep_callbacks(update, SimpleNamespace(user_data={}), rep))
+
+    assert reconciled
+    assert not refunds
+    assert query.answers and "ثبت محلی کامل نشد" in query.answers[-1][0]
