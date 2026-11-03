@@ -909,6 +909,7 @@ async def process_account_renewal(
         operation_lock_key = f"account-renewal:{account_code.lower()}"
         operation_lock_token = None
         rep_renewal_intent_id = None
+        admin_renewal_confirmation_id = None
         new_bal = None
 
         if not is_admin_exempt:
@@ -947,14 +948,47 @@ async def process_account_renewal(
             operation_lock_token = started["lock_token"]
             new_bal = started["new_balance"]
         else:
-            operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=None)
-            if not operation_lock_token:
-                pending_res = database.get_pending_reservation(account_code)
-                keyboard = nlp_matcher.build_account_keyboard(
-                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
-                    role=role, pending_res=pending_res
-                )
-                return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
+            if role == "super_admin" and confirmation_id:
+                try:
+                    admin_started = database.begin_admin_renewal_confirmation(
+                        confirmation_id=confirmation_id,
+                        actor_id=user.id,
+                        actor_role=role,
+                        confirmation_rep_id=rep["id"] if rep else None,
+                        account_code=account_code,
+                        account_email=email,
+                        plan_code=plan_code,
+                        plan_name=plan_name,
+                        gb=gb,
+                        days=days,
+                        amount=charge,
+                    )
+                except ValueError as exc:
+                    pending_res = database.get_pending_reservation(account_code)
+                    keyboard = nlp_matcher.build_account_keyboard(
+                        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                        role=role, pending_res=pending_res
+                    )
+                    return False, f"⛔️ تأیید تمدید مدیریت کل قابل ثبت نیست: {exc}", keyboard
+                if admin_started.get("status") != "started":
+                    pending_res = database.get_pending_reservation(account_code)
+                    keyboard = nlp_matcher.build_account_keyboard(
+                        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                        role=role, pending_res=pending_res
+                    )
+                    return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
+                admin_renewal_confirmation_id = confirmation_id
+                operation_lock_key = admin_started["lock_key"]
+                operation_lock_token = admin_started["lock_token"]
+            else:
+                operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=None)
+                if not operation_lock_token:
+                    pending_res = database.get_pending_reservation(account_code)
+                    keyboard = nlp_matcher.build_account_keyboard(
+                        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                        role=role, pending_res=pending_res
+                    )
+                    return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
 
         try:
             ren_res = await asyncio.to_thread(
@@ -973,6 +1007,14 @@ async def process_account_renewal(
                     )
                 except Exception:
                     logger.exception("Could not mark representative renewal for reconciliation: %s", account_code)
+            elif admin_renewal_confirmation_id:
+                try:
+                    database.mark_admin_renewal_confirmation_for_reconciliation(
+                        admin_renewal_confirmation_id, user.id,
+                        "X-UI renewal raised an exception; external outcome is unknown",
+                    )
+                except Exception:
+                    logger.exception("Could not mark Super Admin renewal for reconciliation: %s", account_code)
             pending_res = database.get_pending_reservation(account_code)
             keyboard = nlp_matcher.build_account_keyboard(
                 account_code, is_enabled=is_enabled, on_first_connect=effective_first,
@@ -1006,6 +1048,11 @@ async def process_account_renewal(
                             role=role, pending_res=pending_res
                         )
                         return False, "⚠️ پنل تمدید را رد کرد اما استرداد اتمیک انجام نشد؛ قفل و پیش‌پرداخت برای تطبیق مدیریت حفظ شدند.", keyboard
+                elif admin_renewal_confirmation_id:
+                    database.fail_admin_renewal_confirmation(
+                        admin_renewal_confirmation_id, user.id,
+                        f"X-UI explicitly rejected renewal for {account_code}",
+                    )
                 else:
                     database.release_operation_lock(operation_lock_key, operation_lock_token)
                 pending_res = database.get_pending_reservation(account_code)
@@ -1026,6 +1073,14 @@ async def process_account_renewal(
                     )
                 except Exception:
                     logger.exception("Could not mark ambiguous representative renewal: %s", account_code)
+            elif admin_renewal_confirmation_id:
+                try:
+                    database.mark_admin_renewal_confirmation_for_reconciliation(
+                        admin_renewal_confirmation_id, user.id,
+                        f"X-UI returned an ambiguous response: {str(ren_res)[:300]}",
+                    )
+                except Exception:
+                    logger.exception("Could not mark ambiguous Super Admin renewal: %s", account_code)
             pending_res = database.get_pending_reservation(account_code)
             keyboard = nlp_matcher.build_account_keyboard(
                 account_code, is_enabled=is_enabled, on_first_connect=effective_first,
@@ -1050,6 +1105,27 @@ async def process_account_renewal(
                     )
                 except Exception:
                     logger.exception("Could not mark successful external renewal for reconciliation: %s", account_code)
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, "⚠️ پنل تمدید را با موفقیت انجام داد، اما ثبت نهایی محلی کامل نشد؛ قفل برای تطبیق حفظ شد.", keyboard
+        elif admin_renewal_confirmation_id:
+            try:
+                database.complete_admin_renewal_confirmation(
+                    admin_renewal_confirmation_id, user.id,
+                    "X-UI explicitly confirmed Super Admin renewal success",
+                )
+            except Exception:
+                logger.exception("Super Admin renewal succeeded but local confirmation finalization failed for %s", account_code)
+                try:
+                    database.mark_admin_renewal_confirmation_for_reconciliation(
+                        admin_renewal_confirmation_id, user.id,
+                        "X-UI explicitly succeeded but local confirmation finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark successful Super Admin renewal for reconciliation: %s", account_code)
                 pending_res = database.get_pending_reservation(account_code)
                 keyboard = nlp_matcher.build_account_keyboard(
                     account_code, is_enabled=is_enabled, on_first_connect=effective_first,
