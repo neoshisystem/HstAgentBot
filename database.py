@@ -415,6 +415,7 @@ def init_db():
             gb REAL NOT NULL,
             days INTEGER NOT NULL,
             amount INTEGER NOT NULL,
+            confirmation_id TEXT,
             status TEXT NOT NULL DEFAULT 'processing',
             operation_lock_key TEXT NOT NULL,
             operation_lock_token TEXT NOT NULL,
@@ -442,6 +443,11 @@ def init_db():
             days INTEGER NOT NULL,
             amount INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
+            operation_ref_type TEXT,
+            operation_ref_id TEXT,
+            operation_lock_key TEXT,
+            operation_lock_token TEXT,
+            result_note TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             expires_at REAL NOT NULL
@@ -466,6 +472,21 @@ def init_db():
         cols_plans = [c[1] for c in cur.execute("PRAGMA table_info(pricing_plans)").fetchall()]
         if "is_active" not in cols_plans:
             cur.execute("ALTER TABLE pricing_plans ADD COLUMN is_active INTEGER DEFAULT 1")
+
+        cols_confirmations = [c[1] for c in cur.execute("PRAGMA table_info(account_renewal_confirmations)").fetchall()]
+        for col, sql_type in (
+            ("operation_ref_type", "TEXT"),
+            ("operation_ref_id", "TEXT"),
+            ("operation_lock_key", "TEXT"),
+            ("operation_lock_token", "TEXT"),
+            ("result_note", "TEXT"),
+        ):
+            if col not in cols_confirmations:
+                cur.execute(f"ALTER TABLE account_renewal_confirmations ADD COLUMN {col} {sql_type}")
+
+        cols_rep_renewals = [c[1] for c in cur.execute("PRAGMA table_info(rep_renewal_intents)").fetchall()]
+        if "confirmation_id" not in cols_rep_renewals:
+            cur.execute("ALTER TABLE rep_renewal_intents ADD COLUMN confirmation_id TEXT")
 
         cols_receipts = [c[1] for c in cur.execute("PRAGMA table_info(payment_receipts)").fetchall()]
         if "cancelled_by" not in cols_receipts:
@@ -2000,6 +2021,60 @@ def mark_user_action_intent_for_reconciliation(
         if cur.rowcount != 1:
             raise RuntimeError("Could not mark user action for reconciliation")
         return True
+
+
+def _validate_account_renewal_confirmation_for_claim(
+    cur, confirmation_id: str, actor_id: int, actor_role: str, rep_id: int | None,
+    account_code: str, account_email: str, plan_code: str, plan_name: str,
+    gb: float, days: int, amount: int,
+) -> dict:
+    key = str(confirmation_id or "").strip()
+    role = str(actor_role or "").strip().lower()
+    row = cur.execute("""
+        SELECT * FROM account_renewal_confirmations
+        WHERE intent_id=? AND actor_id=?
+    """, (key, int(actor_id))).fetchone()
+    if not row:
+        raise ValueError("Quick-renew confirmation not found for this actor")
+    intent = dict(row)
+    if intent["status"] != "pending":
+        raise ValueError(f"Quick-renew confirmation is already {intent['status']}")
+    if float(intent["expires_at"]) <= time.time():
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='expired', updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status='pending'
+        """, (key,))
+        raise ValueError("Quick-renew confirmation expired")
+    if intent["actor_role"] != role:
+        raise ValueError("Quick-renew confirmation role mismatch")
+    if (intent.get("rep_id") is None) != (rep_id is None):
+        raise ValueError("Quick-renew representative context mismatch")
+    if intent.get("rep_id") is not None and int(intent["rep_id"]) != int(rep_id):
+        raise ValueError("Quick-renew representative mismatch")
+    if (
+        str(intent["account_code"]).lower() != str(account_code).lower()
+        or str(intent["account_email"]).lower() != str(account_email).lower()
+        or str(intent["plan_code"]) != str(plan_code)
+        or str(intent["plan_name"]) != str(plan_name)
+        or float(intent["gb"]) != float(gb)
+        or int(intent["days"]) != int(days)
+        or int(intent["amount"]) != int(amount)
+    ):
+        raise ValueError("Quick-renew account or plan snapshot mismatch")
+    plan = cur.execute("""
+        SELECT name, gb, days, rep_price, is_active
+        FROM pricing_plans WHERE plan_code=?
+    """, (str(plan_code),)).fetchone()
+    if (
+        not plan or not int(plan["is_active"] or 0)
+        or str(plan["name"]) != str(plan_name)
+        or float(plan["gb"]) != float(gb)
+        or int(plan["days"]) != int(days)
+        or int(plan["rep_price"]) != int(amount)
+    ):
+        raise ValueError("Quick-renew plan changed or is inactive")
+    return intent
 
 
 def begin_rep_renewal_intent(
