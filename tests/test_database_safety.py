@@ -248,3 +248,71 @@ def test_operation_lock_is_token_owned_and_persistent(isolated_db):
     assert database.acquire_operation_lock(key, ttl_seconds=300) is None
     assert database.release_operation_lock(key, token) is True
     assert database.acquire_operation_lock(key, ttl_seconds=300)
+
+
+
+def test_credit_limit_is_enforced_inside_ledger_transaction(isolated_db):
+    rep_id = add_rep(credit_limit=1_000)
+    database.record_ledger_entry(
+        rep_id, "A1", "A1@example.test", "p1", "debit", 700,
+        "first charge", 9000, "test"
+    )
+    with pytest.raises(ValueError, match="credit limit"):
+        database.record_ledger_entry(
+            rep_id, "A2", "A2@example.test", "p2", "debit", 301,
+            "over limit", 9000, "test"
+        )
+    assert database.get_rep_balance(rep_id) == 700
+    assert scalar("SELECT COUNT(*) FROM financial_ledger WHERE rep_id=?", (rep_id,)) == 1
+
+
+def test_reservation_activation_lock_blocks_cancel_until_released(isolated_db):
+    reservation_id = database.create_reservation(
+        rep_id=None, account_code="LOCK1", email="LOCK1@example.test",
+        plan_code="20gb_30d", plan_name="20 GB", gb=20, days=30,
+        on_first_connect=0, charge_amount=0, actor_id=9000, actor_name="test",
+    )
+    lock_key = f"reservation-activation:{reservation_id}"
+    token = database.acquire_operation_lock(lock_key, ttl_seconds=900)
+    assert token
+    assert database.cancel_reservation(reservation_id, actor_id=9000, actor_name="test") is None
+    assert database.get_reservation_by_id(reservation_id)["status"] == "pending"
+    assert database.release_operation_lock(lock_key, token) is True
+    cancelled = database.cancel_reservation(reservation_id, actor_id=9000, actor_name="test")
+    assert cancelled is not None
+    assert cancelled[0]["status"] == "pending"
+
+
+def test_account_lookup_rejects_partial_identifier_matches(isolated_db):
+    add_account("A1234", "customer-A1234@example.test")
+    database.link_user_to_account("A1234", 8080, "owner", "Owner")
+    assert database.get_user_owned_account(8080, "A1234") is not None
+    assert database.get_user_owned_account(8080, "1234") is None
+    assert database.is_account_in_rep_scope(999, "A12") is None
+
+
+def test_plan_cannot_be_deleted_while_pending_reservation_uses_it(isolated_db):
+    database.add_or_update_plan("hold_plan", "Hold Plan", 5, 30, 100, 200)
+    database.create_reservation(
+        rep_id=None, account_code="PLAN1", email="PLAN1@example.test",
+        plan_code="hold_plan", plan_name="Hold Plan", gb=5, days=30,
+        on_first_connect=0, charge_amount=0, actor_id=9000, actor_name="test",
+    )
+    with pytest.raises(ValueError, match="pending reservations"):
+        database.delete_plan("hold_plan")
+    assert database.get_plan("hold_plan") is not None
+
+
+def test_rep_archive_preserves_ledger_and_prevents_new_debits(isolated_db):
+    rep_id = add_rep(credit_limit=10_000)
+    database.record_ledger_entry(
+        rep_id, "ARC1", "ARC1@example.test", "p1", "debit", 100,
+        "historical charge", 9000, "test"
+    )
+    assert database.delete_rep(rep_id) is True
+    assert scalar("SELECT COUNT(*) FROM financial_ledger WHERE rep_id=?", (rep_id,)) == 1
+    with pytest.raises(ValueError, match="Representative not found"):
+        database.record_ledger_entry(
+            rep_id, "ARC2", "ARC2@example.test", "p2", "debit", 100,
+            "post archive", 9000, "test"
+        )
