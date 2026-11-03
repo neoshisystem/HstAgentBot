@@ -261,3 +261,93 @@ def test_failed_intent_refund_rolls_back_and_preserves_lock_and_intent(isolated_
     assert database.get_user_action_intent(intent, user_id)["status"] == "processing"
     assert has_lock(started["lock_key"])
     assert ledger_count(user_id) == 2
+
+
+def test_unresolved_intent_lock_cannot_use_generic_unlock_and_applied_resolution_is_atomic(isolated_db):
+    user_id = 7009
+    fund_user(user_id)
+    intent_id = make_intent(user_id)
+    started = database.begin_user_action_intent(intent_id, user_id, "buy")
+    assert started["status"] == "started"
+    assert database.mark_user_action_intent_for_reconciliation(
+        intent_id,
+        user_id,
+        started["lock_key"],
+        started["lock_token"],
+        "X-UI response was ambiguous; inspect exact client before resolving",
+    )
+
+    operation = next(
+        item for item in database.get_operation_locks()
+        if item["lock_key"] == started["lock_key"]
+    )
+    assert operation["intent_id"] == intent_id
+    assert operation["intent_status"] == "needs_reconciliation"
+    assert operation["user_id"] == user_id
+
+    with pytest.raises(ValueError, match="resolveintent"):
+        database.resolve_operation_lock(
+            started["lock_key"], 9000, "Admin",
+            "RECONCILED: checked panel state",
+        )
+    assert has_lock(started["lock_key"])
+
+    result = database.resolve_user_action_intent(
+        intent_id,
+        actor_id=9000,
+        actor_name="Super Admin",
+        resolution="APPLIED",
+        evidence_note="APPLIED: exact client was inspected in X-UI and renewal is present",
+    )
+    assert result["status"] == "succeeded"
+    assert result["new_balance"] is None
+    assert database.get_user_action_intent(intent_id, user_id)["status"] == "succeeded"
+    assert database.get_user_wallet_balance(user_id) == 4_500_000
+    assert ledger_count(user_id) == 2
+    assert not has_lock(started["lock_key"])
+    assert scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='resolve_user_action_intent_applied'",
+    ) == 1
+
+
+def test_unresolved_intent_refund_resolution_credits_once_and_consumes_lock(isolated_db):
+    user_id = 7010
+    fund_user(user_id)
+    intent_id = make_intent(user_id)
+    started = database.begin_user_action_intent(intent_id, user_id, "buy")
+    assert started["status"] == "started"
+    assert database.mark_user_action_intent_for_reconciliation(
+        intent_id,
+        user_id,
+        started["lock_key"],
+        started["lock_token"],
+        "X-UI response was ambiguous; inspect exact client before resolving",
+    )
+
+    result = database.resolve_user_action_intent(
+        intent_id,
+        actor_id=9000,
+        actor_name="Super Admin",
+        resolution="REFUND_NOT_APPLIED",
+        evidence_note="REFUND_NOT_APPLIED: exact client was inspected in X-UI and no new client exists",
+    )
+    assert result["status"] == "refunded"
+    assert result["new_balance"] == 5_000_000
+    assert database.get_user_wallet_balance(user_id) == 5_000_000
+    assert database.get_user_action_intent(intent_id, user_id)["status"] == "refunded"
+    assert ledger_count(user_id) == 3
+    assert not has_lock(started["lock_key"])
+
+    with pytest.raises(ValueError, match="unresolved"):
+        database.resolve_user_action_intent(
+            intent_id,
+            actor_id=9000,
+            actor_name="Super Admin",
+            resolution="REFUND_NOT_APPLIED",
+            evidence_note="REFUND_NOT_APPLIED: duplicate admin attempt",
+        )
+    assert database.get_user_wallet_balance(user_id) == 5_000_000
+    assert ledger_count(user_id) == 3
+    assert scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='resolve_user_action_intent_refund'",
+    ) == 1
