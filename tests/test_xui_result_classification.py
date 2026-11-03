@@ -347,3 +347,43 @@ def test_rep_reservation_conflicting_response_retains_activation_lock(monkeypatc
 
     assert events == ["acquire"]
     assert query.answers and "مبهم" in query.answers[-1][0]
+
+def test_user_renewal_conflicting_response_is_not_refunded(monkeypatch):
+    update, query = callback_update("user:do_renew:renew-intent")
+    owned = {"account_code": "ACC-1", "email": "acc-1@example.test", "owner_tg_id": 71001}
+    intent = {"action_type": "renew", "account_code": "ACC-1", "account_email": "acc-1@example.test", "plan_code": "renew-plan"}
+    started_intent = {
+        **intent, "plan_name": "Renew Plan", "amount": 200000,
+        "gb": 20, "days": 30, "status": "processing",
+    }
+    monkeypatch.setattr(user_portal.database, "is_user_blocked", lambda _uid: False)
+    monkeypatch.setattr(user_portal.database, "get_user_role", lambda *a, **k: ("end_user", None))
+    monkeypatch.setattr(user_portal.database, "get_user_action_intent", lambda *a, **k: intent)
+    monkeypatch.setattr(user_portal.database, "get_user_owned_account", lambda *a, **k: owned)
+    monkeypatch.setattr(
+        user_portal.database, "begin_user_action_intent",
+        lambda *a, **k: {
+            "status": "started", "intent": started_intent,
+            "lock_key": "user-renewal:ACC-1", "lock_token": "token",
+            "new_balance": 800000,
+        },
+    )
+    monkeypatch.setattr(
+        user_portal, "xui_manager",
+        SimpleNamespace(renew_client=lambda *a, **k: {"status": "success", "success": False}),
+    )
+    unresolved, refunded = [], []
+    monkeypatch.setattr(
+        user_portal.database, "mark_user_action_intent_for_reconciliation",
+        lambda *a, **k: unresolved.append((a, k)) or True,
+    )
+    monkeypatch.setattr(
+        user_portal.database, "refund_user_wallet_and_release_operation_lock",
+        lambda *a, **k: refunded.append((a, k)),
+    )
+
+    asyncio.run(user_portal.handle_user_callbacks(update, SimpleNamespace(user_data={})))
+
+    assert unresolved
+    assert not refunded
+    assert query.answers and "کافی نیست" in query.answers[-1][0]
