@@ -569,12 +569,20 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             size_kb = b_res.get("size_kb")
             
             keyboard = build_back_to_admin_keyboard()
+            upload_status = b_res.get("telegram_upload_status", "unknown")
+            if upload_status == "sent":
+                upload_line = "✅ ارسال به تاپیک پشتیبان‌گیری تلگرام تأیید شد."
+            elif upload_status == "failed":
+                upload_line = "⚠️ آرشیو محلی ساخته شد، اما ارسال تلگرام ناموفق بود."
+            else:
+                upload_line = "⚠️ آرشیو محلی ساخته شد، اما مقصد تلگرام پیکربندی نشده است."
             await query.edit_message_text(
-                f"✅ **پشتیبان‌گیری کامل انجام شد.**\n\n"
+                f"✅ **فایل پشتیبان محلی ایجاد شد.**\n\n"
                 f"• حجم فایل: **{size_kb} KB**\n"
                 f"• مسیر لوکال: `{archive_path}`\n"
-                f"• ارسال به تاپیک ۲۰ فروم: **انجام شد**\n\n"
-                f"فایل آرشیو در ادامه برای شما ارسال می‌شود...",
+                f"• وضعیت تلگرام: {upload_line}\n"
+                f"• خطای ارسال: {b_res.get('telegram_upload_error') or 'ندارد'}\n\n"
+                f"فایل آرشیو محلی در ادامه برای شما ارسال می‌شود...",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard
             )
