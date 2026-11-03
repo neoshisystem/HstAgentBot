@@ -25,6 +25,7 @@ from xui_result import XUIResult, classify_xui_result
         ({"status": "failure", "success": True}, XUIResult.UNKNOWN),
         ({"status": "pending"}, XUIResult.UNKNOWN),
         ({"success": "true"}, XUIResult.UNKNOWN),
+        ({"status": "success", "success": "false"}, XUIResult.UNKNOWN),
         ({}, XUIResult.UNKNOWN),
         (None, XUIResult.UNKNOWN),
         ("success", XUIResult.UNKNOWN),
