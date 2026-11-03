@@ -452,6 +452,21 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         if action == "force_res":
+            lock_key = f"reservation-activation:{res_id}"
+            lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=900)
+            if not lock_token:
+                await query.answer("⏳ این رزرو در حال فعال‌سازی است یا نتیجه عملیات قبلی نیازمند بررسی است.", show_alert=True)
+                return
+            # Re-read after acquiring the lease to close the cancel/activate race.
+            res_item = database.get_reservation_by_id(res_id)
+            if (
+                not res_item or res_item.get("status") != "pending"
+                or res_item.get("rep_id") != rep.get("id")
+                or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+            ):
+                database.release_operation_lock(lock_key, lock_token)
+                await query.answer("⛔️ وضعیت رزرو تغییر کرده یا در محدوده نمایندگی شما نیست.", show_alert=True)
+                return
             gb = res_item["gb"]
             days = res_item["days"]
             on_first = bool(res_item.get("on_first_connect", 0))
@@ -464,17 +479,26 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             except Exception:
                 logger.exception("Representative force-reserve outcome is unknown: %s", res_id)
-                await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو در صف باقی ماند و نیاز به بررسی دارد.", show_alert=True)
+                # Keep the lease until it expires: the panel may have renewed the account.
+                await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
+                return
+            if isinstance(renew_result, dict) and (
+                renew_result.get("status") in ("error", "failed", "failure")
+                or renew_result.get("success") is False
+            ):
+                database.release_operation_lock(lock_key, lock_token)
+                await query.answer("❌ پنل فعال‌سازی رزرو را رد کرد؛ رزرو در صف باقی ماند.", show_alert=True)
                 return
             if not isinstance(renew_result, dict) or not (
                 renew_result.get("status") in ("success", "ok") or renew_result.get("success") is True
             ):
-                await query.answer("⚠️ پنل موفقیت فعال‌سازی را تأیید نکرد؛ رزرو در صف باقی ماند.", show_alert=True)
+                await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
                 return
             activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
             if not activated:
-                await query.answer("⚠️ وضعیت رزرو هم‌زمان تغییر کرده است؛ از اجرای مجدد خودداری کنید.", show_alert=True)
+                await query.answer("⚠️ پنل عملیات را انجام داد اما ثبت فعال‌سازی ناموفق بود؛ قفل تطبیق حفظ شد.", show_alert=True)
                 return
+            database.release_operation_lock(lock_key, lock_token)
             result_msg = f"🚀 بسته رزرو اکانت {acc_code} فعال شد."
         else:
             cancel_result = database.cancel_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
