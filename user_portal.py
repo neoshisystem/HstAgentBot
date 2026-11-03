@@ -278,9 +278,14 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             if not sub_url:
                 await query.answer("دامنه سابسکریپشن در تنظیمات سامانه تعریف نشده است.", show_alert=True)
                 return
-            qr_bytes = sub_manager.generate_qr_code(sub_url)
-            caption = f"📱 **QR کد اشتراک اکانت {acc_code}**\n\nلینک: `{sub_url}`"
-            await query.message.reply_photo(photo=qr_bytes, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            try:
+                qr_bytes = sub_manager.generate_qr_code(sub_url)
+                caption = f"📱 **QR کد اشتراک اکانت {acc_code}**\n\nلینک: `{sub_url}`"
+                await query.message.reply_photo(photo=qr_bytes, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                logger.exception("Could not create or deliver subscription QR for %s", acc_code)
+                await query.answer("❌ ساخت یا ارسال QR ناموفق بود؛ لینک اشتراک تغییری نکرده است.", show_alert=True)
+                return
             await query.answer("QR ارسال شد.")
         else:
             await query.answer("❌ خطا در تولید QR.", show_alert=True)
