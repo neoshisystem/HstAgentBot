@@ -268,3 +268,115 @@ def test_rep_confirmation_is_bound_to_account_snapshot_at_atomic_claim(isolated_
     assert database.get_account_renewal_confirmation(token, 85001)["status"] == "pending"
     assert database.get_rep_balance(rep_id) == 0
 
+def create_admin_confirmation():
+    plan = database.get_plan("renew_20gb_30d")
+    database.upsert_account_record(
+        rep_id=None,
+        email="admin-renew@example.test",
+        account_code="AD-2001",
+        customer_name="Admin Account",
+        sub_id="admin-renew-sub",
+        enable=1,
+        total_gb=20,
+        expiry_time=0,
+    )
+    return database.create_account_renewal_confirmation(
+        actor_id=9000,
+        actor_role="super_admin",
+        rep_id=None,
+        account_code="AD-2001",
+        account_email="admin-renew@example.test",
+        plan_code=plan["plan_code"],
+        plan_name=plan["name"],
+        gb=plan["gb"],
+        days=plan["days"],
+        amount=plan["rep_price"],
+    )
+
+
+def test_super_admin_confirmation_is_atomically_claimed_with_persistent_lock(isolated_db):
+    token = create_admin_confirmation()
+    plan = database.get_plan("renew_20gb_30d")
+    started = database.begin_admin_renewal_confirmation(
+        confirmation_id=token,
+        actor_id=9000,
+        actor_role="super_admin",
+        confirmation_rep_id=None,
+        account_code="AD-2001",
+        account_email="admin-renew@example.test",
+        plan_code=plan["plan_code"],
+        plan_name=plan["name"],
+        gb=plan["gb"],
+        days=plan["days"],
+        amount=plan["rep_price"],
+    )
+    assert started["status"] == "started"
+    confirmation = database.get_account_renewal_confirmation(token, 9000)
+    assert confirmation["status"] == "processing"
+    assert confirmation["operation_ref_type"] == "admin_renewal"
+    assert confirmation["operation_ref_id"] == token
+    assert confirmation["operation_lock_key"] == started["lock_key"]
+
+    lock = next(item for item in database.get_operation_locks() if item["lock_key"] == started["lock_key"])
+    assert lock["action_type"] == "admin_renewal"
+    assert lock["intent_owner_type"] == "super_admin"
+    assert lock["intent_id"] == token
+    assert "token" not in lock
+
+    with pytest.raises(ValueError, match="resolveadminrenewal"):
+        database.resolve_operation_lock(
+            started["lock_key"], 9000, "Super Admin",
+            "RECONCILED: checked exact X-UI account",
+        )
+
+    database.complete_admin_renewal_confirmation(token, 9000, "Explicit X-UI success")
+    assert database.get_account_renewal_confirmation(token, 9000)["status"] == "succeeded"
+    assert database.get_operation_locks() == []
+
+
+def test_super_admin_confirmation_ambiguous_resolution_has_no_financial_effect(isolated_db):
+    rep_id = isolated_db
+    token = create_admin_confirmation()
+    plan = database.get_plan("renew_20gb_30d")
+    started = database.begin_admin_renewal_confirmation(
+        token, 9000, "super_admin", None, "AD-2001",
+        "admin-renew@example.test", plan["plan_code"], plan["name"],
+        plan["gb"], plan["days"], plan["rep_price"],
+    )
+    database.mark_admin_renewal_confirmation_for_reconciliation(
+        token, 9000, "X-UI response timed out after request",
+    )
+    assert database.get_account_renewal_confirmation(token, 9000)["status"] == "needs_reconciliation"
+
+    result = database.resolve_admin_renewal_confirmation(
+        token, 9000, "Super Admin", "NOT_APPLIED",
+        "NOT_APPLIED: inspected exact external account and renewal is absent",
+    )
+    assert result["status"] == "failed"
+    assert database.get_account_renewal_confirmation(token, 9000)["status"] == "failed"
+    assert database.get_operation_locks() == []
+    assert database.get_rep_balance(rep_id) == 0
+
+
+def test_super_admin_confirmation_claim_rolls_back_if_lock_creation_cannot_complete(isolated_db, monkeypatch):
+    token = create_admin_confirmation()
+    plan = database.get_plan("renew_20gb_30d")
+    original = database._insert_audit
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("injected audit failure")
+
+    monkeypatch.setattr(database, "_insert_audit", fail_audit)
+    with pytest.raises(RuntimeError, match="injected audit failure"):
+        database.begin_admin_renewal_confirmation(
+            token, 9000, "super_admin", None, "AD-2001",
+            "admin-renew@example.test", plan["plan_code"], plan["name"],
+            plan["gb"], plan["days"], plan["rep_price"],
+        )
+    monkeypatch.setattr(database, "_insert_audit", original)
+
+    confirmation = database.get_account_renewal_confirmation(token, 9000)
+    assert confirmation["status"] == "pending"
+    assert confirmation["operation_lock_key"] is None
+    assert database.get_operation_locks() == []
+
