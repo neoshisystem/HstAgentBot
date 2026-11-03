@@ -960,12 +960,17 @@ def get_operation_locks() -> list[dict]:
     with get_db() as conn:
         rows = conn.execute("""
             SELECT o.lock_key, o.expires_at, o.created_at,
-                   COALESCE(i.intent_id, r.intent_id) AS intent_id,
-                   COALESCE(i.action_type, r.action_type) AS action_type,
-                   COALESCE(i.user_id, r.actor_tg_id) AS user_id,
-                   COALESCE(i.account_code, r.account_code) AS account_code,
-                   COALESCE(i.status, r.status) AS intent_status,
-                   CASE WHEN r.intent_id IS NOT NULL THEN 'representative' ELSE 'end_user' END AS intent_owner_type
+                   COALESCE(i.intent_id, r.intent_id, rr.intent_id) AS intent_id,
+                   COALESCE(i.action_type, r.action_type,
+                       CASE WHEN rr.intent_id IS NOT NULL THEN 'renew' END) AS action_type,
+                   COALESCE(i.user_id, r.actor_tg_id, rr.actor_tg_id) AS user_id,
+                   COALESCE(i.account_code, r.account_code, rr.account_code) AS account_code,
+                   COALESCE(i.status, r.status, rr.status) AS intent_status,
+                   CASE
+                       WHEN r.intent_id IS NOT NULL OR rr.intent_id IS NOT NULL THEN 'representative'
+                       WHEN i.intent_id IS NOT NULL THEN 'end_user'
+                       ELSE 'unlinked'
+                   END AS intent_owner_type
             FROM operation_locks o
             LEFT JOIN user_action_intents i
               ON i.operation_lock_key = o.lock_key
@@ -973,6 +978,9 @@ def get_operation_locks() -> list[dict]:
             LEFT JOIN rep_action_intents r
               ON r.operation_lock_key = o.lock_key
              AND r.operation_lock_token = o.token
+            LEFT JOIN rep_renewal_intents rr
+              ON rr.operation_lock_key = o.lock_key
+             AND rr.operation_lock_token = o.token
             WHERE o.expires_at > ?
             ORDER BY o.created_at ASC
         """, (time.time(),)).fetchall()
@@ -997,26 +1005,36 @@ def resolve_operation_lock(
         if not row:
             return False
         linked_intent = cur.execute("""
-            SELECT intent_id, status, 'end_user' AS owner_type FROM user_action_intents
+            SELECT intent_id, status, 'end_user' AS owner_type, action_type FROM user_action_intents
             WHERE operation_lock_key = ?
               AND operation_lock_token = (
                   SELECT token FROM operation_locks WHERE lock_key = ?
               )
               AND status IN ('processing', 'needs_reconciliation')
             UNION ALL
-            SELECT intent_id, status, 'representative' AS owner_type FROM rep_action_intents
+            SELECT intent_id, status, 'representative' AS owner_type, action_type FROM rep_action_intents
+            WHERE operation_lock_key = ?
+              AND operation_lock_token = (
+                  SELECT token FROM operation_locks WHERE lock_key = ?
+              )
+              AND status IN ('processing', 'needs_reconciliation')
+            UNION ALL
+            SELECT intent_id, status, 'representative' AS owner_type, 'renew' AS action_type
+            FROM rep_renewal_intents
             WHERE operation_lock_key = ?
               AND operation_lock_token = (
                   SELECT token FROM operation_locks WHERE lock_key = ?
               )
               AND status IN ('processing', 'needs_reconciliation')
             LIMIT 1
-        """, (key, key, key, key)).fetchone()
+        """, (key, key, key, key, key, key)).fetchone()
         if linked_intent:
-            resolve_command = (
-                "/resolverepintent" if linked_intent["owner_type"] == "representative"
-                else "/resolveintent"
-            )
+            if linked_intent["owner_type"] == "end_user":
+                resolve_command = "/resolveintent"
+            elif linked_intent["action_type"] == "renew":
+                resolve_command = "/resolvereprenewal"
+            else:
+                resolve_command = "/resolverepintent"
             raise ValueError(
                 f"Operation lock belongs to {linked_intent['owner_type']} action intent {linked_intent['intent_id']} "
                 f"({linked_intent['status']}); use {resolve_command} so ledger and intent state are reconciled together"
@@ -2087,10 +2105,10 @@ def resolve_rep_renewal_intent(
         if not row:
             raise ValueError("No unresolved representative renewal intent with that ID was found")
         intent = dict(row)
-        lock, = (cur.execute(
+        lock = cur.execute(
             "SELECT token, created_at FROM operation_locks WHERE lock_key=?",
             (intent["operation_lock_key"],),
-        ).fetchone(),)
+        ).fetchone()
         if not lock or not secrets.compare_digest(str(lock["token"]), str(intent["operation_lock_token"])):
             raise ValueError("Representative renewal intent's exact operation lock is missing or ownership differs")
 
