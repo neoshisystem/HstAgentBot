@@ -178,51 +178,112 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("❌ پلن یافت نشد.", show_alert=True)
             return
 
-        allowed, curr_debt, credit_limit = database.check_rep_credit_limit(rep["id"], plan["rep_price"])
-        if not allowed:
-            await query.answer(f"⛔️ سقف اعتبار تکمیل است.", show_alert=True)
+        amount = int(plan["rep_price"])
+        if amount <= 0:
+            await query.answer("❌ قیمت پلن معتبر نیست.", show_alert=True)
+            return
+        lock_key = f"rep-issue:{rep['id']}:{plan_code}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=300)
+        if not lock_token:
+            await query.answer("⏳ درخواست صدور دیگری در حال پردازش است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
             return
 
-        gb = plan["gb"]
-        days = plan["days"]
-        scope_for_alloc = rep.get("scope_filter") or "all"
+        try:
+            new_bal = database.record_ledger_entry(
+                rep_id=rep["id"], account_code="", email="", plan_code=plan_code,
+                tx_type="debit", amount=amount,
+                description=f"پیش‌پرداخت صدور {plan['name']} (در انتظار تأیید پنل)",
+                actor_id=user.id, actor_name=user.full_name or "Rep"
+            )
+        except ValueError as exc:
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer(f"⛔️ ثبت مالی صدور انجام نشد: {exc}", show_alert=True)
+            return
 
-        alloc_res = await asyncio.to_thread(xui_manager.allocate_pool_client, gb, days, comment=cust_name, scope=scope_for_alloc)
-        if alloc_res.get("status") == "success":
+        gb = float(plan["gb"])
+        days = int(plan["days"])
+        scope_for_alloc = rep.get("scope_filter") or "all"
+        try:
+            alloc_res = await asyncio.to_thread(
+                xui_manager.allocate_pool_client, gb, days,
+                comment=cust_name, scope=scope_for_alloc
+            )
+        except Exception:
+            logger.exception("Representative allocation outcome is unknown for rep %s", rep["id"])
+            await query.answer(
+                "⚠️ پاسخ پنل نامشخص است؛ مبلغ به‌صورت پیش‌پرداخت محفوظ مانده است. لطفاً مجدداً کلیک نکنید.",
+                show_alert=True
+            )
+            return
+
+        if isinstance(alloc_res, dict) and alloc_res.get("status") == "success":
             email = alloc_res.get("email")
+            if not email:
+                logger.error("X-UI reported successful allocation without email: %r", alloc_res)
+                await query.answer("⚠️ پاسخ پنل ناقص است؛ مبلغ برای تطبیق محفوظ ماند.", show_alert=True)
+                return
             sub_id = alloc_res.get("sub_id")
             code = xui_manager.extract_account_identifier(email) or email
+            try:
+                database.upsert_account_record(
+                    rep_id=rep["id"], email=email, account_code=code,
+                    customer_name=cust_name, sub_id=sub_id, enable=1,
+                    total_gb=gb, expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
+                )
+            except Exception:
+                logger.exception("X-UI allocated %s but local persistence failed", email)
+                await query.answer(
+                    "⚠️ اکانت در پنل ایجاد شد اما ثبت محلی کامل نشد؛ مبلغ محفوظ است و تطبیق لازم است.",
+                    show_alert=True
+                )
+                return
 
-            database.upsert_account_record(
-                rep_id=rep["id"],
-                email=email,
-                account_code=code,
-                customer_name=cust_name,
-                sub_id=sub_id,
-                enable=1,
-                total_gb=gb,
-                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
-            )
-
-            new_bal = database.record_ledger_entry(
-                rep_id=rep["id"],
-                account_code=code,
-                email=email,
-                plan_code=plan_code,
-                tx_type="debit",
-                amount=plan["rep_price"],
-                description=f"صدور اکانت جدید {int(gb)}G/{int(days)}D ({cust_name or 'بدون نام'})",
-                actor_id=user.id,
-                actor_name=user.full_name or "Rep"
-            )
-
+            database.release_operation_lock(lock_key, lock_token)
             deliv_text = alloc_res.get("deliverable", "")
-            deliv_text += f"\n\n🧾 **فاکتور:** `{plan['rep_price']:,} تومان` | **مانده بدهی جدید:** `{new_bal:,} تومان`"
-            keyboard = nlp_matcher.build_account_keyboard(code, is_enabled=True, on_first_connect=False, role="rep")
-            await query.message.reply_text(deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            deliv_text += (
+                f"\n\n🧾 **فاکتور:** `{amount:,} تومان`"
+                f" | **مانده بدهی جدید:** `{new_bal:,} تومان`"
+            )
+            keyboard = nlp_matcher.build_account_keyboard(
+                code, is_enabled=True, on_first_connect=False, role="rep"
+            )
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            await query.message.reply_text(
+                deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            )
             await query.answer("✅ اکانت جدید با موفقیت صادر شد.")
+        elif isinstance(alloc_res, dict) and (
+            alloc_res.get("status") in ("error", "failed", "failure")
+            or alloc_res.get("success") is False
+        ):
+            try:
+                database.register_rep_payment(
+                    rep["id"], amount,
+                    f"استرداد پیش‌پرداخت به دلیل شکست قطعی صدور {plan_code}",
+                    actor_id=user.id, actor_name=user.full_name or "Rep"
+                )
+            except Exception:
+                logger.exception("Failed to reverse allocation precharge for rep %s", rep["id"])
+                await query.answer("⚠️ صدور رد شد اما استرداد ثبت نشد؛ موضوع به مدیریت ارجاع شد.", show_alert=True)
+                return
+            database.release_operation_lock(lock_key, lock_token)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            await query.answer(
+                f"❌ پنل صدور اکانت را رد کرد؛ پیش‌پرداخت {amount:,} تومان مسترد شد.",
+                show_alert=True
+            )
         else:
-            await query.answer(f"❌ خطا: {alloc_res.get('message', 'موجودی استخر تمام شده است')}", show_alert=True)
+            logger.error("Ambiguous X-UI allocate response for rep %s: %r", rep["id"], alloc_res)
+            await query.answer(
+                "⚠️ پاسخ پنل برای تأیید یا رد صدور کافی نیست؛ مبلغ محفوظ است و بررسی دستی لازم است.",
+                show_alert=True
+            )
 
     # 3. Paginated Accounts List
     elif action == "acc_list":
