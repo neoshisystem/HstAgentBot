@@ -23,6 +23,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import database
 import nlp_matcher
 import finance_manager
+from xui_result import XUIResult, classify_xui_result
 
 from server_integrations import load_integration
 xui_manager = load_integration("xui_manager")
@@ -240,7 +241,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        if isinstance(alloc_res, dict) and alloc_res.get("status") == "success":
+        if classify_xui_result(alloc_res) == XUIResult.SUCCESS:
             email = alloc_res.get("email")
             if not email:
                 try:
@@ -311,10 +312,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
             )
             await query.answer("✅ اکانت جدید با موفقیت صادر شد.")
-        elif isinstance(alloc_res, dict) and (
-            alloc_res.get("status") in ("error", "failed", "failure")
-            or alloc_res.get("success") is False
-        ):
+        elif classify_xui_result(alloc_res) == XUIResult.FAILURE:
             try:
                 new_balance = database.refund_rep_action_intent(
                     intent_id, rep["id"], user.id, lock_key, lock_token,
@@ -613,7 +611,15 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 # Keep the lease until it expires: the panel may have renewed the account.
                 await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
                 return
-            if isinstance(renew_result, dict) and (
+            if classify_xui_result(renew_result) == XUIResult.FAILURE:
+                # Explicit and consistent negative response only.
+                database.release_operation_lock(lock_key, lock_token)
+                await query.answer("❌ پنل فعال‌سازی رزرو را رد کرد؛ رزرو در صف باقی ماند.", show_alert=True)
+                return
+            if classify_xui_result(renew_result) != XUIResult.SUCCESS:
+                await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
+                return
+            if False and isinstance(renew_result, dict) and (
                 renew_result.get("status") in ("error", "failed", "failure")
                 or renew_result.get("success") is False
             ):
