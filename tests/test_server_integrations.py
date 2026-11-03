@@ -10,3 +10,15 @@ def test_missing_optional_server_integration_fails_lazily_with_guidance():
         assert "HSTAGENTBOT_INTEGRATIONS_PATH" in str(exc)
     else:
         raise AssertionError("Expected a clear missing-integration error")
+
+
+
+def test_retired_watchdog_refuses_to_start():
+    from watchdog_service import WatchdogService
+
+    try:
+        WatchdogService(None, None, None)
+    except RuntimeError as exc:
+        assert "canonical watchdog_worker" in str(exc)
+    else:
+        raise AssertionError("The retired duplicate watchdog must not be startable")
