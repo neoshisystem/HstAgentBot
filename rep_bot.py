@@ -51,6 +51,13 @@ def _xui_operation_succeeded(result) -> bool:
         result.get("status") in ("success", "ok") or result.get("success") is True
     )
 
+def _xui_operation_failed(result) -> bool:
+    """Return True only for an explicit negative response, never for an ambiguous one."""
+    return isinstance(result, dict) and (
+        result.get("status") in ("error", "failed", "failure")
+        or result.get("success") is False
+    )
+
 
 async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=ParseMode.MARKDOWN):
     """
@@ -559,22 +566,99 @@ async def process_account_renewal(
 
     if can_renew_immediate:
         countdown_param = True if effective_first else "auto"
-        ren_res = await asyncio.to_thread(
-            xui_manager.renew_client,
-            email, gb, days, comment=curr_comment, rollover=True, countdown=countdown_param,
-            scope=scope_flt, by_code_only=by_code_only
-        )
-        if not _xui_operation_succeeded(ren_res):
+        operation_lock_key = f"rep-renew-pending:{account_code.lower()}"
+        operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=300)
+        if not operation_lock_token:
+            pending_res = database.get_pending_reservation(account_code)
+            keyboard = nlp_matcher.build_account_keyboard(
+                account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                role=role, pending_res=pending_res
+            )
+            return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
+
+        # Record the debit before the external side effect. SQLite serializes the
+        # credit-limit check and debit, so parallel renewals cannot exceed the limit.
+        new_bal = None
+        if not is_admin_exempt:
+            try:
+                new_bal = database.record_ledger_entry(
+                    rep_id=target_rep_id,
+                    account_code=account_code,
+                    email=email,
+                    plan_code=plan_code,
+                    tx_type="debit",
+                    amount=charge,
+                    description=f"پیش‌پرداخت تمدید {plan_name} (در انتظار تأیید پنل)",
+                    actor_id=user.id,
+                    actor_name=user.full_name or user.username
+                )
+            except ValueError as exc:
+                database.release_operation_lock(operation_lock_key, operation_lock_token)
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, f"⛔️ ثبت مالی تمدید انجام نشد: {exc}", keyboard
+
+        try:
+            ren_res = await asyncio.to_thread(
+                xui_manager.renew_client,
+                email, gb, days, comment=curr_comment, rollover=True, countdown=countdown_param,
+                scope=scope_flt, by_code_only=by_code_only
+            )
+        except Exception:
+            logger.exception("X-UI renewal outcome is unknown for %s", account_code)
+            # Keep the debit hold and operation lease: the panel may have applied
+            # the renewal even though its response was lost.
             pending_res = database.get_pending_reservation(account_code)
             keyboard = nlp_matcher.build_account_keyboard(
                 account_code, is_enabled=is_enabled, on_first_connect=effective_first,
                 role=role, pending_res=pending_res
             )
             return False, (
-                "⚠️ پاسخ پنل، موفقیت تمدید را تأیید نکرد. هیچ هزینه یا وضعیت مالی جدیدی ثبت نشد؛ "
-                "وضعیت اکانت را در پنل بررسی کنید."
+                "⚠️ نتیجه درخواست تمدید از پنل نامشخص است. مبلغ در وضعیت محفوظ باقی مانده؛ "
+                "لطفاً تا بررسی وضعیت پنل دوباره اقدام نکنید."
             ), keyboard
 
+        if not _xui_operation_succeeded(ren_res):
+            if _xui_operation_failed(ren_res):
+                if not is_admin_exempt:
+                    try:
+                        database.register_rep_payment(
+                            target_rep_id, charge,
+                            f"استرداد پیش‌پرداخت به دلیل رد قطعی تمدید {account_code}",
+                            actor_id=user.id, actor_name=user.full_name or user.username
+                        )
+                    except Exception:
+                        logger.exception("Could not refund representative renewal hold for %s", account_code)
+                        pending_res = database.get_pending_reservation(account_code)
+                        keyboard = nlp_matcher.build_account_keyboard(
+                            account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                            role=role, pending_res=pending_res
+                        )
+                        return False, "⚠️ پنل تمدید را رد کرد اما استرداد مالی ثبت نشد؛ موضوع نیازمند بررسی مدیریت است.", keyboard
+                database.release_operation_lock(operation_lock_key, operation_lock_token)
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, (
+                    "❌ پنل تمدید را رد کرد؛ هیچ تمدیدی انجام نشد و وجه/اعتبار پیش‌پرداخت‌شده مسترد شد."
+                ), keyboard
+
+            # Unknown response: do not refund a possibly completed external operation.
+            pending_res = database.get_pending_reservation(account_code)
+            keyboard = nlp_matcher.build_account_keyboard(
+                account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                role=role, pending_res=pending_res
+            )
+            return False, (
+                "⚠️ پاسخ پنل موفقیت یا شکست قطعی را مشخص نمی‌کند؛ مبلغ محفوظ مانده و بررسی دستی لازم است."
+            ), keyboard
+
+        database.release_operation_lock(operation_lock_key, operation_lock_token)
         report_text = ren_res.get("report", "")
         if comment_updated:
             report_text = f"👤 **نام مشتری روی اکانت ثبت شد:** `{curr_comment}`\n\n" + report_text
@@ -588,17 +672,6 @@ async def process_account_renewal(
             )
             report_text += "\n\n👑 **عملیات مستقیم مدیریت کل (معاف از صورت‌حساب نمایندگی)**"
         else:
-            new_bal = database.record_ledger_entry(
-                rep_id=target_rep_id,
-                account_code=account_code,
-                email=email,
-                plan_code=plan_code,
-                tx_type="debit",
-                amount=charge,
-                description=f"تمدید مستقیم {plan_name} (حالت: {'با اولین اتصال' if effective_first else 'رول‌اوور'})",
-                actor_id=user.id,
-                actor_name=user.full_name or user.username
-            )
             database.log_audit(
                 rep_id=target_rep_id, account_code=account_code, email=email,
                 action="renew_account", actor_id=user.id, actor_name=user.full_name or user.username,
@@ -616,7 +689,6 @@ async def process_account_renewal(
             f"• مجری: {user.full_name} ({'مدیریت (معاف)' if is_admin_exempt else f'{charge:,} تومان'})"
         )
         return True, report_text, keyboard
-
     else:
         # Case 2: Reserve Queue
         existing_res = database.get_pending_reservation(account_code)
