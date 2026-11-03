@@ -607,7 +607,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ قیمت پلن معتبر نیست؛ با پشتیبانی تماس بگیرید.", show_alert=True)
             return
 
-        lock_key = f"user-renew:{user.id}:{acc_code.lower()}"
+        lock_key = f"account-renewal:{owned_account['account_code'].lower()}"
         lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
             await query.answer("⏳ درخواست تمدید دیگری برای این سرویس در حال پردازش است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
