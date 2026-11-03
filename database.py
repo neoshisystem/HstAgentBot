@@ -812,12 +812,20 @@ def reassign_account(account_code, new_rep_id=None, new_owner_tg_id=None):
                 (int(new_owner_tg_id), row["id"])
             )
         return {"status": "ok", "account_code": row["account_code"]}
-def acquire_operation_lock(lock_key: str, ttl_seconds: int = 300) -> str | None:
-    """Acquire a database-backed lease for one sensitive operation."""
+def acquire_operation_lock(lock_key: str, ttl_seconds: int | None = 300) -> str | None:
+    """Acquire a DB-backed operation lease.
+
+    Pass ttl_seconds=None for an unresolved external side effect. Such a lock
+    never expires automatically and must be resolved by a Super Admin after
+    inspecting the external panel and local state.
+    """
     key = str(lock_key or "").strip()
-    ttl = max(1, int(ttl_seconds))
     if not key:
         raise ValueError("Operation lock key is required")
+    if ttl_seconds is None:
+        expires_at = 253402300799.0  # 9999-12-31 UTC; effectively persistent
+    else:
+        expires_at = time.time() + max(1, int(ttl_seconds))
     now = time.time()
     token = uuid.uuid4().hex
     with get_db() as conn:
@@ -831,9 +839,51 @@ def acquire_operation_lock(lock_key: str, ttl_seconds: int = 300) -> str | None:
             return None
         cur.execute(
             "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
-            (key, token, now + ttl)
+            (key, token, expires_at)
         )
         return token
+
+
+def get_operation_locks() -> list[dict]:
+    """List current operation leases without exposing their private ownership tokens."""
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT lock_key, expires_at, created_at
+            FROM operation_locks
+            WHERE expires_at > ?
+            ORDER BY created_at ASC
+        """, (time.time(),)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def resolve_operation_lock(
+    lock_key: str, actor_id: int, actor_name: str, evidence_note: str
+) -> bool:
+    """Release an unresolved operation lock after an administrator records evidence."""
+    key = str(lock_key or "").strip()
+    note = str(evidence_note or "").strip()
+    if not key or len(note) < 15:
+        raise ValueError("A lock key and evidence note of at least 15 characters are required")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT lock_key, created_at FROM operation_locks WHERE lock_key = ?",
+            (key,)
+        ).fetchone()
+        if not row:
+            return False
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ?",
+            (key,)
+        )
+        _insert_audit(
+            cur, rep_id=None, account_code="", email="", action="resolve_operation_lock",
+            actor_id=actor_id, actor_name=actor_name,
+            details={"lock_key": key, "lock_created_at": row["created_at"], "evidence_note": note},
+            result_status="success"
+        )
+        return cur.rowcount >= 0
 
 
 def release_operation_lock(lock_key: str, token: str) -> bool:
