@@ -591,7 +591,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         lock_key = f"reservation-activation:{res_id}"
-        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=900)
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
             await query.answer("⏳ این رزرو در حال فعال‌سازی است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
             return
