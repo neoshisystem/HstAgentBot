@@ -2040,11 +2040,6 @@ def _validate_account_renewal_confirmation_for_claim(
     if intent["status"] != "pending":
         raise ValueError(f"Quick-renew confirmation is already {intent['status']}")
     if float(intent["expires_at"]) <= time.time():
-        cur.execute("""
-            UPDATE account_renewal_confirmations
-            SET status='expired', updated_at=CURRENT_TIMESTAMP
-            WHERE intent_id=? AND status='pending'
-        """, (key,))
         raise ValueError("Quick-renew confirmation expired")
     if intent["actor_role"] != role:
         raise ValueError("Quick-renew confirmation role mismatch")
@@ -2087,6 +2082,8 @@ def begin_rep_renewal_intent(
     gb: float,
     days: int,
     amount: int,
+    confirmation_id: str | None = None,
+    actor_role: str = "rep",
 ) -> dict:
     """Atomically precharge a representative and bind the exact account renewal lock to a durable intent."""
     rep_id, actor_tg_id = int(rep_id), int(actor_tg_id)
@@ -2105,6 +2102,11 @@ def begin_rep_renewal_intent(
         cur.execute("BEGIN IMMEDIATE")
         now = time.time()
         cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (now,))
+        if confirmation_id:
+            _validate_account_renewal_confirmation_for_claim(
+                cur, confirmation_id, actor_tg_id, actor_role, rep_id,
+                code, email, plan_code, plan_name, gb, days, amount,
+            )
         if cur.execute(
             "SELECT 1 FROM operation_locks WHERE lock_key=?", (lock_key,)
         ).fetchone():
@@ -2122,13 +2124,23 @@ def begin_rep_renewal_intent(
         cur.execute("""
             INSERT INTO rep_renewal_intents
             (intent_id, rep_id, actor_tg_id, account_code, account_email,
-             plan_code, plan_name, gb, days, amount, status,
+             plan_code, plan_name, gb, days, amount, confirmation_id, status,
              operation_lock_key, operation_lock_token)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
         """, (
             intent_id, rep_id, actor_tg_id, code, email, plan_code, plan_name,
-            gb, days, amount, lock_key, lock_token,
+            gb, days, amount, confirmation_id, lock_key, lock_token,
         ))
+        if confirmation_id:
+            cur.execute("""
+                UPDATE account_renewal_confirmations
+                SET status='processing', operation_ref_type='rep_renewal',
+                    operation_ref_id=?, operation_lock_key=?, operation_lock_token=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE intent_id=? AND actor_id=? AND status='pending'
+            """, (intent_id, lock_key, lock_token, str(confirmation_id), actor_tg_id))
+            if cur.rowcount != 1:
+                raise RuntimeError("Could not atomically claim quick-renew confirmation")
         _insert_audit(
             cur, rep_id, code, email, "rep_renewal_intent_started",
             actor_tg_id, "Representative",
@@ -2141,6 +2153,19 @@ def begin_rep_renewal_intent(
             "lock_key": lock_key, "lock_token": lock_token,
             "new_balance": new_balance,
         }
+
+
+def _sync_linked_renewal_confirmation(cur, intent: dict, status: str, result_note: str | None = None):
+    confirmation_id = intent.get("confirmation_id")
+    if not confirmation_id:
+        return
+    cur.execute("""
+        UPDATE account_renewal_confirmations
+        SET status=?, result_note=?, updated_at=CURRENT_TIMESTAMP
+        WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+    """, (str(status), str(result_note or "")[:500], str(confirmation_id)))
+    if cur.rowcount != 1:
+        raise RuntimeError("Could not synchronize linked quick-renew confirmation state")
 
 
 def _verify_rep_renewal_lock(cur, intent_id: str, rep_id: int, actor_tg_id: int):
@@ -2180,6 +2205,7 @@ def complete_rep_renewal_intent(
         """, (str(result_note)[:500], str(intent_id)))
         if cur.rowcount != 1:
             raise RuntimeError("Could not finalize representative renewal intent")
+        _sync_linked_renewal_confirmation(cur, intent, "succeeded", result_note)
         _insert_audit(
             cur, int(rep_id), intent["account_code"], intent["account_email"],
             "rep_renewal_intent_succeeded", int(actor_tg_id), "Representative",
@@ -2215,6 +2241,7 @@ def refund_rep_renewal_intent(
         """, (str(reason or "Definite X-UI failure")[:500], str(intent_id)))
         if cur.rowcount != 1:
             raise RuntimeError("Could not finalize representative renewal refund")
+        _sync_linked_renewal_confirmation(cur, intent, "refunded", reason)
         _insert_audit(
             cur, int(rep_id), intent["account_code"], intent["account_email"],
             "rep_renewal_intent_refunded", int(actor_tg_id), "Representative",
@@ -2238,7 +2265,10 @@ def mark_rep_renewal_for_reconciliation(
             SET status='needs_reconciliation', result_note=?, updated_at=CURRENT_TIMESTAMP
             WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
         """, (str(note or "Ambiguous renewal result")[:500], str(intent_id)))
-        return cur.rowcount == 1
+        if cur.rowcount != 1:
+            return False
+        _sync_linked_renewal_confirmation(cur, intent, "needs_reconciliation", note)
+        return True
 
 
 def resolve_rep_renewal_intent(
@@ -2297,6 +2327,7 @@ def resolve_rep_renewal_intent(
         """, (status, note[:500], key))
         if cur.rowcount != 1:
             raise RuntimeError("Could not finalize representative renewal resolution")
+        _sync_linked_renewal_confirmation(cur, intent, status, note)
         _insert_audit(
             cur, int(intent["rep_id"]), intent["account_code"], intent["account_email"],
             audit_action, int(actor_id), str(actor_name or "Super Admin"),
