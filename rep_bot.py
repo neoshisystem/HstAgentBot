@@ -424,9 +424,17 @@ async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id != ADMIN_TELEGRAM_ID:
         return
-    count = database.sync_all_active_reps()
+    result = await asyncio.to_thread(database.sync_all_active_reps_detailed)
+    if result.get("status") != "success":
+        await update.message.reply_text(
+            f"❌ همگام‌سازی انجام نشد: {result.get('message', 'خطای نامشخص')}"
+        )
+        return
     await update.message.reply_text(
-        f"✅ همگام‌سازی دیتابیس با پنل ۳X-UI برای کلیه نمایندگان با موفقیت انجام شد.\nتعداد کل اکانت‌های همگام‌شده: **{count}**",
+        "✅ همگام‌سازی ۳X-UI انجام شد.\n"
+        f"• اکانت‌های به‌روزشده: **{result['count']}**\n"
+        f"• اکانت‌های مبهم/بدون واگذاری جدید: **{result['ambiguous']}**\n"
+        f"• اکانت‌های بدون تطبیق نماینده: **{result['unmatched']}**",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -1876,7 +1884,9 @@ async def watchdog_worker(application: Application):
 
 def main():
     database.init_db()
-    database.sync_all_active_reps()
+    startup_sync = database.sync_all_active_reps_detailed()
+    if startup_sync.get("status") != "success":
+        logger.error("Initial X-UI database sync failed: %s", startup_sync.get("message"))
     
     async def post_init(application: Application):
         asyncio.create_task(watchdog_worker(application))
