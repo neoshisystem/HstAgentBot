@@ -214,6 +214,7 @@ def test_restore_rejects_path_traversal_and_does_not_write_outside_destination(t
     destination = tmp_path / "restore-evil"
     with pytest.raises(ValueError, match="Unsafe archive member path"):
         backup.restore_backup_archive(str(malicious), str(destination))
+    assert not destination.exists()
     assert not outside.exists()
 
 
