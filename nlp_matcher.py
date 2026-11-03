@@ -166,9 +166,17 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
                 )
             ])
         else:
+            # Super Admin account cards use the same two-step confirmation flow
+            # as the dedicated admin reservation queue.
             keyboard.append([
-                InlineKeyboardButton("🚀 فعال‌سازی فوری رزرو (سوزاندن فعلی)", callback_data=f"force_res:{res_id}:{account_code}"),
-                InlineKeyboardButton("🗑 لغو رزرو و عودت وجه", callback_data=f"cancel_res:{res_id}:{account_code}")
+                InlineKeyboardButton(
+                    "🚀 فعال‌سازی فوری رزرو (تأیید دوم)",
+                    callback_data=f"admin:confirm_force_res:{res_id}:{account_code}"
+                ),
+                InlineKeyboardButton(
+                    "🗑 لغو رزرو و عودت (تأیید دوم)",
+                    callback_data=f"admin:confirm_cancel_res:{res_id}:{account_code}"
+                )
             ])
     
     if role in ("super_admin", "rep"):
