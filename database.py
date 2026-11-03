@@ -2570,6 +2570,32 @@ def toggle_user_block(user_id: int) -> int:
         conn.commit()
         return new_val
 
+def set_user_block_status(
+    user_id: int, is_blocked: bool, actor_id: int = 0, actor_name: str = "Admin"
+) -> int:
+    """Set an explicit user access state; replaying the same callback is harmless."""
+    user_id = int(user_id)
+    if user_id <= 0:
+        raise ValueError("Telegram user ID must be positive")
+    value = 1 if bool(is_blocked) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("""
+            INSERT INTO bot_users (telegram_id, is_blocked)
+            VALUES (?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET is_blocked = excluded.is_blocked
+        """, (user_id, value))
+        _insert_audit(
+            cur, None, "", "", "set_user_block_status", int(actor_id),
+            str(actor_name or "Admin"),
+            {"telegram_id": user_id, "is_blocked": bool(value)},
+            "success",
+        )
+        return value
+
+
+
 def get_bot_user_by_tg_id(user_id: int) -> dict | None:
     with get_db() as conn:
         cur = conn.cursor()
@@ -2715,6 +2741,28 @@ def toggle_rep_active(rep_id: int) -> int:
         conn.commit()
         return new_val
 
+def set_rep_active_status(
+    rep_id: int, is_active: bool, actor_id: int = 0, actor_name: str = "Admin"
+) -> int:
+    """Set a representative active state explicitly and audit the desired value."""
+    value = 1 if bool(is_active) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE representatives SET is_active = ? WHERE id = ?",
+            (value, int(rep_id))
+        )
+        if cur.rowcount != 1:
+            raise ValueError("Representative not found")
+        _insert_audit(
+            cur, int(rep_id), "", "", "set_rep_active_status", int(actor_id),
+            str(actor_name or "Admin"), {"is_active": bool(value)}, "success"
+        )
+        return value
+
+
+
 def delete_rep(rep_id: int) -> bool:
     """Archive a representative instead of destroying financial/audit references."""
     with get_db() as conn:
@@ -2743,6 +2791,30 @@ def toggle_plan_quick(plan_code: str) -> int:
         cur.execute("UPDATE pricing_plans SET is_quick = ? WHERE plan_code = ?", (new_val, plan_code))
         conn.commit()
         return new_val
+
+def set_plan_quick_status(
+    plan_code: str, is_quick: bool, actor_id: int = 0, actor_name: str = "Admin"
+) -> int:
+    """Set a plan's quick-display state to an explicit value; callback replay is idempotent."""
+    value = 1 if bool(is_quick) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE pricing_plans SET is_quick = ? WHERE plan_code = ?",
+            (value, str(plan_code))
+        )
+        if cur.rowcount != 1:
+            raise ValueError("Plan not found")
+        _insert_audit(
+            cur, None, "", "", "set_plan_quick_status", int(actor_id),
+            str(actor_name or "Admin"),
+            {"plan_code": str(plan_code), "is_quick": bool(value)},
+            "success",
+        )
+        return value
+
+
 
 def update_plan_specs(plan_code: str, name: str, gb: float, days: int, rep_price: int = None, user_price: int = None):
     name = str(name or "").strip()
