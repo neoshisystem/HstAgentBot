@@ -384,12 +384,28 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             gb = res_item["gb"]
             days = res_item["days"]
             on_first = bool(res_item.get("on_first_connect", 0))
-            await asyncio.to_thread(
-                xui_manager.renew_client,
-                res_item["email"], gb, days, comment=None, rollover=False,
-                countdown=True if on_first else "auto", scope="all", by_code_only=True
-            )
-            database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
+            if res_item.get("rep_id") != rep.get("id") or str(res_item.get("account_code", "")).lower() != acc_code.lower():
+                await query.answer("⛔️ این رزرو در محدوده نمایندگی شما نیست.", show_alert=True)
+                return
+            try:
+                renew_result = await asyncio.to_thread(
+                    xui_manager.renew_client,
+                    res_item["email"], gb, days, comment=None, rollover=False,
+                    countdown=True if on_first else "auto", scope=rep.get("scope_filter") or "all", by_code_only=True
+                )
+            except Exception:
+                logger.exception("Representative force-reserve outcome is unknown: %s", res_id)
+                await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو در صف باقی ماند و نیاز به بررسی دارد.", show_alert=True)
+                return
+            if not isinstance(renew_result, dict) or not (
+                renew_result.get("status") in ("success", "ok") or renew_result.get("success") is True
+            ):
+                await query.answer("⚠️ پنل موفقیت فعال‌سازی را تأیید نکرد؛ رزرو در صف باقی ماند.", show_alert=True)
+                return
+            activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
+            if not activated:
+                await query.answer("⚠️ وضعیت رزرو هم‌زمان تغییر کرده است؛ از اجرای مجدد خودداری کنید.", show_alert=True)
+                return
             await query.answer(f"🚀 بسته رزرو اکانت {acc_code} با موفقیت فعال شد.", show_alert=True)
         else:
             cancel_res = database.cancel_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
