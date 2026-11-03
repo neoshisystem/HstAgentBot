@@ -374,24 +374,32 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 6.1 Force Activate or Cancel Reserve
     elif action in ("force_res", "cancel_res"):
-        res_id = int(parts[2])
+        try:
+            res_id = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("شناسه رزرو نامعتبر است.", show_alert=True)
+            return
         acc_code = parts[3] if len(parts) > 3 else ""
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item
+            or res_item["status"] != "pending"
+            or res_item.get("rep_id") != rep.get("id")
+            or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+        ):
+            await query.answer("⛔️ رزرو در انتظار و متعلق به نمایندگی شما یافت نشد.", show_alert=True)
+            return
+
         if action == "force_res":
-            res_item = database.get_reservation_by_id(res_id)
-            if not res_item or res_item["status"] != "pending":
-                await query.answer("⚠️ این بسته قبلاً فعال یا لغو شده است.", show_alert=True)
-                return
             gb = res_item["gb"]
             days = res_item["days"]
             on_first = bool(res_item.get("on_first_connect", 0))
-            if res_item.get("rep_id") != rep.get("id") or str(res_item.get("account_code", "")).lower() != acc_code.lower():
-                await query.answer("⛔️ این رزرو در محدوده نمایندگی شما نیست.", show_alert=True)
-                return
             try:
                 renew_result = await asyncio.to_thread(
                     xui_manager.renew_client,
                     res_item["email"], gb, days, comment=None, rollover=False,
-                    countdown=True if on_first else "auto", scope=rep.get("scope_filter") or "all", by_code_only=True
+                    countdown=True if on_first else "auto",
+                    scope=rep.get("scope_filter") or "all", by_code_only=True
                 )
             except Exception:
                 logger.exception("Representative force-reserve outcome is unknown: %s", res_id)
@@ -406,17 +414,22 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             if not activated:
                 await query.answer("⚠️ وضعیت رزرو هم‌زمان تغییر کرده است؛ از اجرای مجدد خودداری کنید.", show_alert=True)
                 return
-            await query.answer(f"🚀 بسته رزرو اکانت {acc_code} با موفقیت فعال شد.", show_alert=True)
+            result_msg = f"🚀 بسته رزرو اکانت {acc_code} فعال شد."
         else:
-            cancel_res = database.cancel_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
-            if cancel_res:
-                res_data, new_bal = cancel_res
-                await query.answer(f"🗑 بسته رزرو لغو و {res_data['charge_amount']:,} ت عودت داده شد.", show_alert=True)
-            else:
-                await query.answer("⚠️ این بسته قبلاً لغو یا فعال شده است.", show_alert=True)
+            cancel_result = database.cancel_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
+            if not cancel_result:
+                await query.answer("⚠️ رزرو قبلاً تغییر وضعیت داده است.", show_alert=True)
+                return
+            res_data, new_bal = cancel_result
+            result_msg = f"🗑 رزرو {acc_code} لغو و {res_data['charge_amount']:,} تومان به تراز نماینده عودت داده شد."
 
-        # Refresh view
-        await handle_rep_callbacks(update, context, rep)
+        await query.answer(result_msg, show_alert=True)
+        await query.edit_message_text(
+            result_msg + "\n\nبرای مشاهده صف به‌روزشده از دکمه زیر استفاده کنید.",
+            reply_markup=build_back_to_rep_keyboard([
+                [InlineKeyboardButton("⏳ بازخوانی صف رزرو", callback_data="rep:reserves")]
+            ])
+        )
         return
 
     # 7. Wholesale Pricing Plans
