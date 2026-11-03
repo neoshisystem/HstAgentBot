@@ -237,3 +237,14 @@ def test_representative_sync_does_not_assign_ambiguous_accounts(isolated_db, mon
         ).fetchone()
     assert existing_owner == rep_b
     assert new_account is None
+
+
+def test_operation_lock_is_token_owned_and_persistent(isolated_db):
+    key = "user-buy:7007"
+    token = database.acquire_operation_lock(key, ttl_seconds=300)
+    assert token
+    assert database.acquire_operation_lock(key, ttl_seconds=300) is None
+    assert database.release_operation_lock(key, "not-the-token") is False
+    assert database.acquire_operation_lock(key, ttl_seconds=300) is None
+    assert database.release_operation_lock(key, token) is True
+    assert database.acquire_operation_lock(key, ttl_seconds=300)
