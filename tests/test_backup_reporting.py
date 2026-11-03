@@ -7,6 +7,7 @@ import time
 import pytest
 
 import backup
+import database
 
 
 class UploadResult:
@@ -239,6 +240,44 @@ def test_retention_prunes_only_verified_archives_and_keeps_one_valid_backup(tmp_
     assert len(remaining_valid) == 1
     assert os.path.isfile(remaining_valid[0] + ".sha256")
     assert corrupt.exists()
+
+
+def test_restore_preserves_hstagentbot_database_schema_and_settings(tmp_path, monkeypatch):
+    production_dir = tmp_path / "production"
+    production_dir.mkdir()
+    db_path = production_dir / "agent_bot.db"
+    monkeypatch.setattr(database, "DB_PATH", str(db_path))
+    monkeypatch.setattr(backup, "DB_PATH", str(db_path))
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setattr(backup, "BACKUP_DIR", str(backup_dir))
+    monkeypatch.setattr(backup, "BACKUPS_TOPIC_ID", 0)
+    database.init_db()
+    with database.get_db() as conn:
+        conn.execute(
+            "INSERT INTO system_settings(key, value, label, description) "
+            "VALUES ('backup_restore_probe', 'preserved', 'Probe', 'T10 restore test')"
+        )
+
+    result = backup.run_backup()
+    restored = backup.restore_backup_archive(
+        result["archive"], str(tmp_path / "isolated-application-restore")
+    )
+    restored_db = os.path.join(restored["destination"], "agent_bot.db")
+    connection = sqlite3.connect(restored_db)
+    try:
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert {"accounts", "payment_receipts", "financial_ledger", "receipt_notification_outbox"} <= tables
+        row = connection.execute(
+            "SELECT value FROM system_settings WHERE key='backup_restore_probe'"
+        ).fetchone()
+        assert row[0] == "preserved"
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        connection.close()
 
 
 def test_backup_requires_existing_database(tmp_path, monkeypatch):
