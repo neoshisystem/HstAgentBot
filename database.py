@@ -2048,6 +2048,111 @@ def mark_rep_action_intent_for_reconciliation(
         return cur.rowcount == 1
 
 
+def resolve_rep_action_intent(
+    intent_id: str,
+    actor_id: int,
+    actor_name: str,
+    resolution: str,
+    evidence_note: str,
+) -> dict:
+    """Evidence-gated resolution of an uncertain representative issuance."""
+    key = str(intent_id or "").strip()
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if not key:
+        raise ValueError("Representative intent ID is required")
+    if choice not in ("APPLIED", "REFUND_NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or REFUND_NOT_APPLIED")
+    prefix = "APPLIED:" if choice == "APPLIED" else "REFUND_NOT_APPLIED:"
+    if not note.startswith(prefix) or len(note) < len(prefix) + 15:
+        raise ValueError(
+            f"Evidence must start with {prefix} and contain at least 15 characters after it"
+        )
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM rep_action_intents
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (key,)).fetchone()
+        if not row:
+            raise ValueError("No unresolved representative intent with that ID was found")
+        intent = dict(row)
+        lock_key = str(intent.get("operation_lock_key") or "")
+        lock_token = str(intent.get("operation_lock_token") or "")
+        lock = cur.execute(
+            "SELECT token, created_at FROM operation_locks WHERE lock_key=?", (lock_key,)
+        ).fetchone()
+        if not lock_key or not lock_token or not lock or not secrets.compare_digest(str(lock["token"]), lock_token):
+            raise ValueError("Representative intent's exact operation lock is missing or ownership differs")
+
+        new_balance = None
+        if choice == "REFUND_NOT_APPLIED":
+            new_balance = _record_rep_ledger_entry(
+                cur,
+                int(intent["rep_id"]),
+                "",
+                "",
+                intent["plan_code"],
+                "credit",
+                int(intent["amount"]),
+                "استرداد پس از تطبیق مدیریتی؛ صدور خارجی انجام نشده است",
+                int(actor_id),
+                str(actor_name or "Super Admin"),
+            )
+            new_status = "refunded"
+            audit_action = "resolve_rep_action_intent_refund"
+        else:
+            new_status = "succeeded"
+            audit_action = "resolve_rep_action_intent_applied"
+
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (lock_key, lock_token)
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume representative intent lock")
+
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status=?, operation_lock_key=NULL, operation_lock_token=NULL,
+                result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (new_status, note[:500], key))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative intent resolution")
+
+        _insert_audit(
+            cur,
+            int(intent["rep_id"]),
+            str(intent.get("account_code") or ""),
+            str(intent.get("account_email") or ""),
+            audit_action,
+            int(actor_id),
+            str(actor_name or "Super Admin"),
+            {
+                "intent_id": key,
+                "actor_tg_id": int(intent["actor_tg_id"]),
+                "plan_code": intent["plan_code"],
+                "amount": int(intent["amount"]),
+                "resolution": choice,
+                "evidence_note": note,
+                "lock_key": lock_key,
+                "lock_created_at": lock["created_at"],
+                "new_balance": new_balance,
+            },
+            "success",
+        )
+        return {
+            "status": new_status,
+            "rep_id": int(intent["rep_id"]),
+            "amount": int(intent["amount"]),
+            "new_balance": new_balance,
+            "lock_key": lock_key,
+        }
+
+
 def refund_rep_action_intent(
     intent_id: str, rep_id: int, actor_tg_id: int,
     lock_key: str, token: str, actor_name: str = "Representative",
