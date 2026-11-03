@@ -447,10 +447,18 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  ایجاد: `{item['created_at']}` | انقضا: `{item['expires_at']}`"
         )
         if item.get("intent_id"):
-            owner_label = "نماینده" if item.get("intent_owner_type") == "representative" else "کاربر"
-            command = "/resolverepintent" if item.get("intent_owner_type") == "representative" else "/resolveintent"
+            owner_type = item.get("intent_owner_type")
+            action_type = item.get("action_type")
+            if owner_type == "representative" and action_type == "renew":
+                owner_label, command = "نماینده", "/resolvereprenewal"
+            elif owner_type == "representative":
+                owner_label, command = "نماینده", "/resolverepintent"
+            elif owner_type == "end_user":
+                owner_label, command = "کاربر", "/resolveintent"
+            else:
+                owner_label, command = "نامشخص", "/unlock"
             lines.append(
-                f"  ⚠️ Intent: `{item['intent_id']}` | نوع: {item.get('action_type')} "
+                f"  ⚠️ Intent: `{item['intent_id']}` | نوع: {action_type} "
                 f"| {owner_label} Telegram ID: `{item.get('user_id')}` | وضعیت: {item.get('intent_status')}"
             )
             lines.append(
@@ -459,7 +467,7 @@ async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     lines.append(
         "\nقفل‌های عادی را فقط پس از بررسی پنل و دیتابیس با /unlock حل کنید. "
-        "قفل‌های متصل به Intent کاربر را فقط با /resolveintent تعیین تکلیف کنید."
+        "قفل‌های Intent کاربر با /resolveintent، صدور نماینده با /resolverepintent و تمدید نماینده با /resolvereprenewal تعیین تکلیف می‌شوند."
     )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -610,6 +618,52 @@ async def resolve_rep_intent_cmd(update: Update, context: ContextTypes.DEFAULT_T
             f"✅ پیش‌پرداخت Intent `{intent_id}` مسترد شد؛ "
             f"{result['amount']:,} تومان به تراز نماینده {result['rep_id']} برگشت. "
             f"مانده جدید: {result['new_balance']:,} تومان؛ قفل نیز آزاد شد."
+        )
+
+
+async def resolve_rep_renewal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of an uncertain representative renewal precharge."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور (پس از تطبیق مستقیم اکانت در 3X-UI و دیتابیس):\n"
+            "`/resolvereprenewal <intent-id> APPLIED: مدرک تمدید موفق`\n"
+            "یا\n"
+            "`/resolvereprenewal <intent-id> REFUND_NOT_APPLIED: مدرک عدم اعمال تمدید`\n\n"
+            "APPLIED پیش‌پرداخت را حفظ می‌کند؛ REFUND_NOT_APPLIED اعتبار نماینده را به‌صورت اتمیک مسترد می‌کند. هر دو مسیر قفل دقیق عملیات را آزاد می‌کنند."
+        )
+        return
+
+    intent_id = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("REFUND_NOT_APPLIED:"):
+        resolution = "REFUND_NOT_APPLIED"
+    else:
+        await update.message.reply_text("⛔️ مدرک باید با APPLIED: یا REFUND_NOT_APPLIED: شروع شود.")
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_rep_renewal_intent,
+            intent_id, user.id, user.full_name or "Super Admin", resolution, evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف تمدید انجام نشد: {exc}")
+        return
+
+    if result["status"] == "succeeded":
+        await update.message.reply_text(
+            f"✅ تمدید نماینده `{intent_id}` به‌عنوان انجام‌شده ثبت شد؛ پیش‌پرداخت حفظ و قفل `{result['lock_key']}` آزاد شد. درخواست خارجی جدیدی ارسال نشد."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ پیش‌پرداخت تمدید `{intent_id}` به مبلغ {result['amount']:,} تومان مسترد شد. "
+            f"نماینده: {result['rep_id']} | مانده جدید: {result['new_balance']:,} تومان | قفل آزاد شد."
         )
 
 
@@ -2537,6 +2591,7 @@ def main():
     app.add_handler(CommandHandler("unlock", unlock_operation_cmd))
     app.add_handler(CommandHandler("resolveintent", resolve_user_intent_cmd))
     app.add_handler(CommandHandler("resolverepintent", resolve_rep_intent_cmd))
+    app.add_handler(CommandHandler("resolvereprenewal", resolve_rep_renewal_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
