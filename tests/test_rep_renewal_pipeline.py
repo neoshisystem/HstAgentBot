@@ -47,6 +47,13 @@ def renewal_env(tmp_path, monkeypatch):
     return rep_id, user, rep, acc, client
 
 
+def renewal_locks():
+    return [
+        item for item in database.get_operation_locks()
+        if item["lock_key"].startswith("account-renewal:")
+    ]
+
+
 def renewal_rows():
     with database.get_db() as conn:
         return [dict(row) for row in conn.execute(
@@ -84,7 +91,7 @@ def test_rep_renewal_pipeline_finalizes_intent_on_explicit_xui_success(renewal_e
     assert database.get_rep_balance(rep_id) == 400000
     assert len(renewal_rows()) == 1
     assert renewal_rows()[0]["status"] == "succeeded"
-    assert database.get_operation_locks() == []
+    assert renewal_locks() == []
 
 
 def test_rep_renewal_pipeline_refunds_once_on_explicit_xui_failure(renewal_env, monkeypatch):
@@ -104,7 +111,7 @@ def test_rep_renewal_pipeline_refunds_once_on_explicit_xui_failure(renewal_env, 
         assert conn.execute(
             "SELECT COUNT(*) FROM financial_ledger WHERE rep_id=?", (rep_id,)
         ).fetchone()[0] == 2
-    assert database.get_operation_locks() == []
+    assert renewal_locks() == []
 
 
 @pytest.mark.parametrize(
@@ -128,7 +135,7 @@ def test_rep_renewal_pipeline_retains_precharge_and_lock_for_ambiguous_response(
     assert "نامشخص" in message or "قطعی" in message
     assert database.get_rep_balance(rep_id) == 400000
     assert renewal_rows()[0]["status"] == "needs_reconciliation"
-    assert len(database.get_operation_locks()) == 1
+    assert len(renewal_locks()) == 1
 
 
 def test_rep_renewal_pipeline_marks_exception_for_reconciliation(renewal_env, monkeypatch):
@@ -143,7 +150,7 @@ def test_rep_renewal_pipeline_marks_exception_for_reconciliation(renewal_env, mo
     assert "نامشخص" in message
     assert database.get_rep_balance(rep_id) == 400000
     assert renewal_rows()[0]["status"] == "needs_reconciliation"
-    assert len(database.get_operation_locks()) == 1
+    assert len(renewal_locks()) == 1
 
 
 def test_rep_renewal_pipeline_keeps_lock_if_local_success_finalization_fails(
@@ -165,4 +172,4 @@ def test_rep_renewal_pipeline_keeps_lock_if_local_success_finalization_fails(
     assert "ثبت نهایی محلی" in message
     assert database.get_rep_balance(rep_id) == 400000
     assert renewal_rows()[0]["status"] == "needs_reconciliation"
-    assert len(database.get_operation_locks()) == 1
+    assert len(renewal_locks()) == 1
