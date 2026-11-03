@@ -2063,6 +2063,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     parts = data.split(":")
     action = parts[0]
+    renewal_confirmation_id = None
     # Reserve callbacks carry <reservation_id>:<account_email>; other account
     # callbacks carry the account identifier in parts[1].
     account_code = (
@@ -2099,22 +2100,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("⛔️ مالکیت یا محدوده اکانت برای این تمدید قابل تأیید نیست.", show_alert=True)
                 return
 
-        consumed = database.consume_account_renewal_confirmation(
-            intent_id, user.id, role, rep["id"] if rep else None
-        )
-        if consumed["status"] != "consumed":
-            messages = {
-                "not_found": "⛔️ درخواست تمدید معتبر نیست.",
-                "wrong_role": "⛔️ سطح دسترسی درخواست با حساب فعلی تطبیق ندارد.",
-                "wrong_representative": "⛔️ درخواست متعلق به نمایندگی دیگری است.",
-                "already_processed": "⛔️ این تأیید تمدید قبلاً استفاده شده است؛ برای تمدید تازه از منوی پلن اقدام کنید.",
-                "expired": "⌛️ تأیید تمدید منقضی شده است؛ دوباره از منوی پلن اقدام کنید.",
-                "plan_changed": "⚠️ تعرفه پس از نمایش تأیید تغییر کرده است؛ دوباره از منوی پلن اقدام کنید.",
-            }
-            await query.answer(messages.get(consumed["status"], "❌ تأیید تمدید قابل اجرا نیست."), show_alert=True)
+        if intent.get("status") != "pending":
+            await query.answer(
+                "⛔️ این تأیید تمدید قبلاً وارد مرحله پردازش شده یا تعیین تکلیف شده است.",
+                show_alert=True
+            )
             return
 
-        confirmed = consumed["intent"]
+        # Do not consume the token here. The downstream database transaction
+        # claims it atomically with a rep renewal intent, reservation, or admin lock.
+        renewal_confirmation_id = intent_id
+        confirmed = intent
         account_code = confirmed["account_email"]
         parts = ["qrenew_execute", account_code, confirmed["plan_code"]]
         action = "qrenew_execute"
@@ -2388,6 +2384,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role not in ("super_admin", "rep"):
             await query.answer("⛔️ عدم دسترسی", show_alert=True)
             return
+        if not renewal_confirmation_id:
+            await query.answer(
+                "⛔️ این دکمه قدیمی یا فاقد تأیید یک‌بارمصرف معتبر است؛ از کارت اکانت دوباره اقدام کنید.",
+                show_alert=True
+            )
+            return
         plan_code = parts[2] if len(parts) > 2 else ""
         plan = database.get_plan(plan_code)
         if not plan:
@@ -2397,7 +2399,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok, msg_out, keyboard = await process_account_renewal(
             user=user, role=role, rep=rep, acc_record=acc_record, client_info=client_info,
             gb=plan["gb"], days=plan["days"], plan_code=plan_code, effective_first=on_first,
-            curr_comment=curr_comment, comment_updated=False
+            curr_comment=curr_comment, comment_updated=False,
+            confirmation_id=renewal_confirmation_id,
         )
         await safe_edit_message(query, msg_out, reply_markup=keyboard)
         await query.answer("عملیات تمدید / صف رزرو پردازش شد.")
