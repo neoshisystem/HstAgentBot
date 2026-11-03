@@ -127,7 +127,9 @@ def get_db():
     finally:
         conn.close()
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db_parent = os.path.dirname(DB_PATH)
+    if db_parent:
+        os.makedirs(db_parent, exist_ok=True)
     with get_db() as conn:
         cur = conn.cursor()
         
