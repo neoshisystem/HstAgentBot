@@ -137,38 +137,47 @@ def generate_qr_code(payload: str):
 
 
 def reset_client_subscription(xui_module, account_identifier: str, scope: str = "all") -> dict:
-    """Resolve an account identifier, rotate its subscription ID and return one stable result shape."""
-    if not account_identifier:
+    """Return ok, partial, error or unknown without losing a possibly rotated token."""
+    if not str(account_identifier or "").strip():
         return {"status": "error", "message": "شناسه اکانت مشخص نشده است."}
     try:
         search = xui_module.find_client_by_code(account_identifier)
-        if not search or not search.get("found"):
+        if not isinstance(search, dict) or not search.get("found"):
             return {"status": "error", "message": "اکانت موردنظر در پنل یافت نشد."}
         data = search.get("data") or {}
         raw = data.get("raw") or {}
         email = data.get("email") or raw.get("email") or account_identifier
+        applied, message, new_sub_id = reset_client_sub_id(
+            xui_module, email, initial_search=search
+        )
+        if applied is None:
+            return {
+                "status": "unknown", "message": message,
+                "candidate_sub_id": new_sub_id, "email": email,
+            }
+        if not applied:
+            return {"status": "error", "message": message, "email": email}
 
-        url_builder = getattr(xui_module, "get_sub_url", None)
-        if not callable(url_builder) and not get_subscription_url("probe"):
-            return {"status": "error", "message": "دامنه سابسکریپشن در تنظیمات سامانه تعریف نشده است."}
+        # A missing public URL does not undo a confirmed remote rotation.
+        new_url = ""
+        builder = getattr(xui_module, "get_sub_url", None)
+        try:
+            if callable(builder):
+                new_url = str(builder(new_sub_id) or "")
+            if not new_url:
+                new_url = get_subscription_url(new_sub_id)
+        except Exception:
+            logger.exception("Could not build the new public URL for %s", email)
 
-        ok, message, new_sub_id = reset_client_sub_id(xui_module, email)
-        if not ok:
-            return {"status": "error", "message": message}
-        new_url = url_builder(new_sub_id) if callable(url_builder) else get_subscription_url(new_sub_id)
         if not new_url:
             return {
-                "status": "partial",
-                "message": "شناسه سابسکریپشن تغییر کرد، اما ساخت لینک جدید ممکن نشد؛ تنظیمات دامنه را بررسی کنید.",
-                "new_sub_id": new_sub_id,
+                "status": "partial", "message": "شناسه جدید در پنل تأیید شد، اما لینک عمومی ساخته نشد.",
+                "new_sub_id": new_sub_id, "email": email,
             }
         return {
-            "status": "ok",
-            "message": message,
-            "new_sub_id": new_sub_id,
-            "new_sub_url": new_url,
-            "email": email,
+            "status": "ok", "message": message, "new_sub_id": new_sub_id,
+            "new_sub_url": new_url, "email": email,
         }
     except Exception as exc:
-        logger.exception("Failed to reset subscription for %s", account_identifier)
-        return {"status": "error", "message": str(exc)}
+        logger.exception("Subscription reset outcome could not be established for %s", account_identifier)
+        return {"status": "unknown", "message": str(exc)}
