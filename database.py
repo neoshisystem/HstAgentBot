@@ -872,13 +872,18 @@ def acquire_operation_lock(lock_key: str, ttl_seconds: int | None = 300) -> str 
 
 
 def get_operation_locks() -> list[dict]:
-    """List current operation leases without exposing their private ownership tokens."""
+    """List active operation leases and linked recovery intent metadata, never tokens."""
     with get_db() as conn:
         rows = conn.execute("""
-            SELECT lock_key, expires_at, created_at
-            FROM operation_locks
-            WHERE expires_at > ?
-            ORDER BY created_at ASC
+            SELECT o.lock_key, o.expires_at, o.created_at,
+                   i.intent_id, i.action_type, i.user_id,
+                   i.account_code, i.status AS intent_status
+            FROM operation_locks o
+            LEFT JOIN user_action_intents i
+              ON i.operation_lock_key = o.lock_key
+             AND i.operation_lock_token = o.token
+            WHERE o.expires_at > ?
+            ORDER BY o.created_at ASC
         """, (time.time(),)).fetchall()
         return [dict(row) for row in rows]
 
@@ -900,6 +905,20 @@ def resolve_operation_lock(
         ).fetchone()
         if not row:
             return False
+        linked_intent = cur.execute("""
+            SELECT intent_id, status FROM user_action_intents
+            WHERE operation_lock_key = ?
+              AND operation_lock_token = (
+                  SELECT token FROM operation_locks WHERE lock_key = ?
+              )
+              AND status IN ('processing', 'needs_reconciliation')
+            LIMIT 1
+        """, (key, key)).fetchone()
+        if linked_intent:
+            raise ValueError(
+                f"Operation lock belongs to user action intent {linked_intent['intent_id']} "
+                f"({linked_intent['status']}); use /resolveintent so wallet and intent state are reconciled together"
+            )
         cur.execute(
             "DELETE FROM operation_locks WHERE lock_key = ?",
             (key,)
@@ -1762,6 +1781,117 @@ def mark_user_action_intent_for_reconciliation(
         if cur.rowcount != 1:
             raise RuntimeError("Could not mark user action for reconciliation")
         return True
+
+
+def resolve_user_action_intent(
+    intent_id: str,
+    actor_id: int,
+    actor_name: str,
+    resolution: str,
+    evidence_note: str,
+) -> dict:
+    """Resolve an uncertain user action with evidence and atomic wallet/lock semantics.
+
+    APPLIED keeps the existing debit and marks the action succeeded.
+    REFUND_NOT_APPLIED credits the wallet, writes the ledger and marks the action
+    refunded. Both paths consume the exact operation-lock token in one transaction.
+    """
+    key = str(intent_id or "").strip()
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if not key:
+        raise ValueError("A user action intent ID is required")
+    if choice not in ("APPLIED", "REFUND_NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or REFUND_NOT_APPLIED")
+    expected_prefix = "APPLIED:" if choice == "APPLIED" else "REFUND_NOT_APPLIED:"
+    if not note.startswith(expected_prefix) or len(note) < len(expected_prefix) + 15:
+        raise ValueError(
+            f"Evidence must start with {expected_prefix} and contain at least 15 characters after it"
+        )
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent_row = cur.execute("""
+            SELECT * FROM user_action_intents
+            WHERE intent_id = ? AND status IN ('processing', 'needs_reconciliation')
+        """, (key,)).fetchone()
+        if not intent_row:
+            raise ValueError("No unresolved user action intent with that ID was found")
+        intent = dict(intent_row)
+        lock_key = str(intent.get("operation_lock_key") or "")
+        lock_token = str(intent.get("operation_lock_token") or "")
+        if not lock_key or not lock_token:
+            raise ValueError("The unresolved intent has no matching operation-lock ownership data")
+
+        lock = cur.execute(
+            "SELECT token, created_at FROM operation_locks WHERE lock_key = ?",
+            (lock_key,)
+        ).fetchone()
+        if not lock or not secrets.compare_digest(str(lock["token"]), lock_token):
+            raise ValueError("The intent's exact operation lock is missing or has different ownership")
+
+        new_balance = None
+        if choice == "REFUND_NOT_APPLIED":
+            new_balance = _credit_user_wallet(
+                cur,
+                int(intent["user_id"]),
+                int(intent["amount"]),
+                "استرداد پس از تطبیق مدیریتی؛ عملیات خارجی انجام نشده است",
+                int(actor_id),
+                str(actor_name or "Super Admin"),
+            )
+            new_status = "refunded"
+            audit_action = "resolve_user_action_intent_refund"
+        else:
+            new_status = "succeeded"
+            audit_action = "resolve_user_action_intent_applied"
+
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ? AND token = ?",
+            (lock_key, lock_token)
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume the exact user action operation lock")
+
+        cur.execute("""
+            UPDATE user_action_intents
+            SET status = ?, operation_lock_key = NULL, operation_lock_token = NULL,
+                result_note = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND status IN ('processing', 'needs_reconciliation')
+        """, (new_status, note[:500], key))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize the user action intent resolution")
+
+        _insert_audit(
+            cur,
+            rep_id=None,
+            account_code=str(intent.get("account_code") or ""),
+            email=str(intent.get("account_email") or ""),
+            action=audit_action,
+            actor_id=int(actor_id),
+            actor_name=str(actor_name or "Super Admin"),
+            details={
+                "intent_id": key,
+                "user_id": int(intent["user_id"]),
+                "action_type": intent["action_type"],
+                "plan_code": intent["plan_code"],
+                "amount": int(intent["amount"]),
+                "resolution": choice,
+                "evidence_note": note,
+                "lock_key": lock_key,
+                "lock_created_at": lock["created_at"],
+                "new_balance": new_balance,
+            },
+            result_status="success",
+        )
+        return {
+            "status": new_status,
+            "user_id": int(intent["user_id"]),
+            "amount": int(intent["amount"]),
+            "new_balance": new_balance,
+            "lock_key": lock_key,
+        }
 
 
 def refund_user_wallet_and_release_operation_lock(
