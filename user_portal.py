@@ -293,7 +293,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
     # 2.4 Reset Sub — persist only a confirmed remote rotation.
     elif action == "reset_sub":
         acc_code = parts[2] if len(parts) > 2 else ""
-        lock_key = f"subscription-reset:{str(owned_account['account_code']).lower()}"
+        lock_key = f"subscription-reset:{str(owned_account['email']).lower()}"
         lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
             await query.answer("⏳ بازنشانی لینک این سرویس در حال انجام یا نیازمند تطبیق است؛ دوباره تلاش نکنید.", show_alert=True)
