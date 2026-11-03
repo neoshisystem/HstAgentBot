@@ -893,13 +893,38 @@ async def process_account_renewal(
     if is_depleted:
         rem_gb = 0.0
 
+    # Renewals must always use a currently approved plan. Do not invent a
+    # fallback price or allow free-form/unlisted volume-duration combinations.
     plan = database.get_plan(plan_code)
-    plan_name = plan["name"] if plan else f"{int(gb)} گیگ {int(days)} روزه"
-    charge = plan["rep_price"] if plan else int(gb * 15000)
+    pending_res = database.get_pending_reservation(account_code)
+    keyboard = nlp_matcher.build_account_keyboard(
+        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+        role=role, pending_res=pending_res
+    )
+    if not plan or not bool(plan.get("is_active", 1)):
+        return False, "⛔️ پلن تمدید تعریف نشده یا غیرفعال است؛ لطفاً یکی از پلن‌های فعال و مصوب را انتخاب کنید.", keyboard
+    try:
+        requested_gb = float(gb)
+        requested_days = float(days)
+        plan_gb = float(plan["gb"])
+        plan_days = int(plan["days"])
+        charge = int(plan["rep_price"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False, "⛔️ اطلاعات پلن تمدید معتبر نیست؛ عملیات انجام نشد.", keyboard
+    if (
+        requested_gb <= 0
+        or requested_days <= 0
+        or requested_days != plan_days
+        or abs(requested_gb - plan_gb) > 1e-9
+    ):
+        return False, "⛔️ مشخصات حجم یا مدت با پلن مصوب مطابقت ندارد؛ عملیات انجام نشد.", keyboard
+    plan_name = str(plan["name"])
 
     # 3. Decision Logic:
     target_rep_id = acc_record.get("rep_id")
     is_admin_exempt = is_super_admin or (target_rep_id is None)
+    if not is_admin_exempt and charge <= 0:
+        return False, "⛔️ قیمت پلن برای نمایندگی معتبر نیست؛ با مدیریت تماس بگیرید.", keyboard
 
     # Representative Credit Limit Enforcement
     if not is_admin_exempt and target_rep_id:
