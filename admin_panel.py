@@ -576,31 +576,66 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
     # 13. Admin Force/Cancel Reserve Actions
     elif action == "force_res":
-        res_id = int(parts[2])
+        try:
+            res_id = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("شناسه رزرو نامعتبر است.", show_alert=True)
+            return
         acc_code = parts[3] if len(parts) > 3 else ""
         res_item = database.get_reservation_by_id(res_id)
-        if not res_item or res_item["status"] != "pending":
-            await query.answer("⚠️ این بسته قبلاً فعال یا لغو شده است.", show_alert=True)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+        ):
+            await query.answer("⚠️ رزرو در انتظار یافت نشد یا اطلاعات حساب با آن تطبیق ندارد.", show_alert=True)
             return
-        
+
+        lock_key = f"reservation-activation:{res_id}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=900)
+        if not lock_token:
+            await query.answer("⏳ این رزرو در حال فعال‌سازی است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
+            return
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+        ):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer("⚠️ وضعیت رزرو تغییر کرده است؛ عملیات متوقف شد.", show_alert=True)
+            return
+
         email = res_item["email"]
         gb = res_item["gb"]
         days = res_item["days"]
         on_first = bool(res_item.get("on_first_connect", 0))
-        ren_res = await asyncio.to_thread(
-            xui_manager.renew_client,
-            email, gb, days, comment=None, rollover=False, countdown=True if on_first else "auto",
-            scope="all", by_code_only=True
-        )
+        try:
+            ren_res = await asyncio.to_thread(
+                xui_manager.renew_client,
+                email, gb, days, comment=None, rollover=False,
+                countdown=True if on_first else "auto", scope="all", by_code_only=True
+            )
+        except Exception:
+            logger.exception("Admin force-reserve outcome is unknown: %s", res_id)
+            await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
+            return
+        if isinstance(ren_res, dict) and (
+            ren_res.get("status") in ("error", "failed", "failure")
+            or ren_res.get("success") is False
+        ):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer("❌ پنل فعال‌سازی رزرو را رد کرد؛ رزرو در صف باقی ماند.", show_alert=True)
+            return
         if not isinstance(ren_res, dict) or not (
             ren_res.get("status") in ("success", "ok") or ren_res.get("success") is True
         ):
-            await query.answer("⚠️ پنل موفقیت فعال‌سازی را تایید نکرد؛ رزرو در صف باقی ماند.", show_alert=True)
+            await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
             return
+
         activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Admin")
         if not activated:
-            await query.answer("⚠️ وضعیت رزرو هم‌زمان تغییر کرده است؛ دوباره اجرا نکنید.", show_alert=True)
+            await query.answer("⚠️ پنل عملیات را انجام داد اما ثبت فعال‌سازی ناموفق بود؛ قفل تطبیق حفظ شد.", show_alert=True)
             return
+        database.release_operation_lock(lock_key, lock_token)
         await query.answer(f"🚀 بسته رزرو اکانت {acc_code} فعال شد.", show_alert=True)
         await query.edit_message_text(
             f"✅ فعال‌سازی رزرو `{acc_code}` ثبت شد. برای مشاهده صف به‌روزشده، از دکمه زیر استفاده کنید.",
