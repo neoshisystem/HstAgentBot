@@ -32,7 +32,6 @@ import rep_panel
 import user_portal
 import finance_manager
 import sub_manager
-from watchdog_service import WatchdogService
 
 from server_integrations import load_integration
 xui_manager = load_integration("xui_manager")
@@ -1993,32 +1992,75 @@ async def watchdog_worker(application: Application):
                         reason = f"اتمام حجم (باقیمانده: {rem_gb:.2f} GB)"
 
                     if trigger:
-                        logger.info(f"Watchdog auto-activating reserve package for {email} ({reason})")
-                        gb = res["gb"]
-                        days = res["days"]
-                        on_first = bool(res.get("on_first_connect", 0))
-
-                        ren_res = await asyncio.to_thread(
-                            xui_manager.renew_client,
-                            email, gb, days, comment=None, rollover=False,
-                            countdown=True if on_first else "auto",
-                            scope="all", by_code_only=True
-                        )
-                        if not _xui_operation_succeeded(ren_res):
-                            logger.error(
-                                "Watchdog did not receive a confirmed X-UI success for reservation %s; "
-                                "leaving it pending for reconciliation (response=%r)",
-                                res["id"], ren_res
+                        res_id = int(res["id"])
+                        lock_key = f"reservation-activation:{res_id}"
+                        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=900)
+                        if not lock_token:
+                            logger.info(
+                                "Watchdog skipped reservation %s because another activation/reconciliation owns it",
+                                res_id
                             )
                             continue
-                        activated = database.activate_reservation(res["id"], actor_id=0, actor_name="watchdog")
-                        if not activated:
-                            logger.warning("Reservation %s changed state before watchdog commit", res["id"])
+
+                        # Re-read the reservation after acquiring the same lease used by
+                        # manual activation and cancellation; this closes the race.
+                        current_res = database.get_reservation_by_id(res_id)
+                        if not current_res or current_res.get("status") != "pending":
+                            database.release_operation_lock(lock_key, lock_token)
+                            continue
+                        email = current_res["email"]
+                        gb = current_res["gb"]
+                        days = current_res["days"]
+                        on_first = bool(current_res.get("on_first_connect", 0))
+                        logger.info(f"Watchdog auto-activating reserve package for {email} ({reason})")
+
+                        try:
+                            ren_res = await asyncio.to_thread(
+                                xui_manager.renew_client,
+                                email, gb, days, comment=None, rollover=False,
+                                countdown=True if on_first else "auto",
+                                scope="all", by_code_only=True
+                            )
+                        except Exception:
+                            # The request may have reached the panel. Keep the lease
+                            # so another actor cannot blindly issue the same renewal.
+                            logger.exception(
+                                "Watchdog outcome is unknown for reservation %s; activation lease retained",
+                                res_id
+                            )
                             continue
 
-                        account_code = res["account_code"]
-                        plan_name = res["plan_name"]
-                        rep_id = res["rep_id"]
+                        if _xui_operation_failed(ren_res):
+                            database.release_operation_lock(lock_key, lock_token)
+                            logger.error(
+                                "Watchdog received a definite X-UI failure for reservation %s; "
+                                "reservation remains pending (response=%r)",
+                                res_id, ren_res
+                            )
+                            continue
+
+                        if not _xui_operation_succeeded(ren_res):
+                            logger.error(
+                                "Watchdog received an ambiguous X-UI result for reservation %s; "
+                                "activation lease retained (response=%r)",
+                                res_id, ren_res
+                            )
+                            continue
+
+                        activated = database.activate_reservation(
+                            res_id, actor_id=0, actor_name="watchdog"
+                        )
+                        if not activated:
+                            logger.error(
+                                "X-UI renewed reservation %s but database activation failed; lease retained",
+                                res_id
+                            )
+                            continue
+                        database.release_operation_lock(lock_key, lock_token)
+
+                        account_code = current_res["account_code"]
+                        plan_name = current_res["plan_name"]
+                        rep_id = current_res["rep_id"]
                         rep_info = database.get_rep_by_id(rep_id)
 
                         log_msg = (
