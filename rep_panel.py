@@ -549,52 +549,29 @@ async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_T
 
     if action == "awaiting_new_acc_name":
         plan_code = rep_state["plan_code"]
-        context.user_data["rep_temp_name"] = msg_text
-        context.user_data.pop("rep_state", None)
-
-        # Trigger issue directly with provided name
         plan = database.get_plan(plan_code)
-        gb = plan["gb"]
-        days = plan["days"]
-        scope_for_alloc = rep.get("scope_filter") or "all"
-
-        alloc_res = await asyncio.to_thread(xui_manager.allocate_pool_client, gb, days, comment=msg_text, scope=scope_for_alloc)
-        if alloc_res.get("status") == "success":
-            email = alloc_res.get("email")
-            sub_id = alloc_res.get("sub_id")
-            code = xui_manager.extract_account_identifier(email) or email
-
-            database.upsert_account_record(
-                rep_id=rep["id"],
-                email=email,
-                account_code=code,
-                customer_name=msg_text,
-                sub_id=sub_id,
-                enable=1,
-                total_gb=gb,
-                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
-            )
-
-            new_bal = database.record_ledger_entry(
-                rep_id=rep["id"],
-                account_code=code,
-                email=email,
-                plan_code=plan_code,
-                tx_type="debit",
-                amount=plan["rep_price"],
-                description=f"صدور اکانت جدید {int(gb)}G/{int(days)}D ({msg_text})",
-                actor_id=update.effective_user.id,
-                actor_name=update.effective_user.full_name or "Rep"
-            )
-
-            deliv_text = alloc_res.get("deliverable", "")
-            deliv_text += f"\n\n🧾 **فاکتور:** `{plan['rep_price']:,} تومان` | **مانده بدهی جدید:** `{new_bal:,} تومان`"
-            keyboard = nlp_matcher.build_account_keyboard(code, is_enabled=True, on_first_connect=False, role="rep")
-            await update.message.reply_text(deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        else:
-            await update.message.reply_text(f"❌ خطا: {alloc_res.get('message', 'موجودی استخر تمام شده است')}")
+        context.user_data.pop("rep_state", None)
+        if not plan:
+            context.user_data.pop("rep_temp_name", None)
+            await update.message.reply_text("❌ پلن انتخاب‌شده دیگر در دسترس نیست.")
+            return True
+        context.user_data["rep_temp_name"] = msg_text
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"✅ تایید صدور با هزینه {plan['rep_price']:,} تومان",
+                callback_data=f"rep:issue_acc_direct:{plan_code}"
+            )],
+            [InlineKeyboardButton("❌ انصراف", callback_data="rep:new_acc_plans")]
+        ])
+        await update.message.reply_text(
+            f"👤 **نام مشتری:** {msg_text}\n"
+            f"📦 **پلن:** {plan['name']} ({plan['gb']} گیگ / {plan['days']} روز)\n"
+            f"💳 **هزینه:** {plan['rep_price']:,} تومان\n\n"
+            "برای ادامه، صدور را تایید کنید. مبلغ پیش از درخواست به پنل، با کنترل سقف اعتبار ثبت می‌شود.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard
+        )
         return True
-
     elif action == "awaiting_search_query":
         context.user_data.pop("rep_state", None)
         insp = await asyncio.to_thread(xui_manager.inspect_client, msg_text, scope=rep.get("scope_filter", "all"), by_code_only=False)
