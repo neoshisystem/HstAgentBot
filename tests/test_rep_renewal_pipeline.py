@@ -23,6 +23,16 @@ def renewal_env(tmp_path, monkeypatch):
     database.add_or_update_plan(
         "pipeline_20gb_30d", "Pipeline 20G", 20, 30, 400000, 600000, is_quick=1
     )
+    database.upsert_account_record(
+        rep_id=rep_id,
+        email="pipe-001@example.test",
+        account_code="PIPE-001",
+        customer_name="Pipeline Customer",
+        sub_id="pipe-sub",
+        enable=1,
+        total_gb=20,
+        expiry_time=0,
+    )
 
     user = SimpleNamespace(id=88001, full_name="Pipeline Rep", username="pipeline")
     rep = {"id": rep_id, "name": "Pipeline Representative", "scope_filter": "all"}
@@ -173,3 +183,114 @@ def test_rep_renewal_pipeline_keeps_lock_if_local_success_finalization_fails(
     assert database.get_rep_balance(rep_id) == 400000
     assert renewal_rows()[0]["status"] == "needs_reconciliation"
     assert len(renewal_locks()) == 1
+
+def make_rep_confirmation(rep_id):
+    plan = database.get_plan("pipeline_20gb_30d")
+    return database.create_account_renewal_confirmation(
+        actor_id=88001,
+        actor_role="rep",
+        rep_id=rep_id,
+        account_code="PIPE-001",
+        account_email="pipe-001@example.test",
+        plan_code=plan["plan_code"],
+        plan_name=plan["name"],
+        gb=plan["gb"],
+        days=plan["days"],
+        amount=plan["rep_price"],
+    )
+
+
+def test_quick_confirmation_claims_rep_immediate_renewal_before_xui(renewal_env, monkeypatch):
+    rep_id = renewal_env[0]
+    token = make_rep_confirmation(rep_id)
+    monkeypatch.setattr(
+        rep_bot, "xui_manager",
+        SimpleNamespace(renew_client=lambda *args, **kwargs: {"status": "success", "report": "renewed"}),
+    )
+    ok, _, _ = asyncio.run(rep_bot.process_account_renewal(
+        user=renewal_env[1], role="rep", rep=renewal_env[2],
+        acc_record=renewal_env[3], client_info=renewal_env[4],
+        gb=20, days=30, plan_code="pipeline_20gb_30d",
+        effective_first=False, curr_comment="Pipeline Customer",
+        confirmation_id=token,
+    ))
+    confirmation = database.get_account_renewal_confirmation(token, 88001)
+    assert ok is True
+    assert confirmation["status"] == "succeeded"
+    assert confirmation["operation_ref_type"] == "rep_renewal"
+    assert database.get_rep_balance(rep_id) == 400000
+
+
+def test_quick_confirmation_claims_rep_reservation_atomically(renewal_env, monkeypatch):
+    rep_id, user, rep, acc, client = renewal_env
+    token = make_rep_confirmation(rep_id)
+    client.update({
+        "remaining_gb": 10,
+        "days_left": 10,
+        "is_expired": False,
+        "is_depleted": False,
+        "enabled": True,
+    })
+    monkeypatch.setattr(
+        rep_bot, "xui_manager",
+        SimpleNamespace(renew_client=lambda *args, **kwargs: {"status": "success", "report": "not-called"}),
+    )
+    ok, message, _ = asyncio.run(rep_bot.process_account_renewal(
+        user=user, role="rep", rep=rep, acc_record=acc, client_info=client,
+        gb=20, days=30, plan_code="pipeline_20gb_30d",
+        effective_first=False, curr_comment="Pipeline Customer",
+        confirmation_id=token,
+    ))
+    confirmation = database.get_account_renewal_confirmation(token, 88001)
+    assert ok is True
+    assert "بسته رزرو" in message
+    assert confirmation["status"] == "reserved"
+    assert confirmation["operation_ref_type"] == "reservation"
+    assert database.get_rep_balance(rep_id) == 400000
+
+
+def test_super_admin_quick_confirmation_claims_direct_renewal_without_rep_debit(
+    renewal_env, monkeypatch
+):
+    database.upsert_account_record(
+        rep_id=None,
+        email="admin-pipe@example.test",
+        account_code="ADMIN-PIPE",
+        customer_name="Admin Customer",
+        sub_id="admin-pipe-sub",
+        enable=1,
+        total_gb=20,
+        expiry_time=0,
+    )
+    plan = database.get_plan("pipeline_20gb_30d")
+    token = database.create_account_renewal_confirmation(
+        actor_id=9000, actor_role="super_admin", rep_id=None,
+        account_code="ADMIN-PIPE", account_email="admin-pipe@example.test",
+        plan_code=plan["plan_code"], plan_name=plan["name"],
+        gb=plan["gb"], days=plan["days"], amount=plan["rep_price"],
+    )
+    admin_user = SimpleNamespace(id=9000, full_name="Super Admin", username="admin")
+    admin_acc = {
+        "rep_id": None, "account_code": "ADMIN-PIPE", "email": "admin-pipe@example.test",
+    }
+    admin_client = {
+        "remaining_gb": 0, "days_left": 0, "is_expired": True,
+        "is_depleted": False, "enabled": True,
+    }
+    monkeypatch.setattr(
+        rep_bot, "xui_manager",
+        SimpleNamespace(renew_client=lambda *args, **kwargs: {"status": "success", "report": "renewed"}),
+    )
+    ok, _, _ = asyncio.run(rep_bot.process_account_renewal(
+        user=admin_user, role="super_admin", rep=None, acc_record=admin_acc,
+        client_info=admin_client, gb=plan["gb"], days=plan["days"],
+        plan_code=plan["plan_code"], effective_first=False,
+        curr_comment="Admin Customer", confirmation_id=token,
+    ))
+    confirmation = database.get_account_renewal_confirmation(token, 9000)
+    assert ok is True
+    assert confirmation["status"] == "succeeded"
+    assert confirmation["operation_ref_type"] == "admin_renewal"
+    assert database.get_rep_balance(renewal_env[0]) == 0
+    assert not any(item["lock_key"] == "account-renewal:admin-pipe" for item in database.get_operation_locks())
+
