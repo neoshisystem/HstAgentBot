@@ -13,7 +13,7 @@ def isolated_db(tmp_path, monkeypatch):
             """
             INSERT INTO representatives
                 (rep_code, name, telegram_id, scope_filter, is_active, balance_toman, credit_limit_toman)
-            VALUES ('state-rep', 'State Representative', 84002, 'all', 1, 0, 5_000_000)
+            VALUES ('state-rep', 'State Representative', 84002, 'all', 1, 0, 5000000)
             """
         ).lastrowid
     database.add_or_update_plan("state_plan", "State Plan", 10, 30, 100_000, 150_000)
