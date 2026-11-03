@@ -69,10 +69,19 @@ def _record_rep_ledger_entry(cur, rep_id, account_code, email, plan_code, tx_typ
         raise ValueError("Financial ledger amount must be a positive integer")
     if tx_type not in ("debit", "credit"):
         raise ValueError("Unsupported representative transaction type")
-    rep = cur.execute("SELECT balance_toman FROM representatives WHERE id = ?", (rep_id,)).fetchone()
+    rep = cur.execute(
+        "SELECT balance_toman, credit_limit_toman FROM representatives WHERE id = ?",
+        (rep_id,)
+    ).fetchone()
     if not rep:
         raise ValueError("Representative not found")
     current = int(rep["balance_toman"] or 0)
+    if tx_type == "debit":
+        limit = int(rep["credit_limit_toman"] if rep["credit_limit_toman"] is not None else 5_000_000)
+        if limit > 0 and current + amount > limit:
+            raise ValueError(
+                f"Representative credit limit exceeded: current={current}, charge={amount}, limit={limit}"
+            )
     new_balance = current + amount if tx_type == "debit" else current - amount
     cur.execute("""
         INSERT INTO financial_ledger
