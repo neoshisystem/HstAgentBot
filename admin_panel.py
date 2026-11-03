@@ -103,6 +103,24 @@ def get_build_info() -> dict:
     }
 
 async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message=False):
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat or chat.type != "private":
+        notice = "⛔️ پنل مدیریت فقط در گفت‌وگوی خصوصی ربات قابل استفاده است."
+        if update.callback_query:
+            await update.callback_query.answer(notice, show_alert=True)
+        elif update.message:
+            await update.message.reply_text(notice)
+        return
+    role, _ = database.get_user_role(user.id, chat.id, None)
+    if role != "super_admin":
+        notice = "⛔️ دسترسی فقط برای مدیریت کل سیستم مجاز است."
+        if update.callback_query:
+            await update.callback_query.answer(notice, show_alert=True)
+        elif update.message:
+            await update.message.reply_text(notice)
+        return
+
     with database.get_db() as conn:
         cur = conn.cursor()
         total_accs = cur.execute("SELECT count(*) FROM accounts").fetchone()[0]
@@ -140,7 +158,17 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     user = update.effective_user
     chat = update.effective_chat
-    
+    if not user or not chat or chat.type != "private":
+        await query.answer(
+            "⛔️ پنل مدیریت فقط در گفت‌وگوی خصوصی ربات قابل استفاده است.",
+            show_alert=True
+        )
+        return
+    role, _ = database.get_user_role(user.id, chat.id, None)
+    if role != "super_admin":
+        await query.answer("⛔️ دسترسی فقط برای مدیریت کل سیستم مجاز است.", show_alert=True)
+        return
+
     data = query.data or ""
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else "main"
@@ -653,15 +681,22 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
                     f"  ثبت: `{r['created_at'][:16]}` | فاکتور: `{r['charge_amount']:,} ت`"
                 )
                 extra_btns.append([
-                    InlineKeyboardButton(f"🚀 فعال‌سازی فوری {r['account_code']}", callback_data=f"admin:force_res:{r['id']}:{r['account_code']}"),
-                    InlineKeyboardButton(f"🗑 لغو و عودت {r['account_code']}", callback_data=f"admin:cancel_res:{r['id']}:{r['account_code']}")
+                    InlineKeyboardButton(f"🚀 فعال‌سازی فوری {r['account_code']}", callback_data=f"admin:confirm_force_res:{r['id']}:{r['account_code']}"),
+                    InlineKeyboardButton(f"🗑 لغو و عودت {r['account_code']}", callback_data=f"admin:confirm_cancel_res:{r['id']}:{r['account_code']}")
                 ])
             keyboard = build_back_to_admin_keyboard(extra_btns)
             await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             await query.answer("صف بسته‌های رزرو")
 
-    # 13. Admin Force/Cancel Reserve Actions
-    elif action == "force_res":
+    # 13. Reservation actions require a separate confirmation click.
+    elif action in ("force_res", "cancel_res"):
+        await query.answer(
+            "⚠️ این دکمه قدیمی است و اجرا نشد. صف رزرو را بازخوانی کنید و تأیید دو مرحله‌ای را انجام دهید.",
+            show_alert=True
+        )
+        return
+
+    elif action in ("confirm_force_res", "confirm_cancel_res"):
         try:
             res_id = int(parts[2])
         except (IndexError, ValueError):
@@ -673,7 +708,60 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             not res_item or res_item.get("status") != "pending"
             or str(res_item.get("account_code", "")).lower() != acc_code.lower()
         ):
-            await query.answer("⚠️ رزرو در انتظار یافت نشد یا اطلاعات حساب با آن تطبیق ندارد.", show_alert=True)
+            await query.answer(
+                "⚠️ رزرو در انتظار یافت نشد یا اطلاعات حساب با آن تطبیق ندارد.",
+                show_alert=True
+            )
+            return
+
+        if action == "confirm_force_res":
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🚀 تأیید فعال‌سازی فوری در پنل",
+                    callback_data=f"admin:do_force_res:{res_id}:{acc_code}"
+                )],
+                [InlineKeyboardButton("❌ انصراف / بازگشت به صف", callback_data="admin:reserves")]
+            ])
+            prompt = (
+                f"⚠️ **تأیید فعال‌سازی فوری بسته رزرو**\n\n"
+                f"اکانت: `{acc_code}`\n"
+                f"پلن: **{res_item['plan_name']}** ({res_item['gb']}G / {res_item['days']}D)\n\n"
+                "با تأیید، درخواست تمدید فوراً به پنل X-UI ارسال می‌شود."
+            )
+        else:
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"🗑 تأیید لغو و عودت {int(res_item.get('charge_amount') or 0):,} تومان",
+                    callback_data=f"admin:do_cancel_res:{res_id}:{acc_code}"
+                )],
+                [InlineKeyboardButton("❌ انصراف / بازگشت به صف", callback_data="admin:reserves")]
+            ])
+            prompt = (
+                f"⚠️ **تأیید لغو بسته رزرو و عودت وجه**\n\n"
+                f"اکانت: `{acc_code}`\n"
+                f"پلن: **{res_item['plan_name']}**\n"
+                f"مبلغ قابل عودت: **{int(res_item.get('charge_amount') or 0):,} تومان**\n\n"
+                "با تأیید، رزرو لغو و اعتبار نماینده به‌روزرسانی می‌شود."
+            )
+        await query.edit_message_text(
+            prompt, parse_mode=ParseMode.MARKDOWN, reply_markup=buttons
+        )
+        await query.answer("لطفاً عملیات را در مرحله دوم تأیید کنید.")
+        return
+
+    elif action == "do_force_res":
+        try:
+            res_id = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("شناسه رزرو نامعتبر است.", show_alert=True)
+            return
+        acc_code = parts[3] if len(parts) > 3 else ""
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+        ):
+            await query.answer("⚠️ رزرو تغییر کرده یا دیگر در انتظار نیست.", show_alert=True)
             return
 
         lock_key = f"reservation-activation:{res_id}"
@@ -729,15 +817,32 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    elif action == "cancel_res":
-        res_id = int(parts[2])
+    elif action == "do_cancel_res":
+        try:
+            res_id = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("شناسه رزرو نامعتبر است.", show_alert=True)
+            return
         acc_code = parts[3] if len(parts) > 3 else ""
-        cancel_res = database.cancel_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Admin")
-        if cancel_res:
-            res_data, new_bal = cancel_res
-            await query.answer(f"🗑 بسته رزرو اکانت {acc_code} لغو و {res_data['charge_amount']:,} تومان عودت داده شد.", show_alert=True)
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+        ):
+            await query.answer("⚠️ رزرو تغییر کرده یا دیگر در انتظار نیست.", show_alert=True)
+            return
+
+        cancel_result = database.cancel_reservation(
+            res_id, actor_id=user.id, actor_name=user.full_name or "Admin"
+        )
+        if cancel_result:
+            res_data, new_bal = cancel_result
+            await query.answer(
+                f"🗑 بسته رزرو اکانت {acc_code} لغو و {res_data['charge_amount']:,} تومان عودت داده شد.",
+                show_alert=True
+            )
         else:
-            await query.answer("⚠️ این بسته قبلاً لغو یا فعال شده است.", show_alert=True)
+            await query.answer("⚠️ این بسته در حال فعال‌سازی است یا قبلاً لغو/فعال شده است.", show_alert=True)
         await query.edit_message_text(
             "✅ عملیات لغو رزرو پردازش شد. برای مشاهده صف به‌روزشده از دکمه زیر استفاده کنید.",
             reply_markup=build_back_to_admin_keyboard([[InlineKeyboardButton("📦 بازخوانی صف رزرو", callback_data="admin:reserves")]])
