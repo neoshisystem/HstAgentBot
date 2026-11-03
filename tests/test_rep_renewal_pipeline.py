@@ -380,3 +380,24 @@ def test_super_admin_quick_confirmation_ambiguous_result_retains_lock_for_resolu
     assert database.get_rep_balance(rep_id) == 0
     assert not any(item["lock_key"] == "account-renewal:admin-pipe" for item in database.get_operation_locks())
 
+
+
+def test_rep_renewal_conflicting_xui_signals_are_ambiguous_not_refunded(renewal_env, monkeypatch):
+    rep_id, user, rep, acc, client = renewal_env
+    monkeypatch.setattr(
+        rep_bot, "xui_manager",
+        SimpleNamespace(renew_client=lambda *a, **k: {"status": "failed", "success": True}),
+    )
+
+    ok, message, _keyboard = asyncio.run(rep_bot.process_account_renewal(
+        user=user, role="rep", rep=rep, acc_record=acc, client_info=client,
+        gb=20, days=30, plan_code="pipeline_20gb_30d",
+        effective_first=False, curr_comment="Pipeline Customer",
+    ))
+
+    rows = renewal_rows()
+    locks = renewal_locks()
+    assert ok is False
+    assert "مبهم" in message
+    assert rows[-1]["status"] == "needs_reconciliation"
+    assert locks
