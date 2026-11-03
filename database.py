@@ -678,6 +678,12 @@ def update_plan_price(plan_code, rep_price=None, user_price=None):
             return None
     return get_plan(plan_code)
 def add_or_update_plan(plan_code, name, gb, days, rep_price, user_price, is_quick=0):
+    plan_code = str(plan_code or "").strip()
+    name = str(name or "").strip()
+    gb, days = float(gb), int(days)
+    rep_price, user_price = int(rep_price), int(user_price)
+    if not plan_code or not name or gb <= 0 or days <= 0 or rep_price <= 0 or user_price <= 0:
+        raise ValueError("Plan code/name, volume, duration and both prices must be valid positive values")
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -690,15 +696,15 @@ def add_or_update_plan(plan_code, name, gb, days, rep_price, user_price, is_quic
             rep_price = excluded.rep_price,
             user_price = excluded.user_price,
             is_quick = excluded.is_quick
-        """, (plan_code, name, float(gb), int(days), int(rep_price), int(user_price), int(is_quick)))
+        """, (plan_code, name, gb, days, rep_price, user_price, int(bool(is_quick))))
         conn.commit()
         log_audit(
             rep_id=None, account_code=plan_code, email=None, action="add_or_update_plan",
-            actor_id=0, actor_name="admin", details={"name": name, "gb": gb, "days": days, "rep_price": rep_price, "user_price": user_price, "is_quick": is_quick},
+            actor_id=0, actor_name="admin",
+            details={"name": name, "gb": gb, "days": days, "rep_price": rep_price, "user_price": user_price, "is_quick": is_quick},
             result_status="success"
         )
         return get_plan(plan_code)
-
 def delete_plan(plan_code: str) -> bool:
     with get_db() as conn:
         cur = conn.cursor()
@@ -935,21 +941,25 @@ def get_recent_ledger_entries(rep_id=None, limit=10):
         return [dict(r) for r in rows]
 
 def get_financial_ledger_paginated(rep_id=None, page=1, page_size=10) -> tuple[list, int, int]:
+    page_size = max(1, min(int(page_size), 100))
+    page = max(1, int(page))
     with get_db() as conn:
         cur = conn.cursor()
         base_where = "1=1"
         params = []
-        if rep_id:
+        if rep_id is not None:
             base_where += " AND l.rep_id = ?"
             params.append(rep_id)
-        
-        total = cur.execute(f"SELECT COUNT(*) FROM financial_ledger l WHERE {base_where}", tuple(params)).fetchone()[0]
+
+        total = cur.execute(
+            f"SELECT COUNT(*) FROM financial_ledger l WHERE {base_where}", tuple(params)
+        ).fetchone()[0]
         total_pages = max(1, (total + page_size - 1) // page_size)
-        page = min(max(1, page), total_pages)
+        page = min(page, total_pages)
         offset = (page - 1) * page_size
-        
+
         query = f"""
-        SELECT l.*, 
+        SELECT l.*,
                r.name as rep_name,
                u.full_name as user_full_name,
                u.username as user_username
@@ -962,11 +972,6 @@ def get_financial_ledger_paginated(rep_id=None, page=1, page_size=10) -> tuple[l
         """
         rows = cur.execute(query, tuple(params + [page_size, offset])).fetchall()
         return [dict(r) for r in rows], total, total_pages
-
-record_payment = register_rep_payment
-
-# --- User Settings (On First Connect Mode) ---
-
 def get_user_first_connect_mode(user_id: int) -> bool:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1795,6 +1800,8 @@ def update_plan_specs(plan_code: str, name: str, gb: float, days: int, rep_price
             raise ValueError("Plan not found")
 def get_rep_accounts_paginated(rep_id: int, filter_type: str = 'all', page: int = 1, page_size: int = 10) -> tuple[list, int, int]:
     import time
+    page_size = max(1, min(int(page_size), 100))
+    page = max(1, int(page))
     now_ms = int(time.time() * 1000)
     with get_db() as conn:
         cur = conn.cursor()
@@ -1810,19 +1817,17 @@ def get_rep_accounts_paginated(rep_id: int, filter_type: str = 'all', page: int 
         elif filter_type == "reserved":
             base_where += " AND account_code IN (SELECT account_code FROM reserved_packages WHERE status = 'pending')"
 
-        total = cur.execute(f"SELECT COUNT(*) FROM accounts WHERE {base_where}", tuple(params)).fetchone()[0]
+        total = cur.execute(
+            f"SELECT COUNT(*) FROM accounts WHERE {base_where}", tuple(params)
+        ).fetchone()[0]
         total_pages = max(1, (total + page_size - 1) // page_size)
-        page = min(max(1, page), total_pages)
+        page = min(page, total_pages)
         offset = (page - 1) * page_size
-
-        rows = cur.execute(f"""
-        SELECT * FROM accounts
-        WHERE {base_where}
-        ORDER BY updated_at DESC
-        LIMIT ? OFFSET ?
-        """, tuple(params + [page_size, offset])).fetchall()
+        rows = cur.execute(
+            f"SELECT * FROM accounts WHERE {base_where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, offset])
+        ).fetchall()
         return [dict(r) for r in rows], total, total_pages
-
 def get_rep_reservations(rep_id: int) -> list:
     with get_db() as conn:
         cur = conn.cursor()
