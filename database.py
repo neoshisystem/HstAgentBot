@@ -348,6 +348,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS user_action_intents (
             intent_id TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL,
