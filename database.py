@@ -457,22 +457,59 @@ def get_all_settings():
 # --- Reserved Packages Queue Management ---
 
 def create_reservation(rep_id, account_code, email, plan_code, plan_name, gb, days, on_first_connect, charge_amount, actor_id, actor_name):
+    """Create one pending reservation and charge the representative in one transaction."""
+    charge_amount = int(charge_amount)
+    if charge_amount < 0:
+        raise ValueError("Reservation charge cannot be negative")
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        existing = cur.execute("""
+            SELECT id FROM reserved_packages
+            WHERE status = 'pending' AND LOWER(account_code) = LOWER(?)
+            LIMIT 1
+        """, (account_code,)).fetchone()
+        if existing:
+            raise ValueError("A pending reservation already exists for this account")
+
+        if rep_id is not None and charge_amount > 0:
+            rep = cur.execute(
+                "SELECT balance_toman, credit_limit_toman FROM representatives WHERE id = ?",
+                (rep_id,)
+            ).fetchone()
+            if not rep:
+                raise ValueError("Representative not found")
+            current_debt = int(rep["balance_toman"] or 0)
+            credit_limit = int(rep["credit_limit_toman"] if rep["credit_limit_toman"] is not None else 5000000)
+            if credit_limit > 0 and current_debt + charge_amount > credit_limit:
+                raise ValueError("Representative credit limit would be exceeded")
+
         cur.execute("""
-        INSERT INTO reserved_packages (rep_id, account_code, email, plan_code, plan_name, gb, days, on_first_connect, charge_amount, actor_id, actor_name, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        """, (rep_id, account_code, email, plan_code, plan_name, float(gb), int(days), int(on_first_connect), int(charge_amount), actor_id, actor_name))
-        conn.commit()
+            INSERT INTO reserved_packages
+            (rep_id, account_code, email, plan_code, plan_name, gb, days, on_first_connect, charge_amount, actor_id, actor_name, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        """, (
+            rep_id, account_code, email, plan_code, plan_name, float(gb), int(days),
+            int(on_first_connect), charge_amount, actor_id, actor_name
+        ))
         res_id = cur.lastrowid
-        log_audit(
-            rep_id=rep_id, account_code=account_code, email=email, action="create_reservation",
-            actor_id=actor_id, actor_name=actor_name,
-            details={"res_id": res_id, "plan_code": plan_code, "plan_name": plan_name, "gb": gb, "days": days, "charge": charge_amount},
-            result_status="success"
+
+        if rep_id is not None and charge_amount > 0:
+            new_balance = _record_rep_ledger_entry(
+                cur, rep_id, account_code, email, plan_code, "debit", charge_amount,
+                f"رزرو بسته {plan_name}", actor_id, actor_name
+            )
+        else:
+            new_balance = 0
+
+        _insert_audit(
+            cur, rep_id, account_code, email, "create_reservation",
+            actor_id, actor_name,
+            {"res_id": res_id, "plan_code": plan_code, "plan_name": plan_name,
+             "gb": gb, "days": days, "charge": charge_amount, "balance_after": new_balance},
+            "success"
         )
         return res_id
-
 def get_pending_reservation(account_code: str):
     if not account_code:
         return None
