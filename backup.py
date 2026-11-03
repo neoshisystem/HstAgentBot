@@ -217,12 +217,14 @@ def restore_backup_archive(archive_path: str, destination_dir: str) -> dict:
     if _is_path_overlap(destination_dir, configured_backup_dir):
         raise ValueError("Restore destination overlaps the configured backup directory")
 
+    destination_existed = os.path.isdir(destination_dir)
     if os.path.exists(destination_dir):
-        if not os.path.isdir(destination_dir) or os.listdir(destination_dir):
+        if not destination_existed or os.listdir(destination_dir):
             raise ValueError("Restore destination must be a new or empty directory")
     else:
         os.makedirs(destination_dir, exist_ok=False)
 
+    restored_root = None
     try:
         with tarfile.open(archive_path, "r:gz") as archive:
             members, root = _archive_members(archive)
@@ -256,9 +258,16 @@ def restore_backup_archive(archive_path: str, destination_dir: str) -> dict:
             "file_count": verification["file_count"],
         }
     except Exception:
-        # Leave no partial extraction behind; only files inside the disposable
-        # destination are removed. Never touch the source archive or configured DB.
-        shutil.rmtree(destination_dir, ignore_errors=True)
+        # Remove only the extracted archive root. Preserve a caller-owned empty
+        # destination directory; remove the destination itself only when this
+        # function created it.
+        if restored_root and os.path.isdir(restored_root):
+            shutil.rmtree(restored_root, ignore_errors=True)
+        if not destination_existed and os.path.isdir(destination_dir):
+            try:
+                os.rmdir(destination_dir)
+            except OSError:
+                pass
         raise
 
 
