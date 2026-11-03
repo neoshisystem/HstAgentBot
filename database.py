@@ -2,6 +2,8 @@ import os
 import sys
 import sqlite3
 import json
+import secrets
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from config import (
@@ -48,13 +50,82 @@ DEFAULT_SETTINGS = [
     ("admin_telegram_id", str(ADMIN_TELEGRAM_ID), "شناسه تلگرام ادمین کل", "شناسه عددی ادمین اصلی سیستم")
 ]
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+@contextmanager
+def _insert_audit(cur, rep_id, account_code, email, action, actor_id, actor_name, details, result_status):
+    cur.execute("""
+        INSERT INTO audit_logs (rep_id, account_code, email, action, actor_id, actor_name, details_json, result_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        rep_id, str(account_code or ""), str(email or ""), action, actor_id,
+        actor_name, json.dumps(details, ensure_ascii=False) if isinstance(details, (dict, list)) else str(details),
+        result_status
+    ))
 
+
+def _record_rep_ledger_entry(cur, rep_id, account_code, email, plan_code, tx_type, amount, description, actor_id, actor_name):
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("Financial ledger amount must be a positive integer")
+    if tx_type not in ("debit", "credit"):
+        raise ValueError("Unsupported representative transaction type")
+    rep = cur.execute("SELECT balance_toman FROM representatives WHERE id = ?", (rep_id,)).fetchone()
+    if not rep:
+        raise ValueError("Representative not found")
+    current = int(rep["balance_toman"] or 0)
+    new_balance = current + amount if tx_type == "debit" else current - amount
+    cur.execute("""
+        INSERT INTO financial_ledger
+        (rep_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        rep_id, str(account_code or ""), str(email or ""), str(plan_code or ""),
+        tx_type, amount, new_balance, description, actor_id, actor_name
+    ))
+    cur.execute("UPDATE representatives SET balance_toman = ? WHERE id = ?", (new_balance, rep_id))
+    return new_balance
+
+
+def _credit_user_wallet(cur, user_id, amount, description, actor_id, actor_name):
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("Wallet credit amount must be a positive integer")
+    cur.execute("""
+        INSERT INTO user_wallets (user_id, balance_toman, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            balance_toman = user_wallets.balance_toman + excluded.balance_toman,
+            updated_at = CURRENT_TIMESTAMP
+    """, (user_id, amount))
+    row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
+    new_balance = int(row["balance_toman"])
+    cur.execute("""
+        INSERT INTO financial_ledger
+        (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
+        VALUES (NULL, ?, 'credit', ?, ?, ?, ?, ?)
+    """, (user_id, amount, new_balance, description, actor_id, actor_name))
+    return new_balance
+
+
+def get_db():
+    """Yield a configured SQLite connection and always close it.
+
+    The context commits on success and rolls back on failure. Callers may still
+    explicitly commit within the context when a result must be durable before
+    a subsequent operation.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with get_db() as conn:
@@ -433,54 +504,70 @@ def get_all_pending_reservations():
         return [dict(r) for r in rows]
 
 def activate_reservation(res_id: int, actor_id=0, actor_name="system"):
+    """Mark a pending reservation activated once; return None on stale/replayed IDs."""
     with get_db() as conn:
         cur = conn.cursor()
-        row = cur.execute("SELECT * FROM reserved_packages WHERE id = ?", (res_id,)).fetchone()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT * FROM reserved_packages WHERE id = ? AND status = 'pending'",
+            (res_id,)
+        ).fetchone()
         if not row:
             return None
-        cur.execute("UPDATE reserved_packages SET status = 'activated', activated_at = CURRENT_TIMESTAMP WHERE id = ?", (res_id,))
-        conn.commit()
-        log_audit(
-            rep_id=row["rep_id"], account_code=row["account_code"], email=row["email"],
+        cur.execute("""
+            UPDATE reserved_packages
+            SET status = 'activated', activated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+        """, (res_id,))
+        if cur.rowcount != 1:
+            return None
+        data = dict(row)
+        data["status"] = "activated"
+        _insert_audit(
+            cur, rep_id=row["rep_id"], account_code=row["account_code"], email=row["email"],
             action="activate_reservation", actor_id=actor_id, actor_name=actor_name,
             details={"res_id": res_id, "plan_code": row["plan_code"], "plan_name": row["plan_name"]},
             result_status="success"
         )
-        return dict(row)
-
+        return data
 def cancel_reservation(res_id: int, actor_id=0, actor_name="admin"):
+    """Cancel one pending reservation and refund its representative atomically."""
     with get_db() as conn:
         cur = conn.cursor()
-        row = cur.execute("SELECT * FROM reserved_packages WHERE id = ? AND status = 'pending'", (res_id,)).fetchone()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT * FROM reserved_packages WHERE id = ? AND status = 'pending'",
+            (res_id,)
+        ).fetchone()
         if not row:
             return None
-        res_data = dict(row)
-        cur.execute("UPDATE reserved_packages SET status = 'cancelled' WHERE id = ?", (res_id,))
-        conn.commit()
-        
-    # Refund the charged amount to representative balance if applicable
-    refund_amount = res_data.get("charge_amount", 0)
-    new_bal = 0
-    if res_data.get("rep_id") is not None and refund_amount > 0:
-        new_bal = record_ledger_entry(
-            rep_id=res_data["rep_id"],
-            account_code=res_data["account_code"],
-            email=res_data["email"],
-            plan_code=res_data["plan_code"],
-            tx_type="credit",
-            amount=refund_amount,
-            description=f"لغو بسته رزرو {res_data['plan_name']} و عودت وجه",
-            actor_id=actor_id,
-            actor_name=actor_name
-        )
-    log_audit(
-        rep_id=res_data.get("rep_id"), account_code=res_data["account_code"], email=res_data["email"],
-        action="cancel_reservation_refund", actor_id=actor_id, actor_name=actor_name,
-        details={"res_id": res_id, "refund_amount": refund_amount, "new_balance": new_bal},
-        result_status="success"
-    )
-    return res_data, new_bal
 
+        res_data = dict(row)
+        cur.execute(
+            "UPDATE reserved_packages SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
+            (res_id,)
+        )
+        if cur.rowcount != 1:
+            return None
+
+        refund_amount = int(res_data.get("charge_amount") or 0)
+        new_bal = 0
+        if res_data.get("rep_id") is not None and refund_amount > 0:
+            new_bal = _record_rep_ledger_entry(
+                cur, rep_id=res_data["rep_id"], account_code=res_data["account_code"],
+                email=res_data["email"], plan_code=res_data["plan_code"],
+                tx_type="credit", amount=refund_amount,
+                description=f"لغو بسته رزرو {res_data['plan_name']} و عودت وجه",
+                actor_id=actor_id, actor_name=actor_name
+            )
+        _insert_audit(
+            cur, rep_id=res_data.get("rep_id"), account_code=res_data["account_code"],
+            email=res_data["email"], action="cancel_reservation_refund",
+            actor_id=actor_id, actor_name=actor_name,
+            details={"res_id": res_id, "refund_amount": refund_amount, "new_balance": new_bal},
+            result_status="success"
+        )
+        return res_data, new_bal
 def get_pricing_plans(quick_only=False, active_only=False):
     with get_db() as conn:
         cur = conn.cursor()
@@ -669,52 +756,25 @@ def acquire_renewal_lock(account_code: str, ttl_seconds: int = 20) -> bool:
 # --- Financial Ledger & Accounting ---
 
 def record_ledger_entry(rep_id, account_code, email, plan_code, tx_type, amount, description, actor_id, actor_name):
-    """
-    Records a financial transaction and atomically updates the representative's balance_toman.
-    tx_type: 'debit' increases debt (cost of renewal/new account)
-             'credit' decreases debt (payment/settlement)
-    """
+    """Atomically updates representative balance and its ledger entry."""
     if not rep_id:
+        if int(amount) <= 0:
+            raise ValueError("Financial amount must be positive")
         return 0
-
     with get_db() as conn:
         cur = conn.cursor()
-        rep = cur.execute("SELECT balance_toman FROM representatives WHERE id = ?", (rep_id,)).fetchone()
-        curr_bal = (rep["balance_toman"] or 0) if rep else 0
-        
-        if tx_type == "debit":
-            new_bal = curr_bal + amount
-        elif tx_type == "credit":
-            new_bal = curr_bal - amount
-        else: # adjust
-            new_bal = amount
-            
-        cur.execute("""
-        INSERT INTO financial_ledger (rep_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rep_id,
-            str(account_code),
-            str(email or ""),
-            str(plan_code or ""),
-            tx_type,
-            int(amount),
-            new_bal,
-            description,
-            actor_id,
-            actor_name
-        ))
-        
-        cur.execute("UPDATE representatives SET balance_toman = ? WHERE id = ?", (new_bal, rep_id))
-        conn.commit()
-        log_audit(
-            rep_id=rep_id, account_code=str(account_code or ""), email=str(email or ""),
-            action=f"financial_{tx_type}", actor_id=actor_id, actor_name=actor_name,
-            details={"amount": amount, "plan_code": plan_code, "description": description, "balance_after": new_bal},
-            result_status="success"
+        cur.execute("BEGIN IMMEDIATE")
+        new_balance = _record_rep_ledger_entry(
+            cur, rep_id, account_code, email, plan_code, tx_type, amount,
+            description, actor_id, actor_name
         )
-        return new_bal
-
+        _insert_audit(
+            cur, rep_id, account_code, email, f"financial_{tx_type}",
+            actor_id, actor_name,
+            {"amount": int(amount), "plan_code": plan_code, "description": description, "balance_after": new_balance},
+            "success"
+        )
+        return new_balance
 def register_rep_payment(rep_id, amount, description, actor_id, actor_name):
     return record_ledger_entry(
         rep_id=rep_id,
@@ -928,23 +988,50 @@ def resolve_account_rep_id(email: str) -> int | None:
             return r["id"]
     return None
 
-def link_user_to_account(account_code: str, user_tg_id: int, username: str = "", full_name: str = "") -> dict:
+def get_user_owned_account(user_id: int, account_code_or_email: str) -> dict | None:
+    """Return an exact account only when it belongs to the requesting Telegram user."""
+    identifier = str(account_code_or_email or "").strip().lower()
+    if not identifier:
+        return None
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT * FROM accounts
+            WHERE owner_tg_id = ? AND (LOWER(account_code) = ? OR LOWER(email) = ?)
+            LIMIT 1
+        """, (int(user_id), identifier, identifier)).fetchone()
+        return dict(row) if row else None
+
+
+def link_user_to_account(account_code: str, user_tg_id: int, username: str = "", full_name: str = "", allow_reassign: bool = False) -> dict:
+    """Link an exact account identifier without allowing cross-user account takeover."""
+    identifier = str(account_code or "").strip().lower()
+    if not identifier:
+        return {"status": "error", "message": "Account identifier is required"}
     with get_db() as conn:
         cur = conn.cursor()
-        acc = cur.execute("SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) LIKE ? LIMIT 1", (account_code.lower(), f"%{account_code.lower()}%")).fetchone()
+        cur.execute("BEGIN IMMEDIATE")
+        acc = cur.execute("""
+            SELECT * FROM accounts
+            WHERE LOWER(account_code) = ? OR LOWER(email) = ?
+            ORDER BY id DESC LIMIT 1
+        """, (identifier, identifier)).fetchone()
         if not acc:
             return {"status": "error", "message": "Account not found"}
-        cur.execute("UPDATE accounts SET owner_tg_id = ? WHERE id = ?", (user_tg_id, acc["id"]))
+        owner_id = acc["owner_tg_id"]
+        if owner_id is not None and int(owner_id) != int(user_tg_id) and not allow_reassign:
+            return {"status": "error", "message": "Account is already linked to another Telegram user"}
+        cur.execute(
+            "UPDATE accounts SET owner_tg_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (int(user_tg_id), acc["id"])
+        )
         cur.execute("""
-        INSERT INTO bot_users (telegram_id, role, rep_id, username, full_name)
-        VALUES (?, 'end_user', ?, ?, ?)
-        ON CONFLICT(telegram_id) DO UPDATE SET
-            username = excluded.username,
-            full_name = excluded.full_name
-        """, (user_tg_id, acc["rep_id"], username, full_name))
-        conn.commit()
+            INSERT INTO bot_users (telegram_id, role, rep_id, username, full_name)
+            VALUES (?, 'end_user', ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                username = CASE WHEN excluded.username != '' THEN excluded.username ELSE bot_users.username END,
+                full_name = CASE WHEN excluded.full_name != '' THEN excluded.full_name ELSE bot_users.full_name END
+        """, (int(user_tg_id), acc["rep_id"], username or "", full_name or ""))
         return {"status": "ok", "account": dict(acc)}
-
 def get_user_accounts(user_tg_id: int) -> list:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1115,57 +1202,59 @@ def get_user_wallet_balance(user_id: int) -> int:
         return row["balance_toman"] if row else 0
 
 def record_user_payment(user_id: int, amount: int, description: str, actor_id: int, actor_name: str = "") -> int:
-    """Credits an end-user's wallet atomically and logs to financial_ledger."""
+    """Credit a user wallet and ledger in one serialized SQLite transaction."""
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("""
-        INSERT INTO user_wallets (user_id, balance_toman, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET
-            balance_toman = user_wallets.balance_toman + excluded.balance_toman,
-            updated_at = CURRENT_TIMESTAMP
-        """, (user_id, amount))
-        
-        row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
-        new_balance = row["balance_toman"] if row else amount
-
-        cur.execute("""
-        INSERT INTO financial_ledger (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
-        VALUES (NULL, ?, 'credit', ?, ?, ?, ?, ?)
-        """, (user_id, amount, new_balance, description, actor_id, actor_name))
-        conn.commit()
-        return new_balance
-
-def deduct_user_wallet(user_id: int, amount: int, description: str, plan_code: str = "", account_code: str = "", email: str = "") -> bool:
-    """Atomically deducts funds from an end-user's wallet if sufficient balance exists."""
+        cur.execute("BEGIN IMMEDIATE")
+        return _credit_user_wallet(cur, user_id, amount, description, actor_id, actor_name)
+def deduct_user_wallet(user_id: int, amount: int, description: str, plan_code: str = "", account_code: str = "", email: str = "") -> tuple[bool, int]:
+    """Atomically debit a positive amount; return (success, resulting balance)."""
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("Wallet debit amount must be a positive integer")
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
         row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
-        curr_bal = row["balance_toman"] if row else 0
-        if curr_bal < amount:
-            return False
-
-        new_bal = curr_bal - amount
-        cur.execute("UPDATE user_wallets SET balance_toman = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?", (new_bal, user_id))
+        current = int(row["balance_toman"] or 0) if row else 0
+        if current < amount:
+            return False, current
+        new_balance = current - amount
         cur.execute("""
-        INSERT INTO financial_ledger (rep_id, user_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name)
-        VALUES (NULL, ?, ?, ?, ?, 'debit', ?, ?, ?, ?, 'User')
-        """, (user_id, account_code, email, plan_code, amount, new_bal, description, user_id))
-        conn.commit()
-        return True
-
+            UPDATE user_wallets SET balance_toman = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND balance_toman >= ?
+        """, (new_balance, user_id, amount))
+        if cur.rowcount != 1:
+            return False, current
+        cur.execute("""
+            INSERT INTO financial_ledger
+            (rep_id, user_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name)
+            VALUES (NULL, ?, ?, ?, ?, 'debit', ?, ?, ?, ?, 'User')
+        """, (user_id, account_code, email, plan_code, amount, new_balance, description, user_id))
+        return True, new_balance
 def create_payment_receipt(user_id: int, role: str, amount_toman: int, rep_id: int | None = None, photo_id: str | None = None, note: str | None = None) -> str:
-    import random, string
-    code = "RCP-" + "".join(random.choices(string.digits, k=6))
+    """Create a receipt and return the one canonical persisted tracking code."""
+    amount_toman = int(amount_toman)
+    if amount_toman <= 0:
+        raise ValueError("Receipt amount must be a positive integer")
+    if role not in ("rep", "end_user"):
+        raise ValueError("Invalid receipt role")
+    if role == "rep" and rep_id is None:
+        raise ValueError("Representative receipt requires a representative ID")
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("""
-        INSERT INTO payment_receipts (tracking_code, user_id, role, rep_id, amount_toman, receipt_photo_id, receipt_note, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-        """, (code, user_id, role, rep_id, amount_toman, photo_id, note))
-        conn.commit()
-    return code
-
+        for _ in range(8):
+            code = f"RCP-{secrets.randbelow(100_000_000):08d}"
+            try:
+                cur.execute("""
+                    INSERT INTO payment_receipts
+                    (tracking_code, user_id, role, rep_id, amount_toman, receipt_photo_id, receipt_note, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                """, (code, user_id, role, rep_id, amount_toman, photo_id, note))
+                return code
+            except sqlite3.IntegrityError:
+                continue
+        raise RuntimeError("Could not allocate a unique payment receipt tracking code")
 def get_payment_receipt(receipt_id_or_code):
     with get_db() as conn:
         cur = conn.cursor()
@@ -1184,59 +1273,71 @@ def get_pending_payment_receipts():
         return [dict(r) for r in rows]
 
 def approve_payment_receipt(receipt_id_or_code, admin_tg_id: int, admin_name: str = "Admin") -> dict:
-    rcp = get_payment_receipt(receipt_id_or_code)
-    if not rcp:
-        raise ValueError("Receipt not found")
-    if rcp["status"] != "pending":
-        return rcp
-
+    """Approve a receipt and apply the associated credit exactly once, atomically."""
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+            row = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (int(receipt_id_or_code),)).fetchone()
+        else:
+            row = cur.execute("SELECT * FROM payment_receipts WHERE tracking_code = ?", (str(receipt_id_or_code),)).fetchone()
+        if not row:
+            raise ValueError("Receipt not found")
+        receipt = dict(row)
+        if receipt["status"] != "pending":
+            return receipt
+
         cur.execute("""
-        UPDATE payment_receipts
-        SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND status = 'pending'
-        """, (admin_tg_id, rcp["id"]))
-        if cur.rowcount == 0:
-            return get_payment_receipt(rcp["id"])
-        conn.commit()
+            UPDATE payment_receipts
+            SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+        """, (admin_tg_id, receipt["id"]))
+        if cur.rowcount != 1:
+            latest = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt["id"],)).fetchone()
+            return dict(latest) if latest else receipt
 
-    if rcp["role"] == "rep" and rcp.get("rep_id"):
-        record_payment(
-            rep_id=rcp["rep_id"],
-            amount=rcp["amount_toman"],
-            description=f"تسویه فیش کارت‌به‌کارت {rcp['tracking_code']}",
-            actor_id=admin_tg_id,
-            actor_name=admin_name
-        )
-    else:
-        record_user_payment(
-            user_id=rcp["user_id"],
-            amount=rcp["amount_toman"],
-            description=f"شارژ کیف پول با فیش {rcp['tracking_code']}",
-            actor_id=admin_tg_id,
-            actor_name=admin_name
-        )
+        amount = int(receipt["amount_toman"])
+        if amount <= 0:
+            raise ValueError("Receipt has an invalid amount")
+        if receipt["role"] == "rep":
+            if receipt.get("rep_id") is None:
+                raise ValueError("Representative receipt has no representative account")
+            _record_rep_ledger_entry(
+                cur, receipt["rep_id"], "", "", "",
+                "credit", amount, f"تسویه فیش کارت‌به‌کارت {receipt['tracking_code']}",
+                admin_tg_id, admin_name
+            )
+        elif receipt["role"] == "end_user":
+            _credit_user_wallet(
+                cur, receipt["user_id"], amount,
+                f"شارژ کیف پول با فیش {receipt['tracking_code']}",
+                admin_tg_id, admin_name
+            )
+        else:
+            raise ValueError("Receipt role is invalid")
 
-    return get_payment_receipt(rcp["id"])
-
+        updated = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt["id"],)).fetchone()
+        return dict(updated)
 def reject_payment_receipt(receipt_id_or_code, admin_tg_id: int, reason: str = "عدم تطابق با گردش حساب") -> dict:
-    rcp = get_payment_receipt(receipt_id_or_code)
-    if not rcp:
-        raise ValueError("Receipt not found")
-    if rcp["status"] != "pending":
-        return rcp
-
+    """Reject a pending receipt once; repeated callbacks are read-only."""
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+            row = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (int(receipt_id_or_code),)).fetchone()
+        else:
+            row = cur.execute("SELECT * FROM payment_receipts WHERE tracking_code = ?", (str(receipt_id_or_code),)).fetchone()
+        if not row:
+            raise ValueError("Receipt not found")
+        if row["status"] != "pending":
+            return dict(row)
         cur.execute("""
-        UPDATE payment_receipts
-        SET status = 'rejected', rejection_reason = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND status = 'pending'
-        """, (reason, admin_tg_id, rcp["id"]))
-        conn.commit()
-    return get_payment_receipt(rcp["id"])
-
+            UPDATE payment_receipts
+            SET status = 'rejected', rejection_reason = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+        """, (reason, admin_tg_id, row["id"]))
+        latest = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (row["id"],)).fetchone()
+        return dict(latest) if latest else dict(row)
 def get_rep_credit_limit(rep_id: int) -> int:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1346,37 +1447,48 @@ def search_bot_users(query: str) -> list:
         return [dict(r) for r in rows]
 
 def update_user_wallet_manual(user_id: int, delta_amount: int, description: str, actor_id: int, actor_name: str = "Admin") -> int:
+    """Apply a manual wallet adjustment without permitting an accidental negative balance."""
+    delta_amount = int(delta_amount)
+    if delta_amount == 0:
+        raise ValueError("Adjustment amount must not be zero")
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("""
-        INSERT INTO user_wallets (user_id, balance_toman, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET
-            balance_toman = user_wallets.balance_toman + excluded.balance_toman,
-            updated_at = CURRENT_TIMESTAMP
-        """, (user_id, delta_amount))
-        
+        cur.execute("BEGIN IMMEDIATE")
         row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
-        new_balance = row["balance_toman"] if row else delta_amount
-        tx_type = "credit" if delta_amount >= 0 else "debit"
-
+        current = int(row["balance_toman"] or 0) if row else 0
+        new_balance = current + delta_amount
+        if new_balance < 0:
+            raise ValueError("Insufficient wallet balance for this deduction")
         cur.execute("""
-        INSERT INTO financial_ledger (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
-        VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO user_wallets (user_id, balance_toman, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                balance_toman = excluded.balance_toman, updated_at = CURRENT_TIMESTAMP
+        """, (user_id, new_balance))
+        tx_type = "credit" if delta_amount > 0 else "debit"
+        cur.execute("""
+            INSERT INTO financial_ledger
+            (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
+            VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
         """, (user_id, tx_type, abs(delta_amount), new_balance, description, actor_id, actor_name))
-        conn.commit()
         return new_balance
-
-def unlink_account_owner(account_code_or_email: str) -> bool:
+def unlink_account_owner(account_code_or_email: str, user_tg_id: int | None = None) -> bool:
+    """Unlink an exact account; when user_tg_id is supplied, only its owner may unlink it."""
+    identifier = str(account_code_or_email or "").strip().lower()
+    if not identifier:
+        return False
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("""
-        UPDATE accounts SET owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP
-        WHERE LOWER(account_code) = ? OR LOWER(email) = ? OR LOWER(email) LIKE ?
-        """, (account_code_or_email.lower(), account_code_or_email.lower(), f"%{account_code_or_email.lower()}%"))
-        conn.commit()
+        sql = """
+            UPDATE accounts SET owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE (LOWER(account_code) = ? OR LOWER(email) = ?)
+        """
+        params = [identifier, identifier]
+        if user_tg_id is not None:
+            sql += " AND owner_tg_id = ?"
+            params.append(int(user_tg_id))
+        cur.execute(sql, tuple(params))
         return cur.rowcount > 0
-
 def change_user_tg_id(old_tg_id: int, new_tg_id: int) -> bool:
     with get_db() as conn:
         cur = conn.cursor()
