@@ -1047,6 +1047,7 @@ def get_financial_ledger_paginated(rep_id=None, page=1, page_size=10) -> tuple[l
         query = f"""
         SELECT l.*,
                r.name as rep_name,
+               r.rep_code as rep_code,
                u.full_name as user_full_name,
                u.username as user_username
         FROM financial_ledger l
