@@ -185,3 +185,32 @@ def test_super_admin_cannot_open_end_user_or_rep_deposit_command(monkeypatch):
 
     assert message.replies == []
     assert context.user_data == {}
+
+
+def test_super_admin_global_text_routes_are_silent_outside_private_chat(monkeypatch):
+    update, _, message = make_update(chat_type="supergroup", text="ABCD")
+    monkeypatch.setattr(rep_bot.database, "get_user_role", lambda *args, **kwargs: ("super_admin", None))
+    monkeypatch.setattr(rep_bot.database, "is_user_blocked", lambda _uid: False)
+    monkeypatch.setattr(
+        rep_bot.nlp_matcher, "detect_intent",
+        lambda *_: (_ for _ in ()).throw(AssertionError("global admin group text must stop before intent routing")),
+    )
+
+    asyncio.run(rep_bot.handle_message(update, SimpleNamespace(user_data={})))
+
+    assert message.replies == []
+
+
+def test_super_admin_global_callbacks_are_rejected_outside_private_chat(monkeypatch):
+    update, query, _ = make_update("status:ABCD", chat_type="supergroup")
+    monkeypatch.setattr(rep_bot.database, "get_user_role", lambda *args, **kwargs: ("super_admin", None))
+    monkeypatch.setattr(rep_bot.database, "is_user_blocked", lambda _uid: False)
+    monkeypatch.setattr(
+        rep_bot.xui_manager, "inspect_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("global admin callback must stop before X-UI")),
+    )
+
+    asyncio.run(rep_bot.handle_callback(update, SimpleNamespace(user_data={})))
+
+    assert query.answers and query.answers[0][1] is True
+    assert "خصوصی" in query.answers[0][0]
