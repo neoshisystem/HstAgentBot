@@ -133,3 +133,27 @@ def test_rejecting_receipt_is_idempotent_and_never_credits(isolated_db):
         "SELECT COUNT(*) FROM financial_ledger WHERE user_id=?",
         (82004,),
     ) == 0
+
+
+def test_pending_receipt_queue_paginates_without_dropping_older_submissions(isolated_db):
+    codes = []
+    for index in range(12):
+        codes.append(database.create_payment_receipt(
+            user_id=83000 + index,
+            role="end_user",
+            amount_toman=100_000 + index,
+            photo_id=f"photo-{index}",
+        ))
+
+    page1, total1, pages1 = database.get_receipts_paginated("pending", page=1, page_size=10)
+    page2, total2, pages2 = database.get_receipts_paginated("pending", page=2, page_size=10)
+    page_out_of_range, total3, pages3 = database.get_receipts_paginated(
+        "pending", page=999, page_size=10
+    )
+
+    assert (total1, pages1, len(page1)) == (12, 2, 10)
+    assert (total2, pages2, len(page2)) == (12, 2, 2)
+    assert (total3, pages3, len(page_out_of_range)) == (12, 2, 2)
+    assert page1[0]["tracking_code"] == codes[-1]
+    assert page2[-1]["tracking_code"] == codes[0]
+    assert {item["tracking_code"] for item in page1 + page2} == set(codes)
