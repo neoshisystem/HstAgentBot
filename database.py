@@ -957,9 +957,13 @@ def resolve_operation_lock(
             LIMIT 1
         """, (key, key, key, key)).fetchone()
         if linked_intent:
+            resolve_command = (
+                "/resolverepintent" if linked_intent["owner_type"] == "representative"
+                else "/resolveintent"
+            )
             raise ValueError(
                 f"Operation lock belongs to {linked_intent['owner_type']} action intent {linked_intent['intent_id']} "
-                f"({linked_intent['status']}); resolve the linked intent so ledger and intent state are reconciled together"
+                f"({linked_intent['status']}); use {resolve_command} so ledger and intent state are reconciled together"
             )
         cur.execute(
             "DELETE FROM operation_locks WHERE lock_key = ?",
