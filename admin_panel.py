@@ -271,6 +271,10 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
     sub_action=parts[2] if len(parts)>2 else ""
     if action=="cancel_form":
         state=context.user_data.pop("admin_state",None) or {}
+        await _cleanup_form_prompt(
+            update, context, state,
+            preserve_message_id=getattr(getattr(query, "message", None), "message_id", None),
+        )
         parent=state.get("return_callback") or "admin:main"
         if not isinstance(parent,str) or not parent.startswith("admin:") or parent in ("admin:cancel_form","admin:retry_form"): parent="admin:main"
         query.data=parent
@@ -347,6 +351,7 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=_transfer_parent_keyboard(account["account_code"]),
         )
+        _remember_form_prompt(context.user_data["admin_state"], query)
         await query.answer()
         return
 
@@ -1536,10 +1541,12 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         _form_state_scope3=context.user_data.get("admin_state")
         if _form_state_scope3:
             _form_state_scope3.setdefault("return_callback",prompt_parent_cb)
+            _remember_form_prompt(_form_state_scope3, query)
 
         _scope3_state=context.user_data.get("admin_state")
         if _scope3_state:
             _scope3_state.setdefault("return_callback",prompt_parent_cb)
+            _remember_form_prompt(_scope3_state, query)
 
     elif action == "confirm_del_user":
         target_user_id = int(sub_action)
@@ -1677,6 +1684,36 @@ def parse_card_settings_input(raw_text: str) -> tuple[str, str, str]:
     return card,holder,bank
 
 
+async def _cleanup_form_prompt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict,
+    preserve_message_id: int | None = None,
+) -> None:
+    """Delete only the transient prompt message owned by the current FSM."""
+    prompt_msg_id = state.pop("prompt_msg_id", None)
+    if prompt_msg_id is None or str(prompt_msg_id) == str(preserve_message_id):
+        return
+    chat = getattr(update, "effective_chat", None)
+    bot = getattr(context, "bot", None)
+    if not chat or not bot:
+        logger.warning("Cannot clean admin form prompt %s: chat or bot unavailable", prompt_msg_id)
+        return
+    try:
+        await bot.delete_message(chat_id=chat.id, message_id=prompt_msg_id)
+    except Exception as cleanup_error:
+        logger.warning(
+            "Could not remove transient admin form prompt %s: %s",
+            prompt_msg_id, cleanup_error,
+        )
+
+
+def _remember_form_prompt(state: dict, query) -> None:
+    """Store the ID of the exact message that the form prompt was rendered into."""
+    message = getattr(query, "message", None)
+    message_id = getattr(message, "message_id", None)
+    if message_id is not None:
+        state["prompt_msg_id"] = message_id
+
+
 def build_fsm_validation_keyboard(role: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("⬅️ تلاش مجدد",callback_data=f"{role}:retry_form"),
@@ -1699,7 +1736,7 @@ async def _reply_fsm_validation_error(update,context,state,message: str) -> bool
     return True
 
 
-async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _process_admin_text_input_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Handles step-by-step inputs initiated from Admin inline buttons.
     Strictly isolated to Private DM with 60s timeout and Regex prioritization.
@@ -2103,3 +2140,24 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
         return True
 
     return False
+
+
+
+async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Process admin FSM input, cleaning the previous prompt only on success or closure."""
+    # Keep the callback-to-FSM action contract explicit for audits and routing tests.
+    managed_actions = {
+        "edit_card_settings", "charge_user", "edit_credit_limit", "edit_setting",
+        "pay", "add_rep", "edit_plan", "transfer", "transfer_user_target",
+        "inspect", "add_plan", "link_user", "search_user", "edit_user_id",
+        "link_user_account", "unlink_user_account", "edit_rep", "edit_plan_specs",
+    }
+    state = context.user_data.get("admin_state")
+    attempts_before = state.get("attempts", 0) if isinstance(state, dict) else 0
+    result = await _process_admin_text_input_impl(update, context)
+    if isinstance(state, dict) and state.get("action") in managed_actions:
+        state_is_active = context.user_data.get("admin_state") is state
+        accepted_input = result is True and state.get("attempts", 0) == attempts_before
+        if not state_is_active or accepted_input:
+            await _cleanup_form_prompt(update, context, state)
+    return result

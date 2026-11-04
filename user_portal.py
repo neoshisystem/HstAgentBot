@@ -138,6 +138,10 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
     action = parts[1] if len(parts)>1 else "main"
     if action=="cancel_form":
         state=context.user_data.pop("user_state",None) or {}
+        await _cleanup_form_prompt(
+            update, context, state,
+            preserve_message_id=getattr(getattr(query, "message", None), "message_id", None),
+        )
         parent=state.get("return_callback") or "user:main"
         if not isinstance(parent,str) or not parent.startswith("user:") or parent in ("user:cancel_form","user:retry_form"): parent="user:main"
         query.data=parent
@@ -727,6 +731,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             "💡 (مثال: `1001` یا `Hst-sm-1001`)"
         )
         await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        _remember_form_prompt(context.user_data["user_state"], query)
         await query.answer()
 
     # 6. Pricing Plans for Users
@@ -912,6 +917,36 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 
+async def _cleanup_form_prompt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict,
+    preserve_message_id: int | None = None,
+) -> None:
+    """Delete only the transient prompt message owned by the current FSM."""
+    prompt_msg_id = state.pop("prompt_msg_id", None)
+    if prompt_msg_id is None or str(prompt_msg_id) == str(preserve_message_id):
+        return
+    chat = getattr(update, "effective_chat", None)
+    bot = getattr(context, "bot", None)
+    if not chat or not bot:
+        logger.warning("Cannot clean end-user form prompt %s: chat or bot unavailable", prompt_msg_id)
+        return
+    try:
+        await bot.delete_message(chat_id=chat.id, message_id=prompt_msg_id)
+    except Exception as cleanup_error:
+        logger.warning(
+            "Could not remove transient end-user form prompt %s: %s",
+            prompt_msg_id, cleanup_error,
+        )
+
+
+def _remember_form_prompt(state: dict, query) -> None:
+    """Store the ID of the exact message that the form prompt was rendered into."""
+    message = getattr(query, "message", None)
+    message_id = getattr(message, "message_id", None)
+    if message_id is not None:
+        state["prompt_msg_id"] = message_id
+
+
 def build_fsm_validation_keyboard(role: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("⬅️ تلاش مجدد",callback_data=f"{role}:retry_form"),
@@ -934,7 +969,7 @@ async def _reply_fsm_validation_error(update,context,state,message: str) -> bool
     return True
 
 
-async def process_user_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _process_user_text_input_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Processes FSM inputs initiated from end-user portal."""
     user = update.effective_user
     user_state = context.user_data.get("user_state")
@@ -973,3 +1008,18 @@ async def process_user_text_input(update: Update, context: ContextTypes.DEFAULT_
         return True
 
     return False
+
+
+
+async def process_user_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Process end-user FSM input, cleaning its prompt only on success or closure."""
+    managed_actions = {"awaiting_link_code"}
+    state = context.user_data.get("user_state")
+    attempts_before = state.get("attempts", 0) if isinstance(state, dict) else 0
+    result = await _process_user_text_input_impl(update, context)
+    if isinstance(state, dict) and state.get("action") in managed_actions:
+        state_is_active = context.user_data.get("user_state") is state
+        accepted_input = result is True and state.get("attempts", 0) == attempts_before
+        if not state_is_active or accepted_input:
+            await _cleanup_form_prompt(update, context, state)
+    return result

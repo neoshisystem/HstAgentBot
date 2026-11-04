@@ -108,6 +108,10 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     action = parts[1] if len(parts)>1 else "main"
     if action=="cancel_form":
         state=context.user_data.pop("rep_state",None) or {}
+        await _cleanup_form_prompt(
+            update, context, state,
+            preserve_message_id=getattr(getattr(query, "message", None), "message_id", None),
+        )
         parent=state.get("return_callback") or "rep:main"
         if not isinstance(parent,str) or not parent.startswith("rep:") or parent in ("rep:cancel_form","rep:retry_form"): parent="rep:main"
         query.data=parent
@@ -185,6 +189,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             "این درخواست تا ۱۵ دقیقه معتبر است و فقط یک بار قابل اجراست."
         )
         await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        _remember_form_prompt(context.user_data["rep_state"], query)
         await query.answer()
 
     # 2.2 Issue account using one durable representative action intent.
@@ -439,6 +444,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             "لطفاً کد ۴ رقمی اکانت، نام مشتری یا ایمیل آن را ارسال فرمایید:"
         )
         await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        _remember_form_prompt(context.user_data["rep_state"], query)
         await query.answer()
 
     # 5. Wallet & Financial View
@@ -698,6 +704,36 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
+async def _cleanup_form_prompt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict,
+    preserve_message_id: int | None = None,
+) -> None:
+    """Delete only the transient prompt message owned by the current FSM."""
+    prompt_msg_id = state.pop("prompt_msg_id", None)
+    if prompt_msg_id is None or str(prompt_msg_id) == str(preserve_message_id):
+        return
+    chat = getattr(update, "effective_chat", None)
+    bot = getattr(context, "bot", None)
+    if not chat or not bot:
+        logger.warning("Cannot clean representative form prompt %s: chat or bot unavailable", prompt_msg_id)
+        return
+    try:
+        await bot.delete_message(chat_id=chat.id, message_id=prompt_msg_id)
+    except Exception as cleanup_error:
+        logger.warning(
+            "Could not remove transient representative form prompt %s: %s",
+            prompt_msg_id, cleanup_error,
+        )
+
+
+def _remember_form_prompt(state: dict, query) -> None:
+    """Store the ID of the exact message that the form prompt was rendered into."""
+    message = getattr(query, "message", None)
+    message_id = getattr(message, "message_id", None)
+    if message_id is not None:
+        state["prompt_msg_id"] = message_id
+
+
 def build_fsm_validation_keyboard(role: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("⬅️ تلاش مجدد",callback_data=f"{role}:retry_form"),
@@ -720,7 +756,7 @@ async def _reply_fsm_validation_error(update,context,state,message: str) -> bool
     return True
 
 
-async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE, rep: dict) -> bool:
+async def _process_rep_text_input_impl(update: Update, context: ContextTypes.DEFAULT_TYPE, rep: dict) -> bool:
     """Processes FSM inputs initiated from representative dashboard."""
     rep_state = context.user_data.get("rep_state")
     if not rep_state:
@@ -800,3 +836,18 @@ async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_T
         return True
 
     return False
+
+
+
+async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE, rep: dict) -> bool:
+    """Process representative FSM input, cleaning its prompt only on success or closure."""
+    managed_actions = {"awaiting_new_acc_name", "awaiting_search_query"}
+    state = context.user_data.get("rep_state")
+    attempts_before = state.get("attempts", 0) if isinstance(state, dict) else 0
+    result = await _process_rep_text_input_impl(update, context, rep)
+    if isinstance(state, dict) and state.get("action") in managed_actions:
+        state_is_active = context.user_data.get("rep_state") is state
+        accepted_input = result is True and state.get("attempts", 0) == attempts_before
+        if not state_is_active or accepted_input:
+            await _cleanup_form_prompt(update, context, state)
+    return result

@@ -64,7 +64,10 @@ def _xui_operation_failed(result) -> bool:
     return classify_xui_result(result) == XUIResult.FAILURE
 
 
-async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=ParseMode.MARKDOWN):
+async def safe_edit_message(
+    query, text: str, reply_markup=None, parse_mode=ParseMode.MARKDOWN,
+    delete_transient_photo: bool = False,
+):
     """
     Safely edits a message text or caption (for photo messages like QR codes),
     preventing BadRequest crashes when clicking buttons on photo cards.
@@ -78,9 +81,43 @@ async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=Pars
         if "Message is not modified" in str(e):
             return None
         logger.warning(f"safe_edit_message fallback on error: {e}. Sending new message.")
-        return await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        sent_message = await query.message.reply_text(
+            text, reply_markup=reply_markup, parse_mode=parse_mode
+        )
+        caption = (getattr(query.message, "caption", None) or "")
+        is_transient_qr_card = (
+            delete_transient_photo
+            and bool(getattr(query.message, "photo", None))
+            and "QR Code" in caption
+            and ("سابسکریپشن" in caption or "کانفیگ" in caption)
+        )
+        if is_transient_qr_card:
+            try:
+                await query.message.delete()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not remove transient QR navigation card after text fallback: %s",
+                    cleanup_error,
+                )
+        return sent_message
     except Exception as e:
         logger.error(f"safe_edit_message unhandled error: {e}")
+
+
+async def _cleanup_deposit_amount_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Best-effort cleanup for the dedicated card-deposit amount prompt only."""
+    state = context.user_data.pop("deposit_form_state", None) or {}
+    prompt_msg_id = state.pop("prompt_msg_id", None)
+    if prompt_msg_id is None:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
+    except Exception as cleanup_error:
+        logger.warning(
+            "Could not remove transient card-deposit amount prompt %s: %s",
+            prompt_msg_id, cleanup_error,
+        )
+
 
 def send_admin_log(text: str, rep_id: int | None = None):
     """
@@ -139,6 +176,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
     
+    # A fresh start also closes the dedicated card-deposit amount prompt.
+    await _cleanup_deposit_amount_prompt(context, chat.id)
     # Always clear any active FSM state on start/admin commands
     context.user_data.pop("admin_state", None)
     context.user_data.pop("rep_state", None)
@@ -383,14 +422,18 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args and args[0].isdigit():
         amount = int(args[0])
 
+    await _cleanup_deposit_amount_prompt(context, chat.id)
     if amount <= 0:
         context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_AMOUNT
         context.user_data["deposit_role"] = "rep" if role == "rep" else "end_user"
-        await update.message.reply_text(
+        prompt_message = await update.message.reply_text(
             "💳 **لطفاً مبلغ واریزی مورد نظر را به تومان وارد کنید:**\n"
             "مثال: `/deposit 500000` یا ارسال عدد `500000`",
             parse_mode=ParseMode.MARKDOWN
         )
+        context.user_data["deposit_form_state"] = {
+            "prompt_msg_id": getattr(prompt_message, "message_id", None)
+        }
         return
 
     card_info = database.get_card_info()
@@ -1484,6 +1527,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = finance_manager.format_card_instructions(amount, tr_code, card_info)
             keyboard = finance_manager.build_card_payment_keyboard(tr_code)
             await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            await _cleanup_deposit_amount_prompt(context, chat.id)
             return
         else:
             await update.message.reply_text("⚠️ لطفاً مبلغ را به صورت عدد معتبر لاتین وارد کنید (مثال: `500000`).", parse_mode=ParseMode.MARKDOWN)
@@ -2134,14 +2178,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 show_alert=True
             )
             return
+        await _cleanup_deposit_amount_prompt(context, chat.id)
         context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_AMOUNT
         context.user_data["deposit_role"] = expected_role
         await query.answer("مبلغ را وارد کنید.")
-        await query.message.reply_text(
+        prompt_message = await query.message.reply_text(
             "💳 **لطفاً مبلغ مورد نظر جهت پرداخت را به تومان وارد کنید:**\n"
             "مثال: `500000`",
             parse_mode=ParseMode.MARKDOWN
         )
+        context.user_data["deposit_form_state"] = {
+            "prompt_msg_id": getattr(prompt_message, "message_id", None)
+        }
         return
 
     if data == "cancel_payment" or data.startswith("cancel_payment:"):
@@ -2219,6 +2267,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     show_alert=True
                 )
                 return
+            await _cleanup_deposit_amount_prompt(context, chat.id)
             for key in ("fsm_state", "deposit_amount", "deposit_role"):
                 context.user_data.pop(key, None)
             await query.answer("فرایند ورود مبلغ لغو شد.")
@@ -2446,7 +2495,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         status_text += f"\n\n🔄 *آخرین به‌روزرسانی لحظه‌ای:* `{now_time}`"
         keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role, pending_res=pending_res)
-        await safe_edit_message(query, status_text, reply_markup=keyboard)
+        await safe_edit_message(query, status_text, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("📊 وضعیت لحظه‌ای بروزرسانی شد.")
 
     # 5. Suspend Account
@@ -2469,7 +2518,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             pending_res = database.get_pending_reservation(account_code)
             keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=False, on_first_connect=on_first, role=role, pending_res=pending_res)
-            await safe_edit_message(query, text_out, reply_markup=keyboard)
+            await safe_edit_message(query, text_out, reply_markup=keyboard, delete_transient_photo=True)
             database.log_audit(
                 rep_id=target_rep_id, account_code=account_code, email=email,
                 action="suspend_account", actor_id=user.id, actor_name=user.full_name or user.username,
@@ -2498,7 +2547,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             pending_res = database.get_pending_reservation(account_code)
             keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=on_first, role=role, pending_res=pending_res)
-            await safe_edit_message(query, text_out, reply_markup=keyboard)
+            await safe_edit_message(query, text_out, reply_markup=keyboard, delete_transient_photo=True)
             database.log_audit(
                 rep_id=target_rep_id, account_code=account_code, email=email,
                 action="activate_account", actor_id=user.id, actor_name=user.full_name or user.username,
@@ -2556,7 +2605,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"main_menu:{email}"
             )]
         ])
-        await safe_edit_message(query, confirmation_text, reply_markup=keyboard)
+        await safe_edit_message(query, confirmation_text, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("تأیید یک‌بارمصرف تمدید ایجاد شد.")
 
     # qrenew_confirm has consumed its one-time token before reaching this branch.
@@ -2583,7 +2632,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             curr_comment=curr_comment, comment_updated=False,
             confirmation_id=renewal_confirmation_id,
         )
-        await safe_edit_message(query, msg_out, reply_markup=keyboard)
+        await safe_edit_message(query, msg_out, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("عملیات تمدید / صف رزرو پردازش شد.")
 
     # 8. Force Activate Reserved Package
@@ -2651,7 +2700,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report_text = ren_res.get("report", "")
         report_text = f"🚀 **بسته رزرو به صورت فوری فعال شد (اعتبار قبلی صفر و دوره جدید آغاز گردید):**\n\n" + report_text
         keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=on_first_res, role=role, pending_res=None)
-        await safe_edit_message(query, report_text, reply_markup=keyboard)
+        await safe_edit_message(query, report_text, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("🚀 بسته رزرو با موفقیت فعال شد.")
         await asyncio.to_thread(
             send_admin_log,
@@ -2687,7 +2736,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{fin_info}"
         )
         keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role, pending_res=None)
-        await safe_edit_message(query, msg_out, reply_markup=keyboard)
+        await safe_edit_message(query, msg_out, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("🗑 بسته رزرو لغو و وجه آن عودت داده شد.", show_alert=True)
         await asyncio.to_thread(
             send_admin_log,
@@ -2701,7 +2750,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sub_url = xui_manager.get_sub_url(sub_id)
         msg_out = f"🔗 **لینک سابسکریپشن اکانت `{account_code}`:**\n\n`{sub_url}`"
         keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role)
-        await safe_edit_message(query, msg_out, reply_markup=keyboard)
+        await safe_edit_message(query, msg_out, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("🔗 لینک سابسکریپشن واکشی شد.")
 
     # 9. Subscription QR Code
@@ -2831,7 +2880,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = nlp_matcher.build_account_keyboard(
                 account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role
             )
-            await safe_edit_message(query, out_text, reply_markup=keyboard)
+            await safe_edit_message(query, out_text, reply_markup=keyboard, delete_transient_photo=True)
             await query.answer("✅ لینک سابسکریپشن بازنشانی شد.")
             await asyncio.to_thread(
                 send_admin_log, f"بازنشانی لینک ساب اکانت `{email}` توسط `{user.id}`", target_rep_id
