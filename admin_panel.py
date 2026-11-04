@@ -175,6 +175,64 @@ async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYP
     elif update.message:
         await update.message.reply_text(dashboard_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
+
+def _transfer_account_summary(account: dict) -> str:
+    """Format the source account fields displayed by the ownership-transfer wizard."""
+    code = escape_markdown(account.get("account_code") or "")
+    email = escape_markdown(account.get("email") or "")
+    customer = escape_markdown(account.get("customer_name") or "ثبت نشده")
+    rep_name = escape_markdown(account.get("rep_name") or "بدون نماینده (استخر آزاد)")
+    owner_id = account.get("owner_tg_id")
+    owner = str(owner_id) if owner_id is not None else "ندارد"
+    enabled = "🟢 فعال" if account.get("enable") else "🔴 غیرفعال"
+    try:
+        volume = f"{float(account.get('total_gb') or 0):g} GB"
+    except (TypeError, ValueError):
+        volume = str(account.get("total_gb") or 0)
+    return (
+        f"• کد اکانت: {code}\n"
+        f"• ایمیل: {email}\n"
+        f"• نام مشتری: {customer}\n"
+        f"• نماینده فعلی: {rep_name}\n"
+        f"• مالک تلگرام فعلی: {owner}\n"
+        f"• وضعیت سرویس: {enabled}\n"
+        f"• حجم: {volume}"
+    )
+
+
+def _transfer_account_keyboard(account_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 انتقال به نماینده دیگر", callback_data=f"admin:tr_select_rep:{account_code}")],
+        [InlineKeyboardButton("👤 انتقال به کاربر نهایی", callback_data=f"admin:tr_prompt_user:{account_code}")],
+        [InlineKeyboardButton("🏊 بازگردانی به استخر آزاد", callback_data=f"admin:tr_confirm:{account_code}:pool:0")],
+        [InlineKeyboardButton("⬅️ بازگشت به بخش اسکوپ", callback_data="admin:scope")],
+    ])
+
+
+def _transfer_parent_keyboard(account_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ بازگشت به مشخصات اکانت", callback_data=f"admin:tr_account:{account_code}")],
+        [InlineKeyboardButton("⬅️ بازگشت به بخش اسکوپ", callback_data="admin:scope")],
+    ])
+
+
+def _transfer_confirm_keyboard(account_code: str, dest_type: str, dest_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ تایید و اجرای انتقال", callback_data=f"admin:tr_execute:{account_code}:{dest_type}:{dest_id}")],
+        [InlineKeyboardButton("⬅️ بازگشت به انتخاب مقصد", callback_data=f"admin:tr_account:{account_code}")],
+        [InlineKeyboardButton("⬅️ بازگشت به بخش اسکوپ", callback_data="admin:scope")],
+    ])
+
+
+def _transfer_source_snapshot(account: dict) -> dict:
+    return {
+        "account_id": account.get("id"),
+        "rep_id": account.get("rep_id"),
+        "owner_tg_id": account.get("owner_tg_id"),
+        "updated_at": account.get("updated_at"),
+    }
+
+
 async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Guard callback dispatch so unexpected failures do not leave Telegram's spinner running."""
     query = update.callback_query
@@ -222,6 +280,179 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         await query.answer("فرم فعال است؛ مقدار را دوباره ارسال کنید.")
         return
     context.user_data.pop("admin_state",None)
+    if action != "tr_execute":
+        context.user_data.pop("transfer_confirm", None)
+
+    # Scope 4.1 — four-step account ownership transfer wizard.
+    if action == "tr_account":
+        account = database.get_account_by_code_or_email(sub_action)
+        if not account:
+            await query.answer("❌ اکانت پیدا نشد؛ ویزارد را دوباره آغاز کنید.", show_alert=True)
+            return
+        await query.edit_message_text(
+            "🔄 **گام ۲ از ۴ — مشخصات اکانت و انتخاب نوع مقصد**\n\n"
+            + _transfer_account_summary(account)
+            + "\n\nنوع مقصد انتقال را انتخاب کنید:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_transfer_account_keyboard(account["account_code"]),
+        )
+        await query.answer()
+        return
+
+    elif action == "tr_select_rep":
+        account = database.get_account_by_code_or_email(sub_action)
+        if not account:
+            await query.answer("❌ اکانت پیدا نشد.", show_alert=True)
+            return
+        active_reps = database.get_all_active_reps()
+        rows = [
+            [InlineKeyboardButton(
+                f"👥 {str(rep.get('name') or rep.get('rep_code') or rep['id'])[:28]} ({rep.get('rep_code') or rep['id']})",
+                callback_data=f"admin:tr_confirm:{account['account_code']}:rep:{rep['id']}",
+            )]
+            for rep in active_reps
+        ]
+        if not rows:
+            rows = [[InlineKeyboardButton("نماینده فعالی ثبت نشده است", callback_data=f"admin:tr_account:{account['account_code']}")]]
+        rows.extend([
+            [InlineKeyboardButton("⬅️ بازگشت به مشخصات اکانت", callback_data=f"admin:tr_account:{account['account_code']}")],
+            [InlineKeyboardButton("⬅️ بازگشت به بخش اسکوپ", callback_data="admin:scope")],
+        ])
+        await query.edit_message_text(
+            "🔄 **گام ۳ از ۴ — انتخاب نماینده مقصد**\n\n"
+            + _transfer_account_summary(account)
+            + "\n\nیکی از نمایندگان فعال را انتخاب کنید:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        await query.answer()
+        return
+
+    elif action == "tr_prompt_user":
+        account = database.get_account_by_code_or_email(sub_action)
+        if not account:
+            await query.answer("❌ اکانت پیدا نشد.", show_alert=True)
+            return
+        context.user_data["admin_state"] = {
+            "action": "transfer_user_target",
+            "account_code": account["account_code"],
+            "ts": time.time(),
+            "return_callback": f"admin:tr_account:{account['account_code']}",
+        }
+        await query.edit_message_text(
+            "🔄 **گام ۳ از ۴ — تعیین کاربر مقصد**\n\n"
+            + _transfer_account_summary(account)
+            + "\n\nChat ID عددی کاربر مقصد را ارسال کنید.\n"
+            "کاربر باید قبلاً در ربات ثبت شده باشد.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_transfer_parent_keyboard(account["account_code"]),
+        )
+        await query.answer()
+        return
+
+    elif action == "tr_confirm":
+        account_code = sub_action
+        dest_type = parts[3] if len(parts) > 3 else ""
+        dest_id = parts[4] if len(parts) > 4 else ""
+        account = database.get_account_by_code_or_email(account_code)
+        if not account:
+            await query.answer("❌ اکانت پیدا نشد؛ ویزارد را دوباره آغاز کنید.", show_alert=True)
+            return
+        if dest_type == "pool" and dest_id == "0":
+            destination_label = "🏊 استخر آزاد (بدون نماینده و بدون مالک تلگرام)"
+        elif dest_type == "rep" and dest_id.isdigit() and int(dest_id) > 0:
+            rep = database.get_rep_by_id(int(dest_id))
+            if not rep or not rep.get("is_active", 1):
+                await query.answer("❌ نماینده مقصد پیدا نشد یا فعال نیست.", show_alert=True)
+                return
+            destination_label = f"👥 نماینده: {escape_markdown(rep.get('name') or rep.get('rep_code') or dest_id)}"
+        elif dest_type == "user" and dest_id.isdigit() and int(dest_id) > 0:
+            destination_label = f"👤 کاربر نهایی با Chat ID: {dest_id}"
+        else:
+            await query.answer("❌ نوع یا شناسه مقصد معتبر نیست.", show_alert=True)
+            return
+        context.user_data["transfer_confirm"] = {
+            "account_code": account["account_code"],
+            "dest_type": dest_type,
+            "dest_id": dest_id,
+            **_transfer_source_snapshot(account),
+            "ts": time.time(),
+        }
+        await query.edit_message_text(
+            "⚠️ **گام ۴ از ۴ — تایید نهایی انتقال مالکیت**\n\n"
+            + _transfer_account_summary(account)
+            + f"\n\n**مقصد انتخاب‌شده:**\n{destination_label}\n\n"
+            "با تایید، مالکیت محلی اکانت در دیتابیس تغییر می‌کند.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_transfer_confirm_keyboard(account["account_code"], dest_type, dest_id),
+        )
+        await query.answer()
+        return
+
+    elif action == "tr_execute":
+        account_code = sub_action
+        dest_type = parts[3] if len(parts) > 3 else ""
+        dest_id = parts[4] if len(parts) > 4 else ""
+        confirmation = context.user_data.get("transfer_confirm") or {}
+        expected = {"account_code": account_code, "dest_type": dest_type, "dest_id": dest_id}
+        if any(confirmation.get(key) != value for key, value in expected.items()):
+            await query.answer("❌ تایید انتقال معتبر یا فعال نیست؛ ویزارد را دوباره آغاز کنید.", show_alert=True)
+            return
+        if time.time() - float(confirmation.get("ts") or 0) > 60:
+            context.user_data.pop("transfer_confirm", None)
+            await query.answer("⏱ مهلت تایید انتقال به پایان رسیده است؛ ویزارد را دوباره آغاز کنید.", show_alert=True)
+            return
+        account = database.get_account_by_code_or_email(account_code)
+        if not account:
+            context.user_data.pop("transfer_confirm", None)
+            await query.answer("❌ اکانت دیگر در دسترس نیست.", show_alert=True)
+            return
+        source_now = _transfer_source_snapshot(account)
+        if any(source_now.get(key) != confirmation.get(key) for key in source_now):
+            context.user_data.pop("transfer_confirm", None)
+            await query.answer("⚠️ مالکیت اکانت از زمان نمایش خلاصه تغییر کرده است؛ ویزارد را دوباره اجرا کنید.", show_alert=True)
+            return
+        try:
+            if dest_type == "pool":
+                result = database.reassign_account(
+                    account_code, to_pool=True, actor_id=user.id,
+                    actor_name=user.full_name or "Admin",
+                )
+                destination_text = "🏊 استخر آزاد"
+            elif dest_type == "rep":
+                result = database.reassign_account(
+                    account_code, new_rep_id=int(dest_id), to_pool=False, actor_id=user.id,
+                    actor_name=user.full_name or "Admin",
+                )
+                rep = database.get_rep_by_id(int(dest_id))
+                destination_text = f"👥 {escape_markdown((rep or {}).get('name') or dest_id)}"
+            else:
+                result = database.reassign_account(
+                    account_code, new_owner_tg_id=int(dest_id), to_pool=False, actor_id=user.id,
+                    actor_name=user.full_name or "Admin",
+                )
+                destination_text = f"👤 Chat ID: {dest_id}"
+        except (TypeError, ValueError) as exc:
+            await query.answer(f"❌ اجرای انتقال انجام نشد: {exc}", show_alert=True)
+            return
+        if result.get("status") != "ok":
+            await query.answer(
+                f"❌ انتقال انجام نشد: {result.get('message') or 'خطای نامشخص'}",
+                show_alert=True,
+            )
+            return
+        context.user_data.pop("transfer_confirm", None)
+        updated_account = database.get_account_by_code_or_email(account_code) or account
+        await query.edit_message_text(
+            "✅ **انتقال مالکیت با موفقیت انجام شد.**\n\n"
+            + _transfer_account_summary(updated_account)
+            + f"\n\n**مقصد نهایی:** {destination_text}\n"
+            "🧾 رویداد انتقال در audit_logs ثبت شد.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_back_to_admin_keyboard(parent_cb="admin:scope"),
+        )
+        await query.answer("✅ انتقال انجام شد.")
+        return
 
     # 1. Main Dashboard
     if action == "main":
@@ -1172,14 +1403,16 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             await query.answer()
 
         elif action == "prompt_transfer":
-            context.user_data["admin_state"] = {"action": "transfer", "ts": now_ts}
+            context.user_data["admin_state"] = {
+                "action": "transfer",
+                "ts": now_ts,
+                "return_callback": prompt_parent_cb,
+            }
             msg = (
-                "🔄 **انتقال مالکیت اکانت:**\n\n"
-                "لطفاً **کد اکانت** و **کد نماینده جدید** یا Chat ID کاربر را بفرستید:\n"
-                "فرمت:\n"
-                "`<کد_اکانت> <کد_نماینده>` یا `<کد_اکانت> <Chat_ID>`\n"
-                "مثال:\n"
-                "`3029 demo_rep`\n\n"
+                "🔄 **ویزارد انتقال مالکیت اکانت — گام ۱ از ۴:**\n\n"
+                "کد اکانت یا ایمیل دقیق سرویس را ارسال کنید.\n"
+                "برای سازگاری با روش قبلی، می‌توانید یک خط شامل\n"
+                "`<کد_اکانت> <کد_نماینده_یا_Chat_ID>` بفرستید.\n\n"
                 "⏱ مهلت ارسال: ۶۰ ثانیه (یا بنویسید `cancel`)"
             )
             keyboard = build_back_to_admin_keyboard(parent_cb=prompt_parent_cb)
@@ -1660,28 +1893,71 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
             return await _reply_fsm_validation_error(update,context,admin_state,f"قیمت‌ها باید عددی و معتبر باشند: {exc}")
 
     elif action == "transfer":
-        parts = text.split()
-        if len(parts)<2:
-            return await _reply_fsm_validation_error(update,context,admin_state,"فرمت انتقال باید کد اکانت و کد نماینده یا Chat ID مقصد باشد.")
-        acc_code, target = parts[0], parts[1]
-        
-        # Check if target is rep or chat_id
-        rep_info = database.get_rep_by_code(target.lower())
-        new_rep_id = rep_info["id"] if rep_info else None
-        new_owner_id = int(target) if target.isdigit() else None
-        
-        res = database.reassign_account(acc_code, new_rep_id=new_rep_id, new_owner_tg_id=new_owner_id)
-        if res.get("status") == "ok":
-            dest_desc = rep_info['name'] if rep_info else f"Chat ID: {new_owner_id}"
-            await update.message.reply_text(
-                f"✅ **مالکیت اکانت `{acc_code}` منتقل شد.**\n• مقصد جدید: **{dest_desc}**",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=build_admin_main_keyboard()
+        legacy_parts = text.split()
+        if len(legacy_parts) >= 2:
+            # Backward-compatible old single-line format: account identifier + rep code or Chat ID.
+            acc_code, target = legacy_parts[0], legacy_parts[1]
+            rep_info = database.get_rep_by_code(target.lower())
+            new_rep_id = rep_info["id"] if rep_info else None
+            new_owner_id = int(target) if target.isdigit() else None
+            result = database.reassign_account(
+                acc_code, new_rep_id=new_rep_id, new_owner_tg_id=new_owner_id,
+                actor_id=update.effective_user.id,
+                actor_name=update.effective_user.full_name or "Admin",
             )
-        else:
-            return await _reply_fsm_validation_error(update,context,admin_state,f"عملیات انجام نشد: {res.get('message') or 'ورودی معتبر نیست.'}")
-        context.user_data.pop("admin_state",None)
+            if result.get("status") != "ok":
+                return await _reply_fsm_validation_error(update, context, admin_state,
+                    f"انتقال با فرمت قدیمی انجام نشد: {result.get('message') or 'مقصد معتبر نیست.'}")
+            context.user_data.pop("admin_state", None)
+            target_label = rep_info["name"] if rep_info else f"Chat ID: {new_owner_id}"
+            await update.message.reply_text(
+                f"✅ **سازگاری با فرمت قدیمی:** مالکیت اکانت {result['account_code']} به {target_label} منتقل شد.\n"
+                "🧾 رویداد انتقال در audit_logs ثبت شد.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_back_to_admin_keyboard(parent_cb="admin:scope"),
+            )
+            return True
+        if not text:
+            return await _reply_fsm_validation_error(update, context, admin_state, "کد اکانت یا ایمیل را وارد کنید.")
+        account = database.get_account_by_code_or_email(text)
+        if not account:
+            return await _reply_fsm_validation_error(update, context, admin_state, "اکانتی با این کد یا ایمیل پیدا نشد؛ ورودی را بررسی کنید.")
+        admin_state["account_code"] = account["account_code"]
+        admin_state["stage"] = "choose_destination"
+        admin_state["ts"] = time.time()
+        await update.message.reply_text(
+            "🔄 **گام ۲ از ۴ — مشخصات اکانت و انتخاب نوع مقصد**\n\n"
+            + _transfer_account_summary(account)
+            + "\n\nنوع مقصد انتقال را انتخاب کنید:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_transfer_account_keyboard(account["account_code"]),
+        )
         return True
+
+    elif action == "transfer_user_target":
+        translated = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")).strip()
+        if not translated.isdigit() or int(translated) <= 0:
+            return await _reply_fsm_validation_error(update, context, admin_state, "Chat ID مقصد باید یک عدد صحیح مثبت باشد.")
+        account_code = admin_state.get("account_code")
+        account = database.get_account_by_code_or_email(account_code)
+        if not account:
+            return await _reply_fsm_validation_error(update, context, admin_state, "اکانت پیدا نشد؛ ویزارد را دوباره آغاز کنید.")
+        chat_id = int(translated)
+        context.user_data.pop("admin_state", None)
+        await update.message.reply_text(
+            "🔄 **گام ۳ از ۴ — کاربر مقصد تعیین شد**\n\n"
+            + _transfer_account_summary(account)
+            + f"\n\n**کاربر مقصد:** Chat ID {chat_id}\n"
+            "برای مشاهده خلاصه نهایی و تایید انتقال، دکمه زیر را انتخاب کنید.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("ادامه به خلاصه تایید نهایی", callback_data=f"admin:tr_confirm:{account['account_code']}:user:{chat_id}")],
+                [InlineKeyboardButton("⬅️ بازگشت به مشخصات اکانت", callback_data=f"admin:tr_account:{account['account_code']}")],
+                [InlineKeyboardButton("⬅️ بازگشت به بخش اسکوپ", callback_data="admin:scope")],
+            ]),
+        )
+        return True
+
 
     elif action == "inspect":
         insp = await asyncio.to_thread(xui_manager.inspect_client, text, scope="all")

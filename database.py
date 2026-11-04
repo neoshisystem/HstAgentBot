@@ -1053,36 +1053,76 @@ def get_all_bot_users():
         """).fetchall()
         return [dict(r) for r in rows]
 
-def reassign_account(account_code, new_rep_id=None, new_owner_tg_id=None):
-    if not account_code or ((new_rep_id is None) == (new_owner_tg_id is None)):
-        return {"status": "error", "message": "یک مقصد معتبر (نماینده یا کاربر) باید مشخص شود."}
+def get_account_by_code_or_email(identifier: str) -> dict | None:
+    """Return exact account details and the current representative name."""
+    value = str(identifier or '').strip()
+    if not value:
+        return None
+    with get_db() as conn:
+        row = conn.execute('''
+            SELECT a.*, r.name AS rep_name
+            FROM accounts AS a
+            LEFT JOIN representatives AS r ON r.id = a.rep_id
+            WHERE LOWER(a.account_code) = LOWER(?) OR LOWER(a.email) = LOWER(?)
+            LIMIT 1
+        ''', (value, value)).fetchone()
+        return dict(row) if row else None
+
+
+def reassign_account(account_code, new_rep_id=None, new_owner_tg_id=None, to_pool: bool = False, actor_id: int = 0, actor_name: str = 'Admin'):
+    """Atomically assign to a representative, end user, or the free pool; audit the change."""
+    if not account_code:
+        return {'status': 'error', 'message': 'شناسه اکانت الزامی است.'}
+    if to_pool:
+        if new_rep_id is not None or new_owner_tg_id is not None:
+            return {'status': 'error', 'message': 'برای انتقال به استخر آزاد نباید مقصد دیگری تعیین شود.'}
+    elif (new_rep_id is None) == (new_owner_tg_id is None):
+        return {'status': 'error', 'message': 'یک مقصد معتبر (نماینده یا کاربر) باید مشخص شود.'}
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        row = cur.execute("""
+        cur.execute('BEGIN IMMEDIATE')
+        row = cur.execute('''
             SELECT * FROM accounts
             WHERE LOWER(account_code) = LOWER(?) OR LOWER(email) = LOWER(?)
             LIMIT 1
-        """, (account_code, account_code)).fetchone()
+        ''', (str(account_code), str(account_code))).fetchone()
         if not row:
-            return {"status": "error", "message": "اکانت یافت نشد."}
-        if new_rep_id is not None:
-            rep = cur.execute("SELECT id FROM representatives WHERE id = ? AND is_active = 1", (new_rep_id,)).fetchone()
+            return {'status': 'error', 'message': 'اکانت یافت نشد.'}
+        old_rep_id = row['rep_id']
+        old_owner_tg_id = row['owner_tg_id']
+        destination = {'type': 'pool', 'rep_id': None, 'owner_tg_id': None}
+        if to_pool:
+            cur.execute('UPDATE accounts SET rep_id=NULL, owner_tg_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?', (row['id'],))
+        elif new_rep_id is not None:
+            try:
+                target_rep_id = int(new_rep_id)
+            except (TypeError, ValueError):
+                return {'status': 'error', 'message': 'شناسه نماینده مقصد معتبر نیست.'}
+            rep = cur.execute('SELECT id, name FROM representatives WHERE id=? AND is_active=1', (target_rep_id,)).fetchone()
             if not rep:
-                return {"status": "error", "message": "نماینده مقصد یافت نشد یا فعال نیست."}
-            cur.execute(
-                "UPDATE accounts SET rep_id = ?, owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (new_rep_id, row["id"])
-            )
+                return {'status': 'error', 'message': 'نماینده مقصد یافت نشد یا فعال نیست.'}
+            cur.execute('UPDATE accounts SET rep_id=?, owner_tg_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?', (target_rep_id, row['id']))
+            destination = {'type': 'rep', 'rep_id': target_rep_id, 'rep_name': rep['name'], 'owner_tg_id': None}
         else:
-            user = cur.execute("SELECT telegram_id FROM bot_users WHERE telegram_id = ?", (int(new_owner_tg_id),)).fetchone()
+            try:
+                target_user_id = int(new_owner_tg_id)
+            except (TypeError, ValueError):
+                return {'status': 'error', 'message': 'Chat ID مقصد معتبر نیست.'}
+            if target_user_id <= 0:
+                return {'status': 'error', 'message': 'Chat ID مقصد باید عددی مثبت باشد.'}
+            user = cur.execute('SELECT telegram_id FROM bot_users WHERE telegram_id=?', (target_user_id,)).fetchone()
             if not user:
-                return {"status": "error", "message": "کاربر مقصد در سیستم ثبت نشده است."}
-            cur.execute(
-                "UPDATE accounts SET owner_tg_id = ?, rep_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (int(new_owner_tg_id), row["id"])
-            )
-        return {"status": "ok", "account_code": row["account_code"]}
+                return {'status': 'error', 'message': 'کاربر مقصد در سیستم ثبت نشده است.'}
+            cur.execute('UPDATE accounts SET owner_tg_id=?, rep_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?', (target_user_id, row['id']))
+            destination = {'type': 'user', 'rep_id': None, 'owner_tg_id': target_user_id}
+        _insert_audit(
+            cur,
+            new_rep_id if new_rep_id is not None and not to_pool else old_rep_id,
+            row['account_code'], row['email'], 'reassign_account', int(actor_id or 0), actor_name or 'Admin',
+            {'from': {'rep_id': old_rep_id, 'owner_tg_id': old_owner_tg_id}, 'to': destination, 'to_pool': bool(to_pool)},
+            'success',
+        )
+        return {'status': 'ok', 'account_code': row['account_code'], 'destination': destination}
 def acquire_operation_lock(lock_key: str, ttl_seconds: int | None = 300) -> str | None:
     """Acquire a DB-backed operation lease.
 
