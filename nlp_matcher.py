@@ -4,8 +4,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import database
 
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -153,10 +153,31 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
 
     if pending_res and role in ("super_admin", "rep"):
         res_id = pending_res["id"]
-        keyboard.append([
-            InlineKeyboardButton("🚀 فعال‌سازی فوری رزرو (سوزاندن فعلی)", callback_data=f"force_res:{res_id}:{account_code}"),
-            InlineKeyboardButton("🗑 لغو رزرو و عودت وجه", callback_data=f"cancel_res:{res_id}:{account_code}")
-        ])
+        if role == "rep":
+            # Representative activation/cancellation is explicitly two-step.
+            keyboard.append([
+                InlineKeyboardButton(
+                    "🚀 فعال‌سازی فوری رزرو (تأیید دوم)",
+                    callback_data=f"rep:confirm_force_res:{res_id}:{account_code}"
+                ),
+                InlineKeyboardButton(
+                    "🗑 لغو رزرو و عودت (تأیید دوم)",
+                    callback_data=f"rep:confirm_cancel_res:{res_id}:{account_code}"
+                )
+            ])
+        else:
+            # Super Admin account cards use the same two-step confirmation flow
+            # as the dedicated admin reservation queue.
+            keyboard.append([
+                InlineKeyboardButton(
+                    "🚀 فعال‌سازی فوری رزرو (تأیید دوم)",
+                    callback_data=f"admin:confirm_force_res:{res_id}:{account_code}"
+                ),
+                InlineKeyboardButton(
+                    "🗑 لغو رزرو و عودت (تأیید دوم)",
+                    callback_data=f"admin:confirm_cancel_res:{res_id}:{account_code}"
+                )
+            ])
     
     if role in ("super_admin", "rep"):
         quick_plans = database.get_pricing_plans(quick_only=True, active_only=True)
@@ -176,7 +197,7 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
         # Controls Row
         keyboard.append([
             InlineKeyboardButton(toggle_conn_text, callback_data=f"{toggle_conn_action}:{account_code}"),
-            InlineKeyboardButton(mode_text, callback_data=f"toggle_mode:{account_code}")
+            InlineKeyboardButton(mode_text, callback_data=f"set_mode:{account_code}:{0 if on_first_connect else 1}")
         ])
     
     # Fixed Deliverables Row

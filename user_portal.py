@@ -23,9 +23,10 @@ import database
 import nlp_matcher
 import finance_manager
 import sub_manager
+from xui_result import XUIResult, classify_xui_result
 
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
 
 logger = logging.getLogger("UserPortal")
 
@@ -67,6 +68,20 @@ def build_back_to_user_keyboard(extra_buttons=None, back_callback="user:main") -
 async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message=False):
     """Renders or edits the end-user interactive portal."""
     user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+    role, _ = database.get_user_role(
+        user.id, chat.id,
+        update.effective_message.message_thread_id if update.effective_message else None,
+    )
+    if role != "end_user":
+        notice = "⛔️ پورتال کاربری فقط برای نقش کاربر نهایی در دسترس است."
+        if update.callback_query:
+            await update.callback_query.answer(notice, show_alert=True)
+        elif update.message:
+            await update.message.reply_text(notice)
+        return
     database.ensure_bot_user(user.id, user.username or "", user.full_name or "", role="end_user")
 
     if database.is_user_blocked(user.id):
@@ -107,9 +122,52 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("⛔️ دسترسی شما به ربات مسدود شده است.", show_alert=True)
         return
 
+    role, _ = database.get_user_role(
+        user.id, chat.id,
+        update.effective_message.message_thread_id if update.effective_message else None,
+    )
+    if role != "end_user":
+        await query.answer(
+            "⛔️ این مسیر فقط برای حساب‌های کاربر نهایی مجاز است.",
+            show_alert=True
+        )
+        return
+
     data = query.data or ""
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else "main"
+
+    # Every service-specific user action must be re-authorized against the exact DB owner.
+    account_actions = {
+        "view_acc", "get_sub_link", "get_qr", "reset_sub",
+        "unlink_confirm", "do_unlink", "renew_plans"
+    }
+    owned_account = None
+    if action == "do_renew":
+        intent_id = parts[2] if len(parts) > 2 else ""
+        renew_intent = database.get_user_action_intent(intent_id, user.id)
+        if not renew_intent or renew_intent["action_type"] != "renew":
+            await query.answer("⛔️ درخواست تمدید معتبر نیست یا متعلق به شما نیست.", show_alert=True)
+            return
+        owned_account = database.get_user_owned_account(
+            user.id, renew_intent.get("account_code") or renew_intent.get("account_email") or ""
+        )
+        if (
+            not owned_account
+            or str(owned_account["account_code"]).lower() != str(renew_intent.get("account_code") or "").lower()
+            or str(owned_account["email"]).lower() != str(renew_intent.get("account_email") or "").lower()
+        ):
+            await query.answer("⛔️ مالکیت سرویس برای این درخواست قابل تأیید نیست.", show_alert=True)
+            return
+        # Retain the opaque token while normalizing the verified account target.
+        parts = [parts[0], parts[1], owned_account["email"], renew_intent["plan_code"], intent_id]
+    elif action in account_actions:
+        requested_identifier = parts[2] if len(parts) > 2 else ""
+        owned_account = database.get_user_owned_account(user.id, requested_identifier)
+        if not owned_account:
+            await query.answer("⛔️ این سرویس به حساب تلگرام شما متصل نیست.", show_alert=True)
+            return
+        parts[2] = owned_account["email"]
 
     # 1. Main Portal
     if action == "main":
@@ -195,7 +253,10 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         acc_code = parts[2] if len(parts) > 2 else ""
         insp = await asyncio.to_thread(xui_manager.inspect_client, acc_code, scope="all", by_code_only=True)
         if insp.get("status") == "ok":
-            sub_link = insp["data"].get("sub_link") or f"https://cv2xx.hst-vip.com:2223/hsubx/{insp['data'].get('sub_id')}"
+            sub_link = insp["data"].get("sub_link") or sub_manager.get_subscription_url(insp["data"].get("sub_id", ""))
+            if not sub_link:
+                await query.answer("لینک اشتراک در تنظیمات دامنه تعریف نشده است.", show_alert=True)
+                return
             msg = (
                 f"🔗 **لینک اشتراک سابسکریپشن اکانت {acc_code}:**\n\n"
                 f"`{sub_link}`\n\n"
@@ -213,29 +274,89 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         insp = await asyncio.to_thread(xui_manager.inspect_client, acc_code, scope="all", by_code_only=True)
         if insp.get("status") == "ok":
             client_info = insp["data"]
-            sub_url = client_info.get("sub_link") or f"https://cv2xx.hst-vip.com:2223/hsubx/{client_info.get('sub_id')}"
-            qr_bytes = sub_manager.generate_qr_code(sub_url)
-            caption = f"📱 **QR کد اشتراک اکانت {acc_code}**\n\nلینک: `{sub_url}`"
-            await query.message.reply_photo(photo=qr_bytes, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            sub_url = client_info.get("sub_link") or sub_manager.get_subscription_url(client_info.get("sub_id", ""))
+            if not sub_url:
+                await query.answer("دامنه سابسکریپشن در تنظیمات سامانه تعریف نشده است.", show_alert=True)
+                return
+            try:
+                qr_bytes = sub_manager.generate_qr_code(sub_url)
+                caption = f"📱 **QR کد اشتراک اکانت {acc_code}**\n\nلینک: `{sub_url}`"
+                await query.message.reply_photo(photo=qr_bytes, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                logger.exception("Could not create or deliver subscription QR for %s", acc_code)
+                await query.answer("❌ ساخت یا ارسال QR ناموفق بود؛ لینک اشتراک تغییری نکرده است.", show_alert=True)
+                return
             await query.answer("QR ارسال شد.")
         else:
             await query.answer("❌ خطا در تولید QR.", show_alert=True)
 
-    # 2.4 Reset Sub
+    # 2.4 Reset Sub — persist only a confirmed remote rotation.
     elif action == "reset_sub":
         acc_code = parts[2] if len(parts) > 2 else ""
-        res = await asyncio.to_thread(sub_manager.reset_client_subscription, acc_code, scope="all")
-        if res.get("status") == "ok":
-            new_sub_url = res["new_sub_url"]
+        lock_key = f"subscription-reset:{str(owned_account['email']).lower()}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
+        if not lock_token:
+            await query.answer("⏳ بازنشانی لینک این سرویس در حال انجام یا نیازمند تطبیق است؛ دوباره تلاش نکنید.", show_alert=True)
+            return
+
+        try:
+            res = await asyncio.to_thread(
+                sub_manager.reset_client_subscription, xui_manager, acc_code, scope="all"
+            )
+        except Exception as exc:
+            logger.exception("Subscription reset outcome is unknown for %s", acc_code)
+            await query.answer(
+                "⚠️ نتیجه بازنشانی پنل مشخص نیست؛ قفل برای بررسی مدیریت نگه داشته شد. فعلاً دوباره اقدام نکنید.",
+                show_alert=True,
+            )
+            return
+
+        if res.get("status") == "unknown":
+            await query.answer(
+                "⚠️ پاسخ پنل برای مشخص‌کردن وضعیت لینک کافی نیست؛ قفل تطبیق حفظ شد. فعلاً دوباره تلاش نکنید.",
+                show_alert=True,
+            )
+            return
+        if res.get("status") not in ("ok", "partial") or not res.get("new_sub_id"):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer(
+                f"❌ خطا: {res.get('message', 'بازنشانی تأیید نشد')}",
+                show_alert=True,
+            )
+            return
+
+        try:
+            database.upsert_account_record(
+                rep_id=owned_account.get("rep_id"),
+                email=owned_account["email"],
+                account_code=owned_account["account_code"],
+                sub_id=res["new_sub_id"],
+            )
+        except Exception:
+            logger.exception(
+                "Remote subscription ID rotated for %s but local persistence failed",
+                owned_account.get("email"),
+            )
+            await query.answer(
+                "⚠️ شناسه در پنل تغییر کرده اما ثبت محلی کامل نشد؛ قفل تطبیق حفظ شد و بررسی مدیریت لازم است.",
+                show_alert=True,
+            )
+            return
+
+        database.release_operation_lock(lock_key, lock_token)
+        if res.get("status") == "ok" and res.get("new_sub_url"):
             msg = (
-                f"🔄 **لینک اشتراک اکانت {acc_code} با موفقیت بازنشانی شد!**\n\n"
-                f"لینک قبلی باطل گردید. لطفاً لینک جدید زیر را در نرم‌افزار خود جایگزین فرمایید:\n\n"
-                f"`{new_sub_url}`"
+                f"🔄 **لینک اشتراک اکانت {acc_code} با موفقیت بازنشانی شد!**\\n\\n"
+                "لینک قبلی باطل گردید. لینک جدید را جایگزین کنید:\\n\\n"
+                f"{res['new_sub_url']}"
             )
             await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
             await query.answer("لینک ساب بازنشانی شد.")
         else:
-            await query.answer(f"❌ خطا: {res.get('message', 'ناموفق')}", show_alert=True)
+            await query.answer(
+                "⚠️ شناسه جدید در پنل و دیتابیس ثبت شد، اما لینک عمومی ساخته نشد. تنظیمات دامنه را بررسی کنید.",
+                show_alert=True,
+            )
 
     # 2.5 Unlink Confirm
     elif action == "unlink_confirm":
@@ -256,7 +377,10 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif action == "do_unlink":
         acc_code = parts[2] if len(parts) > 2 else ""
-        database.unlink_account_owner(acc_code)
+        unlinked = database.unlink_account_owner(acc_code, user.id)
+        if not unlinked:
+            await query.answer("⛔️ سرویس در اختیار شما نیست یا قبلاً قطع شده است.", show_alert=True)
+            return
         await query.answer("✅ اتصال اکانت با موفقیت قطع شد.", show_alert=True)
         await show_user_portal(update, context, edit_message=True)
 
@@ -272,9 +396,14 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         extra_btns = []
         row = []
         for p in plans:
+            intent_id = database.create_user_action_intent(
+                user_id=user.id, action_type="buy",
+                plan_code=p["plan_code"], plan_name=p["name"],
+                gb=p["gb"], days=p["days"], amount=p["user_price"],
+            )
             row.append(InlineKeyboardButton(
                 f"{p['name']} ({p['user_price']:,} ت)",
-                callback_data=f"user:confirm_buy:{p['plan_code']}"
+                callback_data=f"user:confirm_buy:{intent_id}"
             ))
             if len(row) == 2:
                 extra_btns.append(row)
@@ -288,20 +417,23 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 3.1 Confirm Buy
     elif action == "confirm_buy":
-        plan_code = parts[2] if len(parts) > 2 else "20gb_30d"
-        plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ تعرفه یافت نشد.", show_alert=True)
+        intent_id = parts[2] if len(parts) > 2 else ""
+        intent = database.get_user_action_intent(intent_id, user.id)
+        if (
+            not intent or intent["action_type"] != "buy"
+            or intent["status"] != "pending"
+            or float(intent["expires_at"]) <= time.time()
+        ):
+            await query.answer("⛔️ این درخواست خرید منقضی شده یا قبلاً استفاده شده است؛ منوی خرید را دوباره باز کنید.", show_alert=True)
             return
 
         wallet_bal = database.get_user_wallet_balance(user.id)
-        price = plan["user_price"]
-
+        price = int(intent["amount"])
         if wallet_bal < price:
             deficit = price - wallet_bal
             lines = [
                 "⚠️ **موجودی کیف پول شما کافی نیست!**\n",
-                f"• هزینه پلن انتخابی ({plan['name']}): **{price:,} تومان**",
+                f"• هزینه پلن انتخابی ({intent['plan_name']}): **{price:,} تومان**",
                 f"• موجودی فعلی شما: **{wallet_bal:,} تومان**",
                 f"• کسری موجودی: **{deficit:,} تومان**\n",
                 "لطفاً ابتدا کیف پول خود را شارژ نمایید:"
@@ -313,16 +445,18 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer()
             return
 
-        # Sufficient balance: prompt confirmation
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton(f"✅ تایید و خرید ({price:,} تومان)", callback_data=f"user:do_buy:{plan_code}"),
+                InlineKeyboardButton(
+                    f"✅ تایید و خرید ({price:,} تومان)",
+                    callback_data=f"user:do_buy:{intent_id}"
+                ),
                 InlineKeyboardButton("❌ انصراف", callback_data="user:buy_service")
             ]
         ])
         await query.edit_message_text(
             f"🛒 **تایید نهایی خرید:**\n\n"
-            f"• بسته: **{plan['name']}** ({plan['gb']} گیگابایت / {plan['days']} روز)\n"
+            f"• بسته: **{intent['plan_name']}** ({intent['gb']} گیگابایت / {intent['days']} روز)\n"
             f"• مبلغ کسر از کیف پول: **{price:,} تومان**\n"
             f"• موجودی پس از خرید: **{wallet_bal - price:,} تومان**\n\n"
             "آیا مایل به تکمیل خرید هستید؟",
@@ -331,67 +465,202 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         )
         await query.answer()
 
-    # 3.2 Execute Buy
+
+    # 3.2 Execute Buy — durable intent token prevents a callback replay from charging twice.
     elif action == "do_buy":
-        plan_code = parts[2] if len(parts) > 2 else "20gb_30d"
-        plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ تعرفه یافت نشد.", show_alert=True)
+        intent_id = parts[2] if len(parts) > 2 else ""
+        try:
+            started = database.begin_user_action_intent(intent_id, user.id, "buy")
+        except Exception:
+            logger.exception("Could not claim user purchase intent for user %s", user.id)
+            await query.answer("❌ شروع تراکنش خرید ممکن نشد؛ لطفاً دوباره منوی خرید را باز کنید.", show_alert=True)
             return
 
-        price = plan["user_price"]
-        ok, new_bal = database.deduct_user_wallet(user.id, price, f"خرید سرویس {plan['name']}")
-        if not ok:
-            await query.answer("❌ موجودی کیف پول کافی نیست.", show_alert=True)
+        if started["status"] != "started":
+            messages = {
+                "not_found": "⛔️ درخواست خرید پیدا نشد یا متعلق به شما نیست.",
+                "wrong_action": "⛔️ نوع درخواست خرید معتبر نیست.",
+                "already_processed": "⛔️ این درخواست قبلاً اجرا یا برای بررسی ثبت شده است؛ برداشت مجدد انجام نمی‌شود.",
+                "expired": "⌛️ درخواست خرید منقضی شده است؛ منوی خرید را دوباره باز کنید.",
+                "plan_changed": "⚠️ تعرفه پس از نمایش منو تغییر کرده است؛ لطفاً منوی خرید را تازه کنید.",
+                "busy": "⏳ درخواست دیگری در حال پردازش است؛ پس از پایان آن منوی خرید را دوباره باز کنید.",
+                "not_owned": "⛔️ مالکیت سرویس برای این درخواست قابل تأیید نیست.",
+            }
+            if started["status"] == "insufficient_funds":
+                msg = f"❌ موجودی کافی نیست (موجودی: {started['balance']:,} ت | موردنیاز: {started['required']:,} ت)."
+            else:
+                msg = messages.get(started["status"], "❌ درخواست خرید قابل اجرا نیست.")
+            await query.answer(msg, show_alert=True)
             return
 
-        gb = plan["gb"]
-        days = plan["days"]
+        intent = started["intent"]
+        price = int(intent["amount"])
+        gb = float(intent["gb"])
+        days = int(intent["days"])
+        lock_key = started["lock_key"]
+        lock_token = started["lock_token"]
+        new_bal = started["new_balance"]
         comment = f"User_{user.id}_{user.first_name or ''}"[:30]
+        try:
+            alloc_res = await asyncio.to_thread(
+                xui_manager.allocate_pool_client, gb, days, comment=comment, scope="all"
+            )
+        except Exception:
+            logger.exception("User purchase outcome is unknown for user %s", user.id)
+            try:
+                database.mark_user_action_intent_for_reconciliation(
+                    intent_id, user.id, lock_key, lock_token,
+                    "X-UI allocation raised an exception; external outcome must be reconciled",
+                )
+            except Exception:
+                logger.exception("Could not mark user purchase intent for reconciliation (%s)", intent_id)
+            await query.answer(
+                "⚠️ پاسخ پنل نامشخص است. مبلغ محفوظ مانده و درخواست برای تطبیق مدیریتی قفل شده است.",
+                show_alert=True
+            )
+            return
 
-        alloc_res = await asyncio.to_thread(xui_manager.allocate_pool_client, gb, days, comment=comment, scope="all")
-        if alloc_res.get("status") == "success":
+        if classify_xui_result(alloc_res) == XUIResult.SUCCESS:
             email = alloc_res.get("email")
             sub_id = alloc_res.get("sub_id")
-            code = xui_manager.extract_account_identifier(email) or email
+            if not email:
+                logger.error("X-UI reports success but has no email for user purchase %s: %r", user.id, alloc_res)
+                try:
+                    database.mark_user_action_intent_for_reconciliation(
+                        intent_id, user.id, lock_key, lock_token,
+                        "X-UI reported allocation success without an account email",
+                    )
+                except Exception:
+                    logger.exception("Could not mark incomplete purchase result for reconciliation (%s)", intent_id)
+                await query.answer("⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ مبلغ محفوظ و عملیات قفل شد.", show_alert=True)
+                return
 
-            # Record in accounts and link to user
-            database.upsert_account_record(
-                rep_id=None,
-                email=email,
-                account_code=code,
-                customer_name=user.full_name or "EndUser",
-                sub_id=sub_id,
-                enable=1,
-                total_gb=gb,
-                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
+            try:
+                code = xui_manager.extract_account_identifier(email) or email
+                database.upsert_account_record(
+                    rep_id=None,
+                    email=email,
+                    account_code=code,
+                    customer_name=user.full_name or "EndUser",
+                    sub_id=sub_id,
+                    enable=1,
+                    total_gb=gb,
+                    expiry_time=alloc_res.get("data", {}).get("expiry_time", 0),
+                    owner_tg_id=user.id
+                )
+            except Exception:
+                logger.exception("X-UI allocated account %s but local persistence failed", email)
+                try:
+                    database.mark_user_action_intent_for_reconciliation(
+                        intent_id, user.id, lock_key, lock_token,
+                        f"X-UI created account {email}, but local account persistence failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark local persistence failure for reconciliation (%s)", intent_id)
+                await query.answer(
+                    "⚠️ اکانت در پنل ایجاد شده اما ثبت محلی کامل نشد؛ مبلغ محفوظ و عملیات قفل شد.",
+                    show_alert=True
+                )
+                return
+
+            try:
+                database.complete_user_action_intent(
+                    intent_id, user.id, lock_key, lock_token,
+                    result_note=f"Allocated account {code}",
+                )
+            except Exception:
+                logger.exception("Could not finalize successful purchase intent %s", intent_id)
+                try:
+                    database.mark_user_action_intent_for_reconciliation(
+                        intent_id, user.id, lock_key, lock_token,
+                        f"X-UI account {code} and local record exist, but intent finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark unfinalized successful purchase for reconciliation (%s)", intent_id)
+                await query.answer("⚠️ اکانت ثبت شد اما نهایی‌سازی تراکنش کامل نشد؛ عملیات برای تطبیق مدیریتی قفل باقی ماند.", show_alert=True)
+                return
+
+            sub_url = alloc_res.get("data", {}).get("sub_link") or sub_manager.get_subscription_url(sub_id or "")
+            delivered_link = (
+                f"🔗 **لینک اختصاصی شما:**\n{sub_url}\n\n"
+                if sub_url else
+                "⚠️ لینک عمومی سابسکریپشن در تنظیمات سرور تعریف نشده است. برای دریافت لینک با پشتیبانی تماس بگیرید.\n\n"
             )
-            database.link_user_to_account(user.id, code, user.username or "", user.full_name or "")
-
-            sub_url = alloc_res.get("data", {}).get("sub_link") or f"https://cv2xx.hst-vip.com:2223/hsubx/{sub_id}"
             deliv_text = (
                 f"🎉 **سرویس شما با موفقیت فعال و متصل شد!**\n\n"
-                f"• کد شناسه سرویس: `{code}`\n"
-                f"• حجم: **{int(gb)} گیگابایت** | مدت: **{int(days)} روز**\n"
-                f"• کسر از کیف پول: `{price:,} تومان` | مانده کیف پول: `{new_bal:,} تومان`\n\n"
-                f"🔗 **لینک اختصاصی شما:**\n`{sub_url}`\n\n"
-                "💡 این لینک را در اپلیکیشن فیلترشکن خود وارد نمایید."
+                f"• کد شناسه سرویس: {code}\n"
+                f"• حجم: **{int(gb)} گیگابایت** | مدت: **{days} روز**\n"
+                f"• کسر از کیف پول: {price:,} تومان | مانده کیف پول: {new_bal:,} تومان\n\n"
+                f"{delivered_link}"
+                "💡 شناسه سرویس را برای پیگیری‌های بعدی نگهداری کنید."
             )
-
-            # Generate QR
-            qr_bytes = sub_manager.generate_qr_code(sub_url)
-            await query.message.reply_photo(
-                photo=qr_bytes,
-                caption=deliv_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=build_user_portal_keyboard()
-            )
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            if sub_url:
+                try:
+                    qr_bytes = sub_manager.generate_qr_code(sub_url)
+                    await query.message.reply_photo(
+                        photo=qr_bytes, caption=deliv_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=build_user_portal_keyboard()
+                    )
+                except Exception:
+                    logger.exception("Could not deliver purchase QR for %s; sending text fallback", code)
+                    await query.message.reply_text(
+                        deliv_text, parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=build_user_portal_keyboard()
+                    )
+            else:
+                await query.message.reply_text(
+                    deliv_text, parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=build_user_portal_keyboard()
+                )
             await query.answer("🎉 خرید با موفقیت انجام شد!")
+        elif classify_xui_result(alloc_res) == XUIResult.FAILURE:
+            try:
+                database.refund_user_wallet_and_release_operation_lock(
+                    user_id=user.id,
+                    amount=price,
+                    description="استرداد وجه به دلیل شکست قطعی تخصیص اکانت",
+                    actor_id=user.id,
+                    actor_name="SystemRefund",
+                    lock_key=lock_key,
+                    token=lock_token,
+                    intent_id=intent_id,
+                )
+            except Exception:
+                logger.exception(
+                    "User purchase refund failed; persistent operation lock retained for reconciliation (user=%s)",
+                    user.id,
+                )
+                await query.answer(
+                    "⚠️ صدور ناموفق بود اما استرداد در دیتابیس ثبت نشد؛ قفل عملیات برای بررسی مدیریت محفوظ مانده است.",
+                    show_alert=True,
+                )
+                return
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            await query.message.reply_text(
+                f"❌ صدور سرویس توسط پنل رد شد. مبلغ {price:,} تومان به کیف پول بازگشت داده شد."
+            )
+            await query.answer("صدور سرویس ناموفق بود.", show_alert=True)
         else:
-            # Refund wallet
-            database.record_user_payment(user.id, price, "استرداد وجه به دلیل عدم موجودی استخر آزاد", actor_id=user.id, actor_name="SystemRefund")
-            await query.message.reply_text(f"❌ متاسفانه موجودی سرور موقتاً به اتمام رسیده است. مبلغ {price:,} تومان به کیف پول شما عودت داده شد.")
-            await query.answer("خطا در صدور سرویس", show_alert=True)
+            logger.error("Ambiguous X-UI allocation response for user %s: %r", user.id, alloc_res)
+            try:
+                database.mark_user_action_intent_for_reconciliation(
+                    intent_id, user.id, lock_key, lock_token,
+                    f"Ambiguous X-UI allocation response: {alloc_res!r}"[:500],
+                )
+            except Exception:
+                logger.exception("Could not mark ambiguous purchase intent for reconciliation (%s)", intent_id)
+            await query.answer(
+                "⚠️ پاسخ پنل برای تایید یا رد خرید کافی نیست؛ مبلغ محفوظ و عملیات قفل شده است.",
+                show_alert=True
+            )
 
     # 4. User Wallet View
     elif action == "wallet":
@@ -465,7 +734,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 7. Renew Account Via Wallet Selection
     elif action == "renew_plans":
-        acc_code = parts[2] if len(parts) > 2 else ""
+        acc_code = owned_account["account_code"]
         plans = database.get_pricing_plans(active_only=True)
         wallet_bal = database.get_user_wallet_balance(user.id)
         lines = [
@@ -476,9 +745,20 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         extra_btns = []
         row = []
         for p in plans:
+            intent_id = database.create_user_action_intent(
+                user_id=user.id,
+                action_type="renew",
+                plan_code=p["plan_code"],
+                plan_name=p["name"],
+                gb=p["gb"],
+                days=p["days"],
+                amount=p["user_price"],
+                account_code=owned_account["account_code"],
+                account_email=owned_account["email"],
+            )
             row.append(InlineKeyboardButton(
                 f"{p['name']} ({p['user_price']:,} ت)",
-                callback_data=f"user:do_renew:{acc_code}:{p['plan_code']}"
+                callback_data=f"user:do_renew:{intent_id}"
             ))
             if len(row) == 2:
                 extra_btns.append(row)
@@ -490,44 +770,133 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer()
 
-    # 7.1 Execute Renew with Wallet
+    # 7.1 Execute Renew with Wallet — intent token resolves the canonical owned account.
     elif action == "do_renew":
-        acc_code = parts[2] if len(parts) > 2 else ""
-        plan_code = parts[3] if len(parts) > 3 else "20gb_30d"
-        plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ تعرفه یافت نشد.", show_alert=True)
+        intent_id = parts[4] if len(parts) > 4 else ""
+        acc_code = owned_account["email"]
+        try:
+            started = database.begin_user_action_intent(intent_id, user.id, "renew")
+        except Exception:
+            logger.exception("Could not claim user renewal intent for %s", intent_id)
+            await query.answer("❌ شروع تراکنش تمدید ممکن نشد؛ لطفاً منوی تمدید را دوباره باز کنید.", show_alert=True)
             return
 
-        price = plan["user_price"]
-        ok, new_bal = database.deduct_user_wallet(user.id, price, f"تمدید سرویس {acc_code} ({plan['name']})")
-        if not ok:
-            wallet_bal = database.get_user_wallet_balance(user.id)
-            await query.answer(f"❌ موجودی کیف پول کافی نیست (موجودی: {wallet_bal:,} ت | مورد نیاز: {price:,} ت)", show_alert=True)
+        if started["status"] != "started":
+            messages = {
+                "not_found": "⛔️ درخواست تمدید پیدا نشد یا متعلق به شما نیست.",
+                "wrong_action": "⛔️ نوع درخواست تمدید معتبر نیست.",
+                "already_processed": "⛔️ این درخواست تمدید قبلاً اجرا یا برای بررسی ثبت شده است؛ برداشت مجدد انجام نمی‌شود.",
+                "expired": "⌛️ درخواست تمدید منقضی شده است؛ منوی تمدید را دوباره باز کنید.",
+                "plan_changed": "⚠️ تعرفه پس از نمایش منو تغییر کرده است؛ لطفاً منوی تمدید را تازه کنید.",
+                "busy": "⏳ عملیات دیگری روی این سرویس در جریان است؛ منوی تمدید را پس از پایان آن دوباره باز کنید.",
+                "not_owned": "⛔️ مالکیت سرویس برای این درخواست قابل تأیید نیست.",
+            }
+            if started["status"] == "insufficient_funds":
+                msg = f"❌ موجودی کافی نیست (موجودی: {started['balance']:,} ت | موردنیاز: {started['required']:,} ت)."
+            else:
+                msg = messages.get(started["status"], "❌ درخواست تمدید قابل اجرا نیست.")
+            await query.answer(msg, show_alert=True)
             return
 
-        # Renew client on X-UI
-        gb = plan["gb"]
-        days = plan["days"]
-        renew_res = await asyncio.to_thread(
-            xui_manager.renew_client,
-            acc_code, gb, days, comment=None, rollover=True, countdown="auto", scope="all", by_code_only=True
-        )
+        intent = started["intent"]
+        plan_name = intent["plan_name"]
+        price = int(intent["amount"])
+        lock_key = started["lock_key"]
+        lock_token = started["lock_token"]
+        new_bal = started["new_balance"]
 
-        if renew_res.get("status") == "success":
+        try:
+            renew_res = await asyncio.to_thread(
+                xui_manager.renew_client,
+                acc_code, float(intent["gb"]), int(intent["days"]),
+                comment=None, rollover=True, countdown="auto", scope="all", by_code_only=True
+            )
+        except Exception:
+            logger.exception("User renewal outcome is unknown for %s", acc_code)
+            try:
+                database.mark_user_action_intent_for_reconciliation(
+                    intent_id, user.id, lock_key, lock_token,
+                    "X-UI renewal raised an exception; external outcome must be reconciled",
+                )
+            except Exception:
+                logger.exception("Could not mark renewal intent for reconciliation (%s)", intent_id)
+            await query.answer(
+                "⚠️ پاسخ پنل نامشخص است؛ مبلغ محفوظ و عملیات برای تطبیق مدیریتی قفل شده است.",
+                show_alert=True
+            )
+            return
+
+        if classify_xui_result(renew_res) == XUIResult.SUCCESS:
+            try:
+                database.complete_user_action_intent(
+                    intent_id, user.id, lock_key, lock_token,
+                    result_note=f"Renewed account {intent['account_code']}",
+                )
+            except Exception:
+                logger.exception("Could not finalize successful renewal intent %s", intent_id)
+                try:
+                    database.mark_user_action_intent_for_reconciliation(
+                        intent_id, user.id, lock_key, lock_token,
+                        f"X-UI renewal succeeded for {intent['account_code']}, but intent finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark unfinalized renewal for reconciliation (%s)", intent_id)
+                await query.answer("⚠️ تمدید در پنل انجام شد اما نهایی‌سازی تراکنش کامل نشد؛ عملیات برای بررسی قفل باقی ماند.", show_alert=True)
+                return
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
             await query.message.reply_text(
                 f"✅ **سرویس {acc_code} با موفقیت تمدید شد!**\n\n"
-                f"• بسته: **{plan['name']}**\n"
-                f"• کسر از کیف پول: `{price:,} تومان`\n"
-                f"• موجودی باقیمانده: `{new_bal:,} تومان`",
+                f"• بسته: **{plan_name}**\n"
+                f"• کسر از کیف پول: {price:,} تومان\n"
+                f"• موجودی باقیمانده: {new_bal:,} تومان",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=build_user_portal_keyboard()
             )
             await query.answer("سرویس با موفقیت تمدید شد.")
+        elif classify_xui_result(renew_res) == XUIResult.FAILURE:
+            try:
+                database.refund_user_wallet_and_release_operation_lock(
+                    user_id=user.id,
+                    amount=price,
+                    description=f"استرداد به دلیل شکست قطعی تمدید {acc_code}",
+                    actor_id=user.id,
+                    actor_name="RenewRefund",
+                    lock_key=lock_key,
+                    token=lock_token,
+                    intent_id=intent_id,
+                )
+            except Exception:
+                logger.exception(
+                    "User renewal refund failed; persistent operation lock retained for reconciliation (account=%s)",
+                    acc_code,
+                )
+                await query.answer(
+                    "⚠️ تمدید ناموفق بود اما استرداد در دیتابیس ثبت نشد؛ قفل عملیات برای بررسی مدیریت محفوظ مانده است.",
+                    show_alert=True,
+                )
+                return
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            await query.answer("❌ پنل تمدید را رد کرد؛ مبلغ به کیف پول بازگشت داده شد.", show_alert=True)
         else:
-            # Refund
-            database.record_user_payment(user.id, price, f"استرداد به دلیل خطای تمدید {acc_code}", actor_id=user.id, actor_name="RenewRefund")
-            await query.answer("❌ خطا در اجرای تمدید در سرور. مبلغ به کیف پول بازگشت داده شد.", show_alert=True)
+            logger.error("Ambiguous X-UI renewal response for %s: %r", acc_code, renew_res)
+            try:
+                database.mark_user_action_intent_for_reconciliation(
+                    intent_id, user.id, lock_key, lock_token,
+                    f"Ambiguous X-UI renewal response: {renew_res!r}"[:500],
+                )
+            except Exception:
+                logger.exception("Could not mark ambiguous renewal intent for reconciliation (%s)", intent_id)
+            await query.answer(
+                "⚠️ پاسخ پنل برای تایید یا رد تمدید کافی نیست؛ مبلغ محفوظ و عملیات قفل شده است.",
+                show_alert=True
+            )
+
 
 
 async def process_user_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -551,8 +920,8 @@ async def process_user_text_input(update: Update, context: ContextTypes.DEFAULT_
 
     if action == "awaiting_link_code":
         context.user_data.pop("user_state", None)
-        linked = database.link_user_to_account(user.id, msg_text, user.username or "", user.full_name or "")
-        if linked:
+        linked = database.link_user_to_account(msg_text, user.id, user.username or "", user.full_name or "")
+        if isinstance(linked, dict) and linked.get("status") == "ok":
             await update.message.reply_text(
                 f"✅ **اکانت `{msg_text}` با موفقیت به حساب تلگرام شما متصل گردید.**\n\n"
                 "از این پس می‌توانید وضعیت مصرف این سرویس را در بخش «📱 سرویس‌های من» مشاهده و تمدید نمایید.",

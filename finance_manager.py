@@ -37,7 +37,7 @@ def build_card_payment_keyboard(tracking_code: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📸 ارسال تصویر فیش واریزی", callback_data=f"send_receipt_{tracking_code}"),
         ],
         [
-            InlineKeyboardButton("❌ انصراف", callback_data="cancel_payment"),
+            InlineKeyboardButton("❌ انصراف", callback_data=f"cancel_payment:{tracking_code}"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -61,6 +61,29 @@ def build_admin_reviewed_keyboard(status: str) -> InlineKeyboardMarkup:
     """Keyboard shown after an admin settles the receipt."""
     text = "✅ تایید شده" if status == "approved" else "❌ رد شده"
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data="noop")]])
+
+
+async def reply_with_receipt_detail(message, receipt: dict, text: str, reply_markup=None):
+    """Show the persisted receipt image when available, with a text fallback."""
+    photo_id = receipt.get("receipt_photo_id")
+    if photo_id:
+        try:
+            return await message.reply_photo(
+                photo=photo_id,
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            logger.exception(
+                "Could not replay stored receipt image for receipt %s; using text fallback",
+                receipt.get("id") or receipt.get("tracking_code"),
+            )
+    return await message.reply_text(
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
+    )
 
 
 def build_wallet_menu_keyboard(balance_toman: int, is_rep: bool = False) -> InlineKeyboardMarkup:

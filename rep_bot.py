@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 import asyncio
+import html
 from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -31,18 +32,37 @@ import admin_panel
 import rep_panel
 import user_portal
 import finance_manager
+from receipt_notifications import process_receipt_notification_outbox
 import sub_manager
-from watchdog_service import WatchdogService
+from xui_result import XUIResult, classify_xui_result
 
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
-import backup_and_report
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
+backup_and_report = load_integration("backup_and_report")
 
 # Set up logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger("HstAgentBot")
+
+
+def _is_private_super_admin(update: Update) -> bool:
+    """True only for the configured Super Admin in the bot's private chat."""
+    user = update.effective_user
+    chat = update.effective_chat
+    return bool(user and chat and user.id == ADMIN_TELEGRAM_ID and chat.type == "private")
+
+
+
+def _xui_operation_succeeded(result) -> bool:
+    """True only for a consistent explicit success response."""
+    return classify_xui_result(result) == XUIResult.SUCCESS
+
+def _xui_operation_failed(result) -> bool:
+    """True only for a consistent explicit failure response."""
+    return classify_xui_result(result) == XUIResult.FAILURE
+
 
 async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=ParseMode.MARKDOWN):
     """
@@ -149,7 +169,7 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
-    if role == "unauthorized_group":
+    if role != "end_user":
         return
 
     # Allow /link in Private DM (chat.id > 0) AND in End-User Sandbox topic
@@ -181,7 +201,7 @@ async def pricing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
-    if role == "unauthorized_group":
+    if role == "unauthorized_group" or (role == "super_admin" and chat.type != "private"):
         return
         
     plans = database.get_pricing_plans()
@@ -202,7 +222,7 @@ async def pricing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
         return
     args = context.args
     if len(args) < 3:
@@ -229,7 +249,16 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role not in ("super_admin", "rep"):
         return
 
+    # Global financial aggregates are private-chat-only.
+    if role == "super_admin" and rep is None and chat.type != "private":
+        return
+
     # If Super Admin in private DM (without specific rep context), show aggregated summary of all reps
+    if role == "super_admin" and rep is None and chat.type != "private":
+        return
+    if role not in ("super_admin", "rep") or (role == "rep" and not rep):
+        return
+
     if role == "super_admin" and rep is None:
         reps = database.get_all_active_reps()
         lines = ["📊 **گزارش تجمیعی صورت‌حساب کلیه نمایندگان:**\n"]
@@ -269,7 +298,7 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
         return
     args = context.args
     if len(args) < 2:
@@ -278,6 +307,9 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rep_code = args[0].lower()
     amount = int(args[1])
+    if amount <= 0:
+        await update.message.reply_text("❌ مبلغ تسویه باید عددی مثبت باشد.")
+        return
     desc = " ".join(args[2:]) if len(args) > 2 else "تسویه حساب / واریزی نماینده"
 
     rep_info = database.get_rep_by_code(rep_code)
@@ -343,7 +375,7 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
-    if role == "unauthorized_group":
+    if role not in ("end_user", "rep") or (role == "rep" and not rep):
         return
 
     args = context.args or []
@@ -362,19 +394,18 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     card_info = database.get_card_info()
-    tr_code = finance_manager.generate_tracking_code()
-    context.user_data["active_receipt_code"] = tr_code
-    context.user_data["deposit_amount"] = amount
-    context.user_data["deposit_role"] = "rep" if role == "rep" else "end_user"
-
     dep_role = "rep" if role == "rep" else "end_user"
     target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
-    database.create_payment_receipt(
+    tr_code = database.create_payment_receipt(
         user_id=user.id,
         role=dep_role,
         amount_toman=amount,
         rep_id=target_rep_id
     )
+    context.user_data["active_receipt_code"] = tr_code
+    context.user_data["deposit_amount"] = amount
+    context.user_data["deposit_role"] = dep_role
+    context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_PHOTO
 
     msg = finance_manager.format_card_instructions(amount, tr_code, card_info)
     keyboard = finance_manager.build_card_payment_keyboard(tr_code)
@@ -382,7 +413,7 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
         return
     args = context.args or []
     if len(args) >= 3:
@@ -410,13 +441,360 @@ async def card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
 
+async def operations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show persistent or unexpired external-operation locks to the Super Admin."""
+    user = update.effective_user
+    if not _is_private_super_admin(update):
+        return
+    locks = await asyncio.to_thread(database.get_operation_locks)
+    if not locks:
+        await update.message.reply_text("✅ هیچ عملیات معلق یا قفل فعالی برای تطبیق وجود ندارد.")
+        return
+    lines = [
+        "⚠️ **عملیات‌های قفل‌شده / نیازمند تطبیق**",
+        "این قفل‌ها مانع اجرای دوباره عملیات خارجی می‌شوند. پیش از آزادسازی، وضعیت دقیق اکانت را در 3X-UI بررسی کنید.",
+        ""
+    ]
+    for item in locks[:30]:
+        lines.append(
+            f"• `{item['lock_key']}`\n"
+            f"  ایجاد: `{item['created_at']}` | انقضا: `{item['expires_at']}`"
+        )
+        if item.get("intent_id"):
+            owner_type = item.get("intent_owner_type")
+            action_type = item.get("action_type")
+            if action_type == "reservation_activation":
+                owner_label = "نماینده" if owner_type == "representative" else "مدیریت کل"
+                command = "/resolvereservation"
+            elif action_type == "admin_renewal":
+                owner_label, command = "مدیریت کل", "/resolveadminrenewal"
+            elif owner_type == "representative" and action_type == "renew":
+                owner_label, command = "نماینده", "/resolvereprenewal"
+            elif owner_type == "representative":
+                owner_label, command = "نماینده", "/resolverepintent"
+            elif owner_type == "end_user":
+                owner_label, command = "کاربر", "/resolveintent"
+            else:
+                owner_label, command = "نامشخص", "/unlock"
+            if action_type == "reservation_activation":
+                lines.append(
+                    f"  ⚠️ رزرو: `{item.get('reservation_id')}` | {owner_label} | "
+                    f"Actor Telegram ID: `{item.get('user_id')}` | وضعیت: {item.get('intent_status')}"
+                )
+                lines.append(
+                    f"  تعیین تکلیف پس از تطبیق X-UI: {command} <reservation-id> APPLIED: ... "
+                    f"یا {command} <reservation-id> NOT_APPLIED: ..."
+                )
+            else:
+                lines.append(
+                    f"  ⚠️ Intent: `{item['intent_id']}` | نوع: {action_type} "
+                    f"| {owner_label} Telegram ID: `{item.get('user_id')}` | وضعیت: {item.get('intent_status')}"
+                )
+                lines.append(
+                    f"  تعیین تکلیف مالی: {command} <intent-id> APPLIED: ... "
+                    f"یا {command} <intent-id> REFUND_NOT_APPLIED: ..."
+                )
+    lines.append(
+        "\nقفل‌های عادی را فقط پس از بررسی پنل و دیتابیس با /unlock حل کنید. "
+        "قفل‌های Intent کاربر با /resolveintent، صدور نماینده با /resolverepintent، تمدید نماینده با /resolvereprenewal، تمدید مستقیم مدیریت کل با /resolveadminrenewal و فعال‌سازی رزرو با /resolvereservation تعیین تکلیف می‌شوند."
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def unlock_operation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Release an unresolved-operation lock only with explicit admin evidence."""
+    user = update.effective_user
+    if not _is_private_super_admin(update):
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور:\n"
+            "`/unlock <operation-key> VERIFIED_NOT_APPLIED: توضیح بررسی پنل`\n"
+            "یا\n"
+            "`/unlock <operation-key> RECONCILED: توضیح اصلاح وضعیت محلی`\n\n"
+            "پیش از این دستور حتماً وضعیت همان اکانت را در 3X-UI و دیتابیس تطبیق دهید."
+        )
+        return
+    lock_key = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if not (
+        evidence.startswith("VERIFIED_NOT_APPLIED:")
+        or evidence.startswith("RECONCILED:")
+    ):
+        await update.message.reply_text(
+            "⛔️ مدرک باید با VERIFIED_NOT_APPLIED: یا RECONCILED: شروع شود."
+        )
+        return
+    try:
+        resolved = await asyncio.to_thread(
+            database.resolve_operation_lock,
+            lock_key, user.id, user.full_name or "Super Admin", evidence
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ آزادسازی انجام نشد: {exc}")
+        return
+    if resolved:
+        await update.message.reply_text(
+            f"✅ قفل `{lock_key}` با ثبت مدرک و هویت مدیر آزاد شد.\n"
+            "این دستور هیچ تغییری در 3X-UI، موجودی یا وضعیت رزرو ایجاد نمی‌کند."
+        )
+    else:
+        await update.message.reply_text("ℹ️ چنین قفل فعالی پیدا نشد.")
+
+
+async def resolve_user_intent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of a user purchase/renewal with atomic wallet semantics."""
+    user = update.effective_user
+    if not _is_private_super_admin(update):
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور (فقط پس از بررسی مستقیم اکانت و دیتابیس):\n"
+            "`/resolveintent <intent-id> APPLIED: مدرک انجام عملیات در 3X-UI`\n"
+            "یا\n"
+            "`/resolveintent <intent-id> REFUND_NOT_APPLIED: مدرک عدم انجام عملیات در 3X-UI`\n\n"
+            "APPLIED قفل را آزاد و Intent را موفق ثبت می‌کند؛ REFUND_NOT_APPLIED مبلغ را به‌صورت اتمیک مسترد و Intent را refunded می‌کند."
+        )
+        return
+
+    intent_id = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("REFUND_NOT_APPLIED:"):
+        resolution = "REFUND_NOT_APPLIED"
+    else:
+        await update.message.reply_text(
+            "⛔️ مدرک باید با APPLIED: یا REFUND_NOT_APPLIED: شروع شود."
+        )
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_user_action_intent,
+            intent_id,
+            user.id,
+            user.full_name or "Super Admin",
+            resolution,
+            evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف انجام نشد: {exc}")
+        return
+
+    if result["status"] == "succeeded":
+        await update.message.reply_text(
+            f"✅ Intent `{intent_id}` به‌عنوان انجام‌شده ثبت شد و قفل `{result['lock_key']}` آزاد شد.\n"
+            "برداشت مالی قبلی حفظ شد؛ هیچ درخواست خارجی جدیدی ارسال نشد."
+        )
+    elif result["status"] == "refunded":
+        await update.message.reply_text(
+            f"✅ Intent `{intent_id}` مسترد شد؛ مبلغ {result['amount']:,} تومان به کیف پول کاربر "
+            f"`{result['user_id']}` بازگشت و موجودی جدید {result['new_balance']:,} تومان است.\n"
+            f"قفل `{result['lock_key']}` نیز در همان تراکنش آزاد شد."
+        )
+
+
+async def resolve_rep_intent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of a representative issuance precharge."""
+    user = update.effective_user
+    if not _is_private_super_admin(update):
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور (پس از تطبیق مستقیم اکانت در 3X-UI و دیتابیس):\n"
+            "`/resolverepintent <intent-id> APPLIED: مدرک وجود اکانت و ثبت محلی`\n"
+            "یا\n"
+            "`/resolverepintent <intent-id> REFUND_NOT_APPLIED: مدرک عدم صدور اکانت`\n\n"
+            "APPLIED پیش‌پرداخت را حفظ و Intent را موفق ثبت می‌کند؛ "
+            "REFUND_NOT_APPLIED پیش‌پرداخت را به‌صورت اتمیک به تراز نماینده برمی‌گرداند."
+        )
+        return
+
+    intent_id = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("REFUND_NOT_APPLIED:"):
+        resolution = "REFUND_NOT_APPLIED"
+    else:
+        await update.message.reply_text("⛔️ مدرک باید با APPLIED: یا REFUND_NOT_APPLIED: شروع شود.")
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_rep_action_intent,
+            intent_id,
+            user.id,
+            user.full_name or "Super Admin",
+            resolution,
+            evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف انجام نشد: {exc}")
+        return
+
+    if result["status"] == "succeeded":
+        await update.message.reply_text(
+            f"✅ Intent نماینده `{intent_id}` به‌عنوان انجام‌شده ثبت شد؛ "
+            f"قفل `{result['lock_key']}` آزاد شد. پیش‌پرداخت قبلی حفظ شد و درخواست خارجی جدیدی ارسال نشد."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ پیش‌پرداخت Intent `{intent_id}` مسترد شد؛ "
+            f"{result['amount']:,} تومان به تراز نماینده {result['rep_id']} برگشت. "
+            f"مانده جدید: {result['new_balance']:,} تومان؛ قفل نیز آزاد شد."
+        )
+
+
+async def resolve_admin_renewal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of an ambiguous Super Admin quick renewal."""
+    user = update.effective_user
+    if not _is_private_super_admin(update):
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور (پس از تطبیق مستقیم اکانت در 3X-UI و دیتابیس):\n"
+            "`/resolveadminrenewal <confirmation-id> APPLIED: مدرک تمدید موفق`\n"
+            "یا\n"
+            "`/resolveadminrenewal <confirmation-id> NOT_APPLIED: مدرک عدم اعمال تمدید`\n\n"
+            "این دستور فقط وضعیت تأیید و قفل را تعیین تکلیف می‌کند و هیچ تغییر مالی ایجاد نمی‌کند."
+        )
+        return
+    confirmation_id = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("NOT_APPLIED:"):
+        resolution = "NOT_APPLIED"
+    else:
+        await update.message.reply_text("⛔️ مدرک باید با APPLIED: یا NOT_APPLIED: شروع شود.")
+        return
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_admin_renewal_confirmation,
+            confirmation_id, user.id, user.full_name or "Super Admin", resolution, evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف تمدید مدیریت کل انجام نشد: {exc}")
+        return
+    state_text = "موفق" if result["status"] == "succeeded" else "ناموفق و عدم اعمال تمدید"
+    await update.message.reply_text(
+        f"✅ تأیید تمدید `{confirmation_id}` با مدرک ثبت شد: {state_text}. "
+        f"قفل `{result['lock_key']}` آزاد شد؛ عملیات خارجی جدیدی ارسال نشد."
+    )
+
+
+async def resolve_reservation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of an ambiguous reserved-package activation."""
+    user = update.effective_user
+    if not _is_private_super_admin(update):
+        return
+    args = context.args or []
+    if len(args) < 2 or not args[0].isdigit():
+        await update.message.reply_text(
+            "فرمت دستور (پس از تطبیق وضعیت همان اکانت در 3X-UI):\n"
+            "`/resolvereservation <reservation-id> APPLIED: مدرک فعال شدن بسته`\n"
+            "یا\n"
+            "`/resolvereservation <reservation-id> NOT_APPLIED: مدرک عدم اعمال تمدید`\n\n"
+            "APPLIED رزرو را فعال و قفل را آزاد می‌کند. NOT_APPLIED فقط قفل را آزاد می‌کند و رزرو در صف باقی می‌ماند؛ در صورت نیاز می‌توانید بعداً آن را لغو و وجه را مسترد کنید."
+        )
+        return
+
+    res_id = int(args[0])
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("NOT_APPLIED:"):
+        resolution = "NOT_APPLIED"
+    else:
+        await update.message.reply_text("⛔️ مدرک باید با APPLIED: یا NOT_APPLIED: شروع شود.")
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_reservation_activation,
+            res_id, user.id, user.full_name or "Super Admin", resolution, evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف رزرو انجام نشد: {exc}")
+        return
+
+    if result["status"] == "activated":
+        await update.message.reply_text(
+            f"✅ رزرو `{res_id}` به‌عنوان فعال‌شده ثبت شد؛ قفل `{result['lock_key']}` آزاد شد. پیش‌پرداخت قبلی بدون تغییر باقی ماند."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ مدرک عدم اعمال تمدید برای رزرو `{res_id}` ثبت شد؛ قفل آزاد شد و رزرو همچنان در صف باقی ماند. برای لغو و استرداد از دکمه لغو رزرو استفاده کنید."
+        )
+
+
+async def resolve_rep_renewal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Evidence-gated resolution of an uncertain representative renewal precharge."""
+    user = update.effective_user
+    if not _is_private_super_admin(update):
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "فرمت دستور (پس از تطبیق مستقیم اکانت در 3X-UI و دیتابیس):\n"
+            "`/resolvereprenewal <intent-id> APPLIED: مدرک تمدید موفق`\n"
+            "یا\n"
+            "`/resolvereprenewal <intent-id> REFUND_NOT_APPLIED: مدرک عدم اعمال تمدید`\n\n"
+            "APPLIED پیش‌پرداخت را حفظ می‌کند؛ REFUND_NOT_APPLIED اعتبار نماینده را به‌صورت اتمیک مسترد می‌کند. هر دو مسیر قفل دقیق عملیات را آزاد می‌کنند."
+        )
+        return
+
+    intent_id = args[0].strip()
+    evidence = " ".join(args[1:]).strip()
+    if evidence.startswith("APPLIED:"):
+        resolution = "APPLIED"
+    elif evidence.startswith("REFUND_NOT_APPLIED:"):
+        resolution = "REFUND_NOT_APPLIED"
+    else:
+        await update.message.reply_text("⛔️ مدرک باید با APPLIED: یا REFUND_NOT_APPLIED: شروع شود.")
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            database.resolve_rep_renewal_intent,
+            intent_id, user.id, user.full_name or "Super Admin", resolution, evidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ تعیین تکلیف تمدید انجام نشد: {exc}")
+        return
+
+    if result["status"] == "succeeded":
+        await update.message.reply_text(
+            f"✅ تمدید نماینده `{intent_id}` به‌عنوان انجام‌شده ثبت شد؛ پیش‌پرداخت حفظ و قفل `{result['lock_key']}` آزاد شد. درخواست خارجی جدیدی ارسال نشد."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ پیش‌پرداخت تمدید `{intent_id}` به مبلغ {result['amount']:,} تومان مسترد شد. "
+            f"نماینده: {result['rep_id']} | مانده جدید: {result['new_balance']:,} تومان | قفل آزاد شد."
+        )
+
+
 async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != ADMIN_TELEGRAM_ID:
+    if not _is_private_super_admin(update):
         return
-    count = database.sync_all_active_reps()
+    result = await asyncio.to_thread(database.sync_all_active_reps_detailed)
+    if result.get("status") != "success":
+        await update.message.reply_text(
+            f"❌ همگام‌سازی انجام نشد: {result.get('message', 'خطای نامشخص')}"
+        )
+        return
     await update.message.reply_text(
-        f"✅ همگام‌سازی دیتابیس با پنل ۳X-UI برای کلیه نمایندگان با موفقیت انجام شد.\nتعداد کل اکانت‌های همگام‌شده: **{count}**",
+        "✅ همگام‌سازی ۳X-UI انجام شد.\n"
+        f"• اکانت‌های به‌روزشده: **{result['count']}**\n"
+        f"• اکانت‌های مبهم/بدون واگذاری جدید: **{result['ambiguous']}**\n"
+        f"• اکانت‌های بدون تطبیق نماینده: **{result['unmatched']}**",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -426,6 +804,10 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id if update.message else None
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
     if role == "unauthorized_group":
+        return
+    if role == "super_admin" and rep is None and chat.type != "private":
+        return
+    if role not in ("super_admin", "rep") or (role == "rep" and not rep):
         return
 
     if role == "super_admin" and rep is None:
@@ -477,13 +859,47 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_account_renewal(
     user, role, rep, acc_record, client_info, gb: float, days: float,
-    plan_code: str, effective_first: bool, curr_comment: str, comment_updated: bool = False
+    plan_code: str, effective_first: bool, curr_comment: str, comment_updated: bool = False,
+    confirmation_id: str | None = None,
 ):
     account_code = acc_record["account_code"]
     email = acc_record["email"]
     is_super_admin = (role == "super_admin")
     scope_flt = "all" if is_super_admin else (rep["scope_filter"] if rep else "all")
     by_code_only = False if is_super_admin else True
+
+    # Validate the approved pricing snapshot before acquiring even the short anti-spam lock.
+    # Invalid/free-form requests must not create operation state or reach X-UI.
+    plan = database.get_plan(plan_code)
+    early_keyboard = nlp_matcher.build_account_keyboard(
+        account_code,
+        is_enabled=bool(client_info.get("enabled", True)),
+        on_first_connect=effective_first,
+        role=role,
+        pending_res=database.get_pending_reservation(account_code),
+    )
+    if not plan or not bool(plan.get("is_active", 1)):
+        return False, "⛔️ پلن تمدید تعریف نشده یا غیرفعال است؛ لطفاً یکی از پلن‌های فعال و مصوب را انتخاب کنید.", early_keyboard
+    try:
+        requested_gb = float(gb)
+        requested_days = float(days)
+        plan_gb = float(plan["gb"])
+        plan_days = int(plan["days"])
+        charge = int(plan["rep_price"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False, "⛔️ اطلاعات پلن تمدید معتبر نیست؛ عملیات انجام نشد.", early_keyboard
+    if (
+        requested_gb <= 0
+        or requested_days <= 0
+        or requested_days != plan_days
+        or abs(requested_gb - plan_gb) > 1e-9
+    ):
+        return False, "⛔️ مشخصات حجم یا مدت با پلن مصوب مطابقت ندارد؛ عملیات انجام نشد.", early_keyboard
+    plan_name = str(plan["name"])
+    target_rep_id = acc_record.get("rep_id")
+    is_admin_exempt = is_super_admin or (target_rep_id is None)
+    if not is_admin_exempt and charge <= 0:
+        return False, "⛔️ قیمت پلن برای نمایندگی معتبر نیست؛ با مدیریت تماس بگیرید.", early_keyboard
 
     # Read dynamic system settings
     rollover_max_gb = database.get_setting("rollover_max_gb", default=2.0, cast_type=float)
@@ -510,13 +926,7 @@ async def process_account_renewal(
     if is_depleted:
         rem_gb = 0.0
 
-    plan = database.get_plan(plan_code)
-    plan_name = plan["name"] if plan else f"{int(gb)} گیگ {int(days)} روزه"
-    charge = plan["rep_price"] if plan else int(gb * 15000)
 
-    # 3. Decision Logic:
-    target_rep_id = acc_record.get("rep_id")
-    is_admin_exempt = is_super_admin or (target_rep_id is None)
 
     # Representative Credit Limit Enforcement
     if not is_admin_exempt and target_rep_id:
@@ -541,11 +951,234 @@ async def process_account_renewal(
 
     if can_renew_immediate:
         countdown_param = True if effective_first else "auto"
-        ren_res = await asyncio.to_thread(
-            xui_manager.renew_client,
-            email, gb, days, comment=curr_comment, rollover=True, countdown=countdown_param,
-            scope=scope_flt, by_code_only=by_code_only
-        )
+        operation_lock_key = f"account-renewal:{account_code.lower()}"
+        operation_lock_token = None
+        rep_renewal_intent_id = None
+        admin_renewal_confirmation_id = None
+        new_bal = None
+
+        if not is_admin_exempt:
+            try:
+                started = database.begin_rep_renewal_intent(
+                    rep_id=target_rep_id,
+                    actor_tg_id=user.id,
+                    account_code=account_code,
+                    account_email=email,
+                    plan_code=plan_code,
+                    plan_name=plan_name,
+                    gb=gb,
+                    days=days,
+                    amount=charge,
+                    confirmation_id=confirmation_id,
+                    actor_role=role,
+                )
+            except ValueError as exc:
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, f"⛔️ ثبت مالی تمدید انجام نشد: {exc}", keyboard
+
+            if started.get("status") != "started":
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
+
+            rep_renewal_intent_id = started["intent_id"]
+            operation_lock_key = started["lock_key"]
+            operation_lock_token = started["lock_token"]
+            new_bal = started["new_balance"]
+        else:
+            if role == "super_admin" and confirmation_id:
+                try:
+                    admin_started = database.begin_admin_renewal_confirmation(
+                        confirmation_id=confirmation_id,
+                        actor_id=user.id,
+                        actor_role=role,
+                        confirmation_rep_id=rep["id"] if rep else None,
+                        account_code=account_code,
+                        account_email=email,
+                        plan_code=plan_code,
+                        plan_name=plan_name,
+                        gb=gb,
+                        days=days,
+                        amount=charge,
+                    )
+                except ValueError as exc:
+                    pending_res = database.get_pending_reservation(account_code)
+                    keyboard = nlp_matcher.build_account_keyboard(
+                        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                        role=role, pending_res=pending_res
+                    )
+                    return False, f"⛔️ تأیید تمدید مدیریت کل قابل ثبت نیست: {exc}", keyboard
+                if admin_started.get("status") != "started":
+                    pending_res = database.get_pending_reservation(account_code)
+                    keyboard = nlp_matcher.build_account_keyboard(
+                        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                        role=role, pending_res=pending_res
+                    )
+                    return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
+                admin_renewal_confirmation_id = confirmation_id
+                operation_lock_key = admin_started["lock_key"]
+                operation_lock_token = admin_started["lock_token"]
+            else:
+                operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=None)
+                if not operation_lock_token:
+                    pending_res = database.get_pending_reservation(account_code)
+                    keyboard = nlp_matcher.build_account_keyboard(
+                        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                        role=role, pending_res=pending_res
+                    )
+                    return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
+
+        try:
+            ren_res = await asyncio.to_thread(
+                xui_manager.renew_client,
+                email, gb, days, comment=curr_comment, rollover=True, countdown=countdown_param,
+                scope=scope_flt, by_code_only=by_code_only
+            )
+        except Exception:
+            logger.exception("X-UI renewal outcome is unknown for %s", account_code)
+            # Keep the debit hold and exact operation lease for evidence-gated reconciliation.
+            if rep_renewal_intent_id:
+                try:
+                    database.mark_rep_renewal_for_reconciliation(
+                        rep_renewal_intent_id, target_rep_id, user.id,
+                        "X-UI renewal raised an exception; external outcome is unknown",
+                    )
+                except Exception:
+                    logger.exception("Could not mark representative renewal for reconciliation: %s", account_code)
+            elif admin_renewal_confirmation_id:
+                try:
+                    database.mark_admin_renewal_confirmation_for_reconciliation(
+                        admin_renewal_confirmation_id, user.id,
+                        "X-UI renewal raised an exception; external outcome is unknown",
+                    )
+                except Exception:
+                    logger.exception("Could not mark Super Admin renewal for reconciliation: %s", account_code)
+            pending_res = database.get_pending_reservation(account_code)
+            keyboard = nlp_matcher.build_account_keyboard(
+                account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                role=role, pending_res=pending_res
+            )
+            return False, (
+                "⚠️ نتیجه درخواست تمدید از پنل نامشخص است. مبلغ در وضعیت محفوظ باقی مانده؛ "
+                "لطفاً تا بررسی وضعیت پنل دوباره اقدام نکنید."
+            ), keyboard
+
+        if not _xui_operation_succeeded(ren_res):
+            if _xui_operation_failed(ren_res):
+                if not is_admin_exempt:
+                    try:
+                        database.refund_rep_renewal_intent(
+                            rep_renewal_intent_id, target_rep_id, user.id,
+                            f"استرداد پیش‌پرداخت به دلیل رد قطعی تمدید {account_code}",
+                        )
+                    except Exception:
+                        logger.exception("Could not refund representative renewal intent for %s", account_code)
+                        try:
+                            database.mark_rep_renewal_for_reconciliation(
+                                rep_renewal_intent_id, target_rep_id, user.id,
+                                "X-UI explicitly rejected renewal but atomic refund failed",
+                            )
+                        except Exception:
+                            logger.exception("Could not mark failed refund for reconciliation: %s", account_code)
+                        pending_res = database.get_pending_reservation(account_code)
+                        keyboard = nlp_matcher.build_account_keyboard(
+                            account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                            role=role, pending_res=pending_res
+                        )
+                        return False, "⚠️ پنل تمدید را رد کرد اما استرداد اتمیک انجام نشد؛ قفل و پیش‌پرداخت برای تطبیق مدیریت حفظ شدند.", keyboard
+                elif admin_renewal_confirmation_id:
+                    database.fail_admin_renewal_confirmation(
+                        admin_renewal_confirmation_id, user.id,
+                        f"X-UI explicitly rejected renewal for {account_code}",
+                    )
+                else:
+                    database.release_operation_lock(operation_lock_key, operation_lock_token)
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, (
+                    "❌ پنل تمدید را رد کرد؛ هیچ تمدیدی انجام نشد و وجه/اعتبار پیش‌پرداخت‌شده مسترد شد."
+                ), keyboard
+
+            # Unknown response: do not refund a possibly completed external operation.
+            if rep_renewal_intent_id:
+                try:
+                    database.mark_rep_renewal_for_reconciliation(
+                        rep_renewal_intent_id, target_rep_id, user.id,
+                        f"X-UI returned an ambiguous response: {str(ren_res)[:300]}",
+                    )
+                except Exception:
+                    logger.exception("Could not mark ambiguous representative renewal: %s", account_code)
+            elif admin_renewal_confirmation_id:
+                try:
+                    database.mark_admin_renewal_confirmation_for_reconciliation(
+                        admin_renewal_confirmation_id, user.id,
+                        f"X-UI returned an ambiguous response: {str(ren_res)[:300]}",
+                    )
+                except Exception:
+                    logger.exception("Could not mark ambiguous Super Admin renewal: %s", account_code)
+            pending_res = database.get_pending_reservation(account_code)
+            keyboard = nlp_matcher.build_account_keyboard(
+                account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                role=role, pending_res=pending_res
+            )
+            return False, (
+                "⚠️ پاسخ پنل موفقیت یا شکست قطعی را مشخص نمی‌کند؛ مبلغ محفوظ مانده و بررسی دستی لازم است."
+            ), keyboard
+
+        if rep_renewal_intent_id:
+            try:
+                database.complete_rep_renewal_intent(
+                    rep_renewal_intent_id, target_rep_id, user.id,
+                    "X-UI explicitly confirmed renewal success",
+                )
+            except Exception:
+                logger.exception("X-UI renewal succeeded but local intent finalization failed for %s", account_code)
+                try:
+                    database.mark_rep_renewal_for_reconciliation(
+                        rep_renewal_intent_id, target_rep_id, user.id,
+                        "X-UI explicitly succeeded but local finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark successful external renewal for reconciliation: %s", account_code)
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, "⚠️ پنل تمدید را با موفقیت انجام داد، اما ثبت نهایی محلی کامل نشد؛ قفل برای تطبیق حفظ شد.", keyboard
+        elif admin_renewal_confirmation_id:
+            try:
+                database.complete_admin_renewal_confirmation(
+                    admin_renewal_confirmation_id, user.id,
+                    "X-UI explicitly confirmed Super Admin renewal success",
+                )
+            except Exception:
+                logger.exception("Super Admin renewal succeeded but local confirmation finalization failed for %s", account_code)
+                try:
+                    database.mark_admin_renewal_confirmation_for_reconciliation(
+                        admin_renewal_confirmation_id, user.id,
+                        "X-UI explicitly succeeded but local confirmation finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark successful Super Admin renewal for reconciliation: %s", account_code)
+                pending_res = database.get_pending_reservation(account_code)
+                keyboard = nlp_matcher.build_account_keyboard(
+                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    role=role, pending_res=pending_res
+                )
+                return False, "⚠️ پنل تمدید را با موفقیت انجام داد، اما ثبت نهایی محلی کامل نشد؛ قفل برای تطبیق حفظ شد.", keyboard
+        else:
+            database.release_operation_lock(operation_lock_key, operation_lock_token)
         report_text = ren_res.get("report", "")
         if comment_updated:
             report_text = f"👤 **نام مشتری روی اکانت ثبت شد:** `{curr_comment}`\n\n" + report_text
@@ -559,17 +1192,6 @@ async def process_account_renewal(
             )
             report_text += "\n\n👑 **عملیات مستقیم مدیریت کل (معاف از صورت‌حساب نمایندگی)**"
         else:
-            new_bal = database.record_ledger_entry(
-                rep_id=target_rep_id,
-                account_code=account_code,
-                email=email,
-                plan_code=plan_code,
-                tx_type="debit",
-                amount=charge,
-                description=f"تمدید مستقیم {plan_name} (حالت: {'با اولین اتصال' if effective_first else 'رول‌اوور'})",
-                actor_id=user.id,
-                actor_name=user.full_name or user.username
-            )
             database.log_audit(
                 rep_id=target_rep_id, account_code=account_code, email=email,
                 action="renew_account", actor_id=user.id, actor_name=user.full_name or user.username,
@@ -587,7 +1209,6 @@ async def process_account_renewal(
             f"• مجری: {user.full_name} ({'مدیریت (معاف)' if is_admin_exempt else f'{charge:,} تومان'})"
         )
         return True, report_text, keyboard
-
     else:
         # Case 2: Reserve Queue
         existing_res = database.get_pending_reservation(account_code)
@@ -616,35 +1237,17 @@ async def process_account_renewal(
             on_first_connect=1 if effective_first else 0,
             charge_amount=res_charge,
             actor_id=user.id,
-            actor_name=user.full_name or user.username
+            actor_name=user.full_name or user.username,
+            confirmation_id=confirmation_id,
+            actor_role=role,
+            confirmation_rep_id=rep["id"] if rep else None,
         )
 
         if is_admin_exempt:
-            database.log_audit(
-                rep_id=None, account_code=account_code, email=email,
-                action="admin_reserve_package", actor_id=user.id, actor_name=user.full_name or user.username,
-                details={"gb": gb, "days": days, "mode": "on_connect" if effective_first else "rollover", "charge": 0, "res_id": res_id, "exempt": True},
-                result_status="success"
-            )
             fin_info = "• وضعیت مالی: 👑 **عملیات مستقیم مدیریت کل (معاف از صورت‌حساب نمایندگی)**"
         else:
-            new_bal = database.record_ledger_entry(
-                rep_id=target_rep_id,
-                account_code=account_code,
-                email=email,
-                plan_code=plan_code,
-                tx_type="debit",
-                amount=charge,
-                description=f"رزرو بسته {plan_name} (حالت: {'با اولین اتصال' if effective_first else 'رول‌اوور'})",
-                actor_id=user.id,
-                actor_name=user.full_name or user.username
-            )
-            database.log_audit(
-                rep_id=target_rep_id, account_code=account_code, email=email,
-                action="reserve_package", actor_id=user.id, actor_name=user.full_name or user.username,
-                details={"gb": gb, "days": days, "mode": "on_connect" if effective_first else "rollover", "charge": charge, "balance_after": new_bal, "res_id": res_id},
-                result_status="success"
-            )
+            # Reservation and representative debit were committed atomically by create_reservation.
+            new_bal = database.get_rep_balance(target_rep_id)
             fin_info = f"• فاکتور رزرو: `{charge:,} تومان` | **مانده بدهی نماینده:** `{new_bal:,} تومان`"
 
         pending_dict = database.get_reservation_by_id(res_id)
@@ -686,80 +1289,82 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
     if role == "unauthorized_group":
         return
+    if database.is_user_blocked(user.id):
+        await update.message.reply_text("⛔️ دسترسی شما به این بات مسدود شده است.")
+        return
+    if role not in ("end_user", "rep") or (role == "rep" and not rep):
+        await update.message.reply_text("⛔️ ارسال فیش فقط برای نقش کاربر نهایی یا نماینده مجاز است.")
+        return
 
-    fsm_state = context.user_data.get("fsm_state")
-    photo = update.message.photo[-1]
-    photo_id = photo.file_id
+    photo_id = update.message.photo[-1].file_id
     caption = (update.message.caption or "").strip()
     tr_code = context.user_data.get("active_receipt_code")
-    amount = context.user_data.get("deposit_amount", 0)
-    dep_role = context.user_data.get("deposit_role", "end_user" if role == "end_user" else "rep")
-    target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
+    amount = int(context.user_data.get("deposit_amount") or 0)
+    dep_role = context.user_data.get("deposit_role") or role
+    if dep_role != role:
+        await update.message.reply_text(
+            "⛔️ این فرایند ارسال فیش با نقش فعلی شما آغاز نشده است؛ از پنل همان نقش دوباره اقدام کنید."
+        )
+        return
+    target_rep_id = rep["id"] if role == "rep" else None
 
-    # If amount is 0, attempt to parse amount from caption text if provided
-    if amount == 0 and caption:
+    if amount <= 0 and caption:
         import re
-        digits_match = re.findall(r'\b\d[\d,]{3,}\b', caption)
+        digits_match = re.findall(r"\b\d[\d,]{3,}\b", caption)
         if digits_match:
             try:
-                amount = int(digits_match[0].replace(',', ''))
+                amount = int(digits_match[0].replace(",", ""))
             except ValueError:
                 amount = 0
 
-    if not tr_code:
-        tr_code = finance_manager.generate_tracking_code()
+    if amount <= 0:
+        await update.message.reply_text(
+            "⚠️ مبلغ فیش مشخص نیست. ابتدا از گزینه ثبت فیش یا دستور /deposit مبلغ را ثبت کنید."
+        )
+        return
 
-    existing_rcp = database.get_payment_receipt(tr_code)
-    if not existing_rcp:
-        database.create_payment_receipt(
+    admin_tg_id = database.get_setting("admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int)
+    admin_dm_top = database.get_setting("admin_dm_topic_id", default=ADMIN_DM_LOGS_TOPIC_ID, cast_type=int)
+    try:
+        # Receipt submission and durable admin-notification enqueue share one DB transaction.
+        receipt = database.submit_payment_receipt(
             user_id=user.id,
             role=dep_role,
             amount_toman=amount,
-            rep_id=target_rep_id,
             photo_id=photo_id,
-            note=caption
+            rep_id=target_rep_id,
+            receipt_id_or_code=tr_code,
+            note=caption,
+            recipient_chat_id=admin_tg_id if admin_tg_id and int(admin_tg_id) > 0 else None,
+            recipient_thread_id=admin_dm_top if admin_dm_top and int(admin_dm_top) > 0 else None,
+            sender_name=user.full_name or "",
+            sender_username=user.username or "",
         )
-    else:
-        with database.get_db() as conn:
-            conn.execute(
-                "UPDATE payment_receipts SET receipt_photo_id = ?, receipt_note = ?, amount_toman = CASE WHEN amount_toman = 0 THEN ? ELSE amount_toman END WHERE id = ?",
-                (photo_id, caption, amount, existing_rcp["id"])
-            )
-            conn.commit()
+        tr_code = receipt["tracking_code"]
+    except PermissionError:
+        logger.warning("Rejected receipt submission with mismatched owner/role for user %s", user.id)
+        await update.message.reply_text("⛔️ فیش در انتظار ارسال برای این حساب یافت نشد یا دیگر قابل ویرایش نیست.")
+        return
+    except Exception:
+        logger.exception("Could not persist incoming payment receipt and notification outbox")
+        await update.message.reply_text("❌ ثبت فیش انجام نشد. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+        return
 
-    rcp = database.get_payment_receipt(tr_code)
-    context.user_data.pop("fsm_state", None)
-    context.user_data.pop("active_receipt_code", None)
-    context.user_data.pop("deposit_amount", None)
+    for key in ("fsm_state", "active_receipt_code", "deposit_amount", "deposit_role"):
+        context.user_data.pop(key, None)
 
-    amount_disp = f"**{rcp['amount_toman']:,} تومان**" if rcp['amount_toman'] > 0 else "ثبت‌شده روی تصویر فیش"
-
+    amount_disp = f"**{receipt['amount_toman']:,} تومان**"
     await update.message.reply_text(
         f"🚀 **رسید پرداخت شما با موفقیت دریافت و ثبت گردید.**\n\n"
-        f"• کد پیگیری: `{tr_code}`\n"
+        f"• کد پیگیری: `{receipt['tracking_code']}`\n"
         f"• مبلغ واریزی: {amount_disp}\n\n"
         "به محض بررسی و تایید توسط مدیریت، حساب شما شارژ یا تسویه خواهد شد.",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Send card to Super Admin
-    admin_tg_id = database.get_setting("admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int)
-    admin_dm_top = database.get_setting("admin_dm_topic_id", default=ADMIN_DM_LOGS_TOPIC_ID, cast_type=int)
-    card_text = finance_manager.format_admin_receipt_card(rcp, user.full_name, user.username)
-    review_keyboard = finance_manager.build_admin_receipt_review_keyboard(rcp["id"])
-
-    if admin_tg_id:
-        try:
-            await context.bot.send_photo(
-                chat_id=admin_tg_id,
-                message_thread_id=admin_dm_top if admin_dm_top else None,
-                photo=photo_id,
-                caption=card_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=review_keyboard
-            )
-        except Exception as e:
-            logger.error(f"Failed to forward receipt photo to admin: {e}")
+    # The durable outbox already exists; this is only the first delivery attempt.
+    # The background worker will retry after process restarts or delivery failures.
+    await process_receipt_notification_outbox(context.bot, limit=10)
 
 # --- Message & NLP Router ---
 
@@ -778,6 +1383,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if database.is_user_blocked(user.id):
         await update.message.reply_text("⛔️ دسترسی شما به این بات توسط مدیریت مسدود شده است.")
+        return
+    if role == "super_admin" and chat.type != "private":
         return
 
     # Text triggers for glass dashboard
@@ -811,22 +1418,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check Financial FSM State (Card amount or rejection reason)
     fsm_state = context.user_data.get("fsm_state")
     if fsm_state == finance_manager.STATE_AWAITING_RECEIPT_AMOUNT:
+        expected_deposit_role = context.user_data.get("deposit_role") or role
+        if (
+            role not in ("end_user", "rep")
+            or expected_deposit_role != role
+            or (role == "rep" and not rep)
+        ):
+            await update.message.reply_text(
+                "⛔️ این فرایند شارژ متعلق به نقش فعلی شما نیست؛ از پنل همان نقش دوباره اقدام کنید."
+            )
+            return
         text_clean = msg_text.replace(",", "").strip()
         if text_clean.isdigit() and int(text_clean) > 0:
             amount = int(text_clean)
             context.user_data["deposit_amount"] = amount
             card_info = database.get_card_info()
-            tr_code = finance_manager.generate_tracking_code()
-            context.user_data["active_receipt_code"] = tr_code
             dep_role = context.user_data.get("deposit_role", "end_user" if role == "end_user" else "rep")
             target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
-
-            database.create_payment_receipt(
+            tr_code = database.create_payment_receipt(
                 user_id=user.id,
                 role=dep_role,
                 amount_toman=amount,
                 rep_id=target_rep_id
             )
+            context.user_data["active_receipt_code"] = tr_code
+            context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_PHOTO
 
             msg = finance_manager.format_card_instructions(amount, tr_code, card_info)
             keyboard = finance_manager.build_card_payment_keyboard(tr_code)
@@ -844,88 +1460,169 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # 1. Action: New Account Allocation (Admin / Rep only)
     if intent == "new_account" and role in ("super_admin", "rep"):
-        gb = params.get("gb", 20.0)
-        days = params.get("days", 30.0)
+        gb = float(params.get("gb", 20.0))
+        days = int(params.get("days", 30))
         comment = params.get("comment", "")
+        if gb <= 0 or days <= 0:
+            await update.message.reply_text("❌ حجم و مدت اکانت باید مثبت باشند.")
+            return
+
+        target_rep_id = rep["id"] if rep else None
+        is_exempt = role == "super_admin" or target_rep_id is None
+        plan_code = f"{int(gb)}gb_{int(days)}d"
+        plan = database.get_plan(plan_code)
+        if not is_exempt and not plan:
+            await update.message.reply_text(
+                "❌ این ترکیب حجم/مدت، تعرفه مصوب نمایندگی ندارد. لطفاً از فهرست پلن‌های تاییدشده برای صدور استفاده کنید."
+            )
+            return
+        charge = int(plan["rep_price"]) if plan else 0
+        if not is_exempt and charge <= 0:
+            await update.message.reply_text("❌ قیمت صدور اکانت معتبر نیست؛ با مدیریت تماس بگیرید.")
+            return
+
+        # Representative NLP issuance is handed off to the same durable,
+        # actor-bound rep_action_intents flow used by the dashboard.
+        if role == "rep":
+            try:
+                intent_id = database.create_rep_action_intent(
+                    rep_id=rep["id"], actor_tg_id=user.id,
+                    plan_code=plan["plan_code"], plan_name=plan["name"],
+                    gb=plan["gb"], days=plan["days"], amount=charge,
+                )
+                if comment:
+                    database.set_rep_action_intent_customer_name(
+                        intent_id, rep["id"], user.id, comment
+                    )
+            except Exception:
+                logger.exception("Could not create durable NLP representative issuance intent")
+                await update.message.reply_text("❌ ثبت درخواست صدور ممکن نشد؛ لطفاً از پنل نمایندگی دوباره اقدام کنید.")
+                return
+
+            confirm_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"✅ تأیید صدور با هزینه {charge:,} تومان",
+                    callback_data=f"rep:issue_acc_direct:{intent_id}:noname"
+                )],
+                [InlineKeyboardButton("❌ انصراف", callback_data="rep:new_acc_plans")]
+            ])
+            await update.message.reply_text(
+                f"🆕 **درخواست صدور ثبت شد**\n\n"
+                f"• پلن: **{plan['name']}** ({plan['gb']} گیگ / {plan['days']} روز)\n"
+                f"• هزینه: **{charge:,} تومان**\n"
+                f"• نام مشتری: {comment or 'ثبت نشده'}\n\n"
+                "با تأیید دکمه زیر، پیش‌پرداخت و قفل پایدار به‌صورت اتمیک ثبت و سپس پنل فراخوانی می‌شود.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=confirm_keyboard,
+            )
+            return
+
+        lock_key = f"new-account:{role}:{user.id}:{plan_code}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
+        if not lock_token:
+            await update.message.reply_text("⏳ درخواست صدور دیگری در حال پردازش است یا نتیجه قبلی نیازمند بررسی است؛ لطفاً دوباره اجرا نکنید.")
+            return
+
+        new_bal = None
+        if not is_exempt:
+            try:
+                new_bal = database.record_ledger_entry(
+                    rep_id=target_rep_id, account_code="", email="", plan_code=plan_code,
+                    tx_type="debit", amount=charge,
+                    description=f"پیش‌پرداخت صدور اکانت {int(gb)}G/{days}D (در انتظار تأیید پنل)",
+                    actor_id=user.id, actor_name=user.full_name or user.username
+                )
+            except ValueError as exc:
+                database.release_operation_lock(lock_key, lock_token)
+                await update.message.reply_text(f"⛔️ صدور اکانت انجام نشد: {exc}")
+                return
 
         scope_for_alloc = rep["scope_filter"] if rep else "all"
-        alloc_res = await asyncio.to_thread(xui_manager.allocate_pool_client, gb, days, comment=comment, scope=scope_for_alloc)
-        if alloc_res.get("status") == "success":
-            email = alloc_res.get("email")
-            sub_id = alloc_res.get("sub_id")
-            code = xui_manager.extract_account_identifier(email) or email
-            target_rep_id = rep["id"] if rep else database.resolve_account_rep_id(email)
-            is_exempt = (role == "super_admin") or (target_rep_id is None)
-
-            # Upsert into DB
-            database.upsert_account_record(
-                rep_id=target_rep_id,
-                email=email,
-                account_code=code,
-                customer_name=comment,
-                sub_id=sub_id,
-                enable=1,
-                total_gb=gb,
-                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
+        try:
+            alloc_res = await asyncio.to_thread(
+                xui_manager.allocate_pool_client, gb, days,
+                comment=comment, scope=scope_for_alloc
             )
+        except Exception:
+            logger.exception("New account allocation outcome is unknown for %s", user.id)
+            await update.message.reply_text(
+                "⚠️ پاسخ پنل نامشخص است؛ مبلغ/اعتبار در وضعیت محفوظ باقی مانده و بررسی دستی لازم است. لطفاً درخواست صدور دیگری نفرستید."
+            )
+            return
 
-            # Accounting record
-            plan_code = f"{int(gb)}gb_{int(days)}d"
-            plan = database.get_plan(plan_code) or database.get_plan("20gb_30d")
-            charge = plan["rep_price"] if plan else 300000
+        if classify_xui_result(alloc_res) == XUIResult.SUCCESS:
+            email = alloc_res.get("email")
+            if not email:
+                logger.error("X-UI reports account allocation success without email: %r", alloc_res)
+                await update.message.reply_text("⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ مبلغ برای تطبیق محفوظ ماند.")
+                return
+            sub_id = alloc_res.get("sub_id")
+            try:
+                code = xui_manager.extract_account_identifier(email) or email
+                database.upsert_account_record(
+                    rep_id=target_rep_id, email=email, account_code=code,
+                    customer_name=comment, sub_id=sub_id, enable=1,
+                    total_gb=gb, expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
+                )
+            except Exception:
+                logger.exception("X-UI allocated %s but local account persistence failed", email)
+                await update.message.reply_text(
+                    "⚠️ اکانت در پنل ایجاد شد اما ثبت محلی کامل نشد؛ مبلغ محفوظ است و تطبیق پنل/دیتابیس لازم است."
+                )
+                return
 
             deliv_text = alloc_res.get("deliverable", "")
             if is_exempt:
                 deliv_text += "\n\n👑 **عملیات مستقیم مدیریت کل (معاف از صورت‌حساب نمایندگی)**"
-                database.log_audit(
-                    rep_id=None, account_code=code, email=email,
-                    action="admin_allocate_new_account", actor_id=user.id, actor_name=user.full_name or user.username,
-                    details={"gb": gb, "days": days, "comment": comment, "exempt": True},
-                    result_status="success"
-                )
+                try:
+                    database.log_audit(
+                        rep_id=None, account_code=code, email=email,
+                        action="admin_allocate_new_account", actor_id=user.id,
+                        actor_name=user.full_name or user.username,
+                        details={"gb": gb, "days": days, "comment": comment, "exempt": True},
+                        result_status="success"
+                    )
+                except Exception:
+                    logger.exception("Audit log failed for admin allocation %s", email)
             else:
-                new_bal = database.record_ledger_entry(
-                    rep_id=target_rep_id,
-                    account_code=code,
-                    email=email,
-                    plan_code=plan_code,
-                    tx_type="debit",
-                    amount=charge,
-                    description=f"صدور اکانت جدید {int(gb)}G/{int(days)}D ({comment or 'بدون نام'})",
-                    actor_id=user.id,
-                    actor_name=user.full_name or user.username
-                )
-                database.log_audit(
-                    rep_id=target_rep_id, account_code=code, email=email,
-                    action="allocate_new_account", actor_id=user.id, actor_name=user.full_name or user.username,
-                    details={"gb": gb, "days": days, "comment": comment, "charge": charge, "balance_after": new_bal},
-                    result_status="success"
-                )
+                try:
+                    database.log_audit(
+                        rep_id=target_rep_id, account_code=code, email=email,
+                        action="allocate_new_account", actor_id=user.id,
+                        actor_name=user.full_name or user.username,
+                        details={"gb": gb, "days": days, "comment": comment, "charge": charge, "balance_after": new_bal},
+                        result_status="success"
+                    )
+                except Exception:
+                    logger.exception("Audit log failed for representative allocation %s", email)
                 deliv_text += f"\n\n💳 **فاکتور صدور:** `{charge:,} تومان` | **مانده بدهی:** `{new_bal:,} تومان`"
 
+            database.release_operation_lock(lock_key, lock_token)
             keyboard = nlp_matcher.build_account_keyboard(code, is_enabled=True, role=role)
-
             sub_url = alloc_res.get("sub_url")
             qr_file = None
             if sub_url:
                 try:
                     qr_file = f"/tmp/qr_new_{code}.png"
                     await asyncio.to_thread(xui_manager.generate_qr, sub_url, qr_file)
-                except Exception as e:
-                    logger.error(f"Failed to generate QR: {e}")
+                except Exception:
+                    logger.exception("Failed to generate QR for new account %s", code)
                     qr_file = None
 
-            if qr_file and os.path.exists(qr_file):
-                with open(qr_file, "rb") as photo:
-                    await update.message.reply_photo(
-                        photo=photo,
-                        caption=deliv_text,
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=keyboard
+            try:
+                if qr_file and os.path.exists(qr_file):
+                    with open(qr_file, "rb") as photo:
+                        await update.message.reply_photo(
+                            photo=photo, caption=deliv_text,
+                            parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+                        )
+                    os.remove(qr_file)
+                else:
+                    await update.message.reply_text(
+                        deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
                     )
-                os.remove(qr_file)
-            else:
-                await update.message.reply_text(deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            except Exception:
+                logger.exception("Failed to deliver new account information to Telegram for %s", email)
 
             await asyncio.to_thread(
                 send_admin_log,
@@ -935,10 +1632,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• وضعیت: {'مدیریت (معاف)' if is_exempt else f'{charge:,} تومان'}"
             )
             return
-        else:
-            await update.message.reply_text(f"❌ خطا در تخصیص اکانت: {alloc_res.get('message')}", parse_mode=ParseMode.MARKDOWN)
+
+        if classify_xui_result(alloc_res) == XUIResult.FAILURE:
+            if not is_exempt:
+                try:
+                    database.register_rep_payment(
+                        target_rep_id, charge,
+                        f"استرداد پیش‌پرداخت به دلیل شکست قطعی صدور {plan_code}",
+                        actor_id=user.id, actor_name=user.full_name or user.username
+                    )
+                except Exception:
+                    logger.exception("Failed to reverse representative account precharge")
+                    await update.message.reply_text("⚠️ پنل صدور را رد کرد اما استرداد مالی ثبت نشد؛ مدیریت باید بررسی کند.")
+                    return
+            database.release_operation_lock(lock_key, lock_token)
+            await update.message.reply_text(
+                f"❌ پنل صدور اکانت را رد کرد؛ {'پیش‌پرداخت مسترد شد.' if not is_exempt else 'هزینه‌ای ثبت نشد.'} "
+                f"{alloc_res.get('message', '')}"
+            )
             return
 
+        logger.error("Ambiguous X-UI allocation response for %s: %r", user.id, alloc_res)
+        await update.message.reply_text(
+            "⚠️ پاسخ پنل برای تأیید یا رد صدور کافی نیست؛ مبلغ/اعتبار محفوظ است و بررسی دستی لازم است."
+        )
+        return
     # 2. Extract account code from reply or message
     account_code = nlp_matcher.extract_account_code(reply_text, msg_text)
 
@@ -953,16 +1671,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check End-User access restriction
     if role == "end_user":
-        user_accs = database.get_user_accounts(user.id)
-        matched_user_acc = any(
-            a["account_code"].lower() == account_code.lower() or 
-            a["email"].lower() == account_code.lower() or
-            account_code.lower() in a["email"].lower()
-            for a in user_accs
-        )
-        if not matched_user_acc:
+        owned_account = database.get_user_owned_account(user.id, account_code)
+        if not owned_account:
             await update.message.reply_text("⛔️ شما به این اکانت دسترسی ندارید. ابتدا با دستور `/link <کد_اکانت>` آن را ثبت کنید.", parse_mode=ParseMode.MARKDOWN)
             return
+        account_code = owned_account["email"]
 
     # Super Admin vs Rep Scope Configuration
     is_super_admin = (role == "super_admin")
@@ -974,8 +1687,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_super_admin:
         with database.get_db() as conn:
             row = conn.cursor().execute(
-                "SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) = ? OR LOWER(email) LIKE ? LIMIT 1",
-                (account_code.lower(), account_code.lower(), f"%{account_code.lower()}%")
+                "SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) = ? LIMIT 1",
+                (account_code.lower(), account_code.lower())
             ).fetchone()
             if row:
                 acc_record = dict(row)
@@ -1207,8 +1920,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if database.is_user_blocked(user.id):
         await query.answer("⛔️ دسترسی شما به این بات مسدود شده است.", show_alert=True)
         return
+    if role == "super_admin" and chat.type != "private":
+        await query.answer(
+            "⛔️ عملیات مدیریت کل فقط در گفت‌وگوی خصوصی ربات مجاز است.",
+            show_alert=True
+        )
+        return
 
     data = query.data or ""
+
+    # Admin views and mutations can expose financial/personal records; they are
+    # restricted to the bot's private chat even when the super-admin ID is used
+    # from an otherwise authorized group topic.
+    admin_callback = (
+        data.startswith("admin:")
+        or data.startswith("admin_approve_rcp_")
+        or data.startswith("admin_reject_rcp_")
+        or data.startswith("admin_detail_rcp_")
+    )
+    if admin_callback and (not chat or chat.type != "private"):
+        await query.answer(
+            "⛔️ عملیات پنل مدیریت فقط در گفت‌وگوی خصوصی ربات مجاز است.",
+            show_alert=True
+        )
+        return
 
     # Admin Receipt Verification Callbacks
     if data.startswith("admin_approve_rcp_"):
@@ -1219,8 +1954,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_rcp = int(raw_id) if raw_id.isdigit() else raw_id
         try:
             rcp = database.approve_payment_receipt(target_rcp, user.id, user.full_name or "Admin")
+            if rcp.get("status") != "approved":
+                status = rcp.get("status", "unknown")
+                await query.edit_message_reply_markup(
+                    reply_markup=finance_manager.build_admin_reviewed_keyboard(status)
+                )
+                await query.answer(
+                    f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {status}",
+                    show_alert=True
+                )
+                return
             await query.edit_message_reply_markup(reply_markup=finance_manager.build_admin_reviewed_keyboard("approved"))
-            await query.answer(f"✅ فیش {rcp['tracking_code']} با موفقیت تایید شد.")
+            await query.answer(f"✅ فیش {rcp['tracking_code']} تایید شد.")
             
             try:
                 role_fa = "نماینده" if rcp["role"] == "rep" else "کاربر"
@@ -1245,6 +1990,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_rcp = int(raw_id) if raw_id.isdigit() else raw_id
         try:
             rcp = database.reject_payment_receipt(target_rcp, user.id, "عدم تطابق با گردش حساب")
+            if rcp.get("status") != "rejected":
+                status = rcp.get("status", "unknown")
+                await query.edit_message_reply_markup(
+                    reply_markup=finance_manager.build_admin_reviewed_keyboard(status)
+                )
+                await query.answer(
+                    f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {status}",
+                    show_alert=True
+                )
+                return
             await query.edit_message_reply_markup(reply_markup=finance_manager.build_admin_reviewed_keyboard("rejected"))
             await query.answer(f"❌ فیش {rcp['tracking_code']} رد شد.")
             
@@ -1275,16 +2030,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         status_fa = "⏳ در انتظار بررسی" if rcp["status"] == "pending" else ("✅ تایید شده" if rcp["status"] == "approved" else "❌ رد شده")
         role_fa = "نماینده" if rcp["role"] == "rep" else "کاربر نهایی"
-        note_txt = rcp.get('receipt_note') or 'ندارد'
+        note_txt = html.escape(str(rcp.get("receipt_note") or "ندارد")[:400])
         text = (
-            f"🧾 **شناسنامه و جزئیات فیش پرداختی:**\n\n"
-            f"• کد پیگیری: `{rcp['tracking_code']}`\n"
-            f"• نقش: **{role_fa}**\n"
-            f"• شناسه کاربر: `{rcp['user_id']}`\n"
-            f"• مبلغ واریزی: **{rcp['amount_toman']:,} تومان**\n"
-            f"• وضعیت فعلی: **{status_fa}**\n"
-            f"• تاریخ ارسال: `{rcp['created_at'][:19]}`\n"
-            f"• توضیحات فرستنده: _{note_txt}_\n"
+            f"🧾 <b>شناسنامه و جزئیات فیش پرداختی:</b>\n\n"
+            f"• کد پیگیری: <code>{html.escape(str(rcp['tracking_code']))}</code>\n"
+            f"• نقش: <b>{html.escape(role_fa)}</b>\n"
+            f"• شناسه کاربر: <code>{int(rcp['user_id'])}</code>\n"
+            f"• مبلغ واریزی: <b>{int(rcp['amount_toman']):,} تومان</b>\n"
+            f"• وضعیت فعلی: <b>{html.escape(status_fa)}</b>\n"
+            f"• تاریخ ارسال: <code>{html.escape(str(rcp['created_at'])[:19])}</code>\n"
+            f"• توضیحات فرستنده: <i>{note_txt}</i>\n"
         )
         if rcp["status"] == "pending":
             btns = [
@@ -1295,13 +2050,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         else:
             btns = [[InlineKeyboardButton(status_fa, callback_data="noop")]]
-        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(btns))
+        await finance_manager.reply_with_receipt_detail(
+            query.message,
+            rcp,
+            text,
+            reply_markup=InlineKeyboardMarkup(btns),
+        )
         await query.answer()
         return
 
     if data.startswith("send_receipt_"):
         tr_code = data.replace("send_receipt_", "")
-        context.user_data["active_receipt_code"] = tr_code
+        if role not in ("end_user", "rep") or (role == "rep" and not rep):
+            await query.answer("⛔️ بارگذاری فیش فقط از مسیر کیف پول نقش معتبر مجاز است.", show_alert=True)
+            return
+        receipt = database.get_payment_receipt(tr_code)
+        if (
+            not receipt or int(receipt["user_id"]) != int(user.id)
+            or receipt["status"] != "pending"
+            or receipt.get("role") != role
+            or (
+                role == "rep"
+                and int(receipt.get("rep_id") or -1) != int(rep["id"])
+            )
+        ):
+            await query.answer("⛔️ این فیش متعلق به نقش/حساب فعلی شما نیست یا دیگر در انتظار ارسال نیست.", show_alert=True)
+            return
+        context.user_data["active_receipt_code"] = receipt["tracking_code"]
+        context.user_data["deposit_amount"] = receipt["amount_toman"]
+        context.user_data["deposit_role"] = receipt["role"]
         context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_PHOTO
         await query.answer("📸 منتظر ارسال تصویر فیش...")
         await query.message.reply_text(
@@ -1313,8 +2090,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data in ("wallet_charge_start", "rep_deposit_start", "user_deposit_start"):
+        expected_role = "rep" if data == "rep_deposit_start" else "end_user"
+        if role != expected_role or (expected_role == "rep" and not rep):
+            await query.answer(
+                "⛔️ این دکمه شارژ متعلق به نقش دیگری است؛ از پنل حساب فعلی خود اقدام کنید.",
+                show_alert=True
+            )
+            return
         context.user_data["fsm_state"] = finance_manager.STATE_AWAITING_RECEIPT_AMOUNT
-        context.user_data["deposit_role"] = "rep" if data == "rep_deposit_start" else "end_user"
+        context.user_data["deposit_role"] = expected_role
         await query.answer("مبلغ را وارد کنید.")
         await query.message.reply_text(
             "💳 **لطفاً مبلغ مورد نظر جهت پرداخت را به تومان وارد کنید:**\n"
@@ -1323,16 +2107,153 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "cancel_payment":
-        context.user_data.pop("fsm_state", None)
-        context.user_data.pop("active_receipt_code", None)
-        await query.answer("پرداخت لغو شد.")
-        await safe_edit_message(query, "❌ عملیات پرداخت لغو شد.")
+    if data == "cancel_payment" or data.startswith("cancel_payment:"):
+        # New buttons carry their exact receipt code. The legacy static callback
+        # may cancel only the pre-receipt amount-entry state; it must not guess
+        # which persisted receipt an old/stale message refers to.
+        target_code = data.split(":", 1)[1] if data.startswith("cancel_payment:") else None
+        active_code = context.user_data.get("active_receipt_code")
+
+        if target_code:
+            if role not in ("end_user", "rep") or (role == "rep" and not rep):
+                await query.answer(
+                    "⛔️ این درخواست پرداخت متعلق به نقش فعلی شما نیست.",
+                    show_alert=True
+                )
+                return
+            stored_receipt = database.get_payment_receipt(target_code)
+            if (
+                not stored_receipt
+                or int(stored_receipt.get("user_id") or -1) != int(user.id)
+                or stored_receipt.get("role") != role
+                or (
+                    role == "rep"
+                    and int(stored_receipt.get("rep_id") or -1) != int(rep["id"])
+                )
+            ):
+                await query.answer(
+                    "⛔️ این درخواست پرداخت متعلق به نقش/حساب فعلی شما نیست.",
+                    show_alert=True
+                )
+                return
+            try:
+                receipt = database.cancel_payment_receipt(target_code, user.id)
+            except (ValueError, PermissionError):
+                await query.answer(
+                    "⛔️ این درخواست پرداخت یافت نشد یا متعلق به شما نیست.",
+                    show_alert=True
+                )
+                return
+
+            if receipt.get("status") == "cancelled":
+                if active_code == target_code:
+                    for key in ("fsm_state", "active_receipt_code", "deposit_amount", "deposit_role"):
+                        context.user_data.pop(key, None)
+                await query.answer("درخواست پرداخت لغو و در سامانه ثبت شد.")
+                await safe_edit_message(query, "❌ درخواست پرداخت لغو شد.")
+                return
+
+            if receipt.get("status") == "pending" and receipt.get("receipt_photo_id"):
+                await query.answer(
+                    "این فیش قبلاً ارسال شده و برای بررسی مدیریت قابل لغو نیست.",
+                    show_alert=True
+                )
+                return
+
+            current_status = receipt.get("status", "unknown")
+            await query.answer(
+                f"این درخواست دیگر قابل لغو نیست؛ وضعیت فعلی: {current_status}",
+                show_alert=True
+            )
+            return
+
+        if active_code:
+            await query.answer(
+                "این دکمه قدیمی است و شناسه فیش را ندارد. از پیام جدید پرداخت استفاده کنید.",
+                show_alert=True
+            )
+            return
+
+        if context.user_data.get("fsm_state") == finance_manager.STATE_AWAITING_RECEIPT_AMOUNT:
+            expected_role = context.user_data.get("deposit_role") or role
+            if role not in ("end_user", "rep") or expected_role != role or (role == "rep" and not rep):
+                await query.answer(
+                    "⛔️ این فرایند شارژ متعلق به نقش دیگری است.",
+                    show_alert=True
+                )
+                return
+            for key in ("fsm_state", "deposit_amount", "deposit_role"):
+                context.user_data.pop(key, None)
+            await query.answer("فرایند ورود مبلغ لغو شد.")
+            await safe_edit_message(query, "❌ فرایند پرداخت لغو شد.")
+            return
+
+        await query.answer("درخواست پرداخت قابل شناسایی نیست؛ وضعیت فیش تغییر نکرد.", show_alert=True)
         return
 
     parts = data.split(":")
     action = parts[0]
-    account_code = parts[1] if len(parts) > 1 else ""
+
+    # Old unprefixed account-card reservation callbacks executed immediately.
+    # Representatives must use the new rep:confirm_* → rep:do_* flow instead.
+    if role in ("rep", "super_admin") and action in ("force_res", "cancel_res"):
+        await query.answer(
+            "⚠️ این دکمه رزرو قدیمی است و اجرا نشد؛ کارت اکانت را تازه کنید و تأیید دو مرحله‌ای را انجام دهید.",
+            show_alert=True
+        )
+        return
+
+    renewal_confirmation_id = None
+    # Reserve callbacks carry <reservation_id>:<account_email>; other account
+    # callbacks carry the account identifier in parts[1].
+    account_code = (
+        parts[2] if action in ("force_res", "cancel_res") and len(parts) > 2
+        else (parts[1] if len(parts) > 1 else "")
+    )
+
+    # One-time confirmation for a quick-renew action. The token is owner-bound
+    # and consumed before the existing renewal/reservation pipeline is entered.
+    if action == "qrenew_confirm":
+        if role not in ("super_admin", "rep"):
+            await query.answer("⛔️ تمدید سریع فقط برای نماینده و مدیریت مجاز است.", show_alert=True)
+            return
+        intent_id = parts[1] if len(parts) > 1 else ""
+        intent = database.get_account_renewal_confirmation(intent_id, user.id)
+        if not intent:
+            await query.answer("⛔️ درخواست تمدید یافت نشد یا متعلق به شما نیست.", show_alert=True)
+            return
+        if intent["actor_role"] != role:
+            await query.answer("⛔️ سطح دسترسی این درخواست تغییر کرده است؛ از کارت اکانت دوباره اقدام کنید.", show_alert=True)
+            return
+
+        if role == "rep":
+            if not rep or int(intent.get("rep_id") or -1) != int(rep["id"]):
+                await query.answer("⛔️ این درخواست متعلق به محدوده نمایندگی شما نیست.", show_alert=True)
+                return
+            scoped = database.is_account_in_rep_scope(
+                rep["id"], intent.get("account_code") or intent.get("account_email") or ""
+            )
+            if (
+                not scoped
+                or str(scoped.get("email", "")).lower() != str(intent["account_email"]).lower()
+            ):
+                await query.answer("⛔️ مالکیت یا محدوده اکانت برای این تمدید قابل تأیید نیست.", show_alert=True)
+                return
+
+        if intent.get("status") != "pending":
+            await query.answer(
+                "⛔️ این تأیید تمدید قبلاً وارد مرحله پردازش شده یا تعیین تکلیف شده است.",
+                show_alert=True
+            )
+            return
+
+        # Do not consume the token here. The downstream database transaction
+        # claims it atomically with a rep renewal intent, reservation, or admin lock.
+        renewal_confirmation_id = intent_id
+        confirmed = intent
+        account_code = confirmed["account_email"]
+        parts = ["qrenew_execute", account_code, confirmed["plan_code"]]
+        action = "qrenew_execute"
 
     # 0. Admin Navigation
     if action == "admin":
@@ -1347,35 +2268,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role == "rep" and rep:
             await rep_panel.handle_rep_callbacks(update, context, rep)
             return
-        elif role == "super_admin":
-            reps = database.get_all_reps()
-            if reps:
-                await rep_panel.handle_rep_callbacks(update, context, reps[0])
-                return
-        await query.answer("⛔️ دسترسی فقط برای نمایندگان مجاز است.", show_alert=True)
+        await query.answer(
+            "⛔️ برای ورود به پنل نمایندگی باید در تاپیک اختصاصی همان نماینده باشید.",
+            show_alert=True
+        )
         return
 
     # 0.2 End-User Portal Navigation
     if action == "user":
+        if role != "end_user":
+            await query.answer(
+                "⛔️ پورتال کاربری فقط برای نقش کاربر نهایی مجاز است.",
+                show_alert=True
+            )
+            return
         await user_portal.handle_user_callbacks(update, context)
         return
 
     # Strict End-User Isolation in Callbacks
     if role == "end_user":
-        if action in ("suspend", "activate", "qrenew", "force_res", "cancel_res", "toggle_mode", "more_plans"):
+        if action in ("suspend", "activate", "qrenew", "qrenew_confirm", "qrenew_execute", "force_res", "cancel_res", "toggle_mode", "set_mode", "more_plans"):
             await query.answer("⛔️ این عملیات فقط برای نماینده و مدیریت مجاز است.", show_alert=True)
             return
 
-        user_accs = database.get_user_accounts(user.id)
-        matched_user_acc = any(
-            a["account_code"].lower() == account_code.lower() or 
-            a["email"].lower() == account_code.lower() or
-            account_code.lower() in a["email"].lower()
-            for a in user_accs
-        )
-        if not matched_user_acc:
+        owned_account = database.get_user_owned_account(user.id, account_code)
+        if not owned_account:
             await query.answer("⛔️ شما به این اکانت دسترسی ندارید. ابتدا با دستور /link آن را ثبت کنید.", show_alert=True)
             return
+        account_code = owned_account["email"]
     
     # 1. More Plans Menu
     if action == "more_plans":
@@ -1400,18 +2320,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("↩️ بازگشت به منوی اصلی")
         return
 
-    # 3. Toggle Mode (Standard Rollover vs On First Connect)
+    # 3. Legacy toggle callback is read-only: it carries no desired state.
     if action == "toggle_mode":
-        new_mode = database.toggle_user_first_connect_mode(user.id)
+        await query.answer(
+            "⚠️ این دکمه قدیمی است و تغییری اعمال نشد؛ کارت اکانت را تازه کنید.",
+            show_alert=True
+        )
+        return
+
+    # 3. Explicit renewal mode: replaying this callback preserves the selected value.
+    if action == "set_mode":
+        desired_mode = parts[2] if len(parts) > 2 else ""
+        if desired_mode not in ("0", "1"):
+            await query.answer("⛔️ حالت درخواستی معتبر نیست؛ کارت اکانت را تازه کنید.", show_alert=True)
+            return
+        new_mode = database.set_user_first_connect_mode(user.id, desired_mode == "1")
         acc_rec = database.is_account_in_rep_scope(rep["id"], account_code) if rep else None
         is_en = bool(acc_rec.get("enable", 1)) if acc_rec else True
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_en, on_first_connect=new_mode, role=role)
+        keyboard = nlp_matcher.build_account_keyboard(
+            account_code, is_enabled=is_en, on_first_connect=new_mode, role=role
+        )
         try:
             await query.edit_message_reply_markup(reply_markup=keyboard)
         except BadRequest:
             pass
         mode_label = "شروع با اولین اتصال" if new_mode else "استاندارد (رول‌اوور)"
-        await query.answer(f"⚙️ حالت تمدید تغییر یافت به: {mode_label}", show_alert=True)
+        await query.answer(f"⚙️ حالت تمدید روی «{mode_label}» تنظیم شد.", show_alert=True)
         return
 
     # Account Verification
@@ -1423,8 +2357,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_super_admin:
         with database.get_db() as conn:
             row = conn.cursor().execute(
-                "SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) = ? OR LOWER(email) LIKE ? LIMIT 1",
-                (account_code.lower(), account_code.lower(), f"%{account_code.lower()}%")
+                "SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) = ? LIMIT 1",
+                (account_code.lower(), account_code.lower())
             ).fetchone()
             if row:
                 acc_record = dict(row)
@@ -1536,7 +2470,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("✅ اتصال اکانت مجدداً برقرار گردید.")
             await asyncio.to_thread(send_admin_log, f"✅ برقراری اتصال اکانت `{email}` از دکمه شیشه‌ای")
 
-    # 7. Quick Renewal via Button (qrenew:<account_code>:<plan_code>)
+    # 7. Quick Renewal button opens an expiring one-time confirmation.
     elif action == "qrenew":
         if role not in ("super_admin", "rep"):
             await query.answer("⛔️ عدم دسترسی", show_alert=True)
@@ -1544,16 +2478,73 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         plan_code = parts[2] if len(parts) > 2 else "20gb_30d"
         plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ پلن مورد نظر تعریف نشده است.", show_alert=True)
+        if not plan or not plan.get("is_active", 1):
+            await query.answer("❌ پلن مورد نظر تعریف نشده یا غیرفعال است.", show_alert=True)
+            return
+        try:
+            confirmation_id = database.create_account_renewal_confirmation(
+                actor_id=user.id,
+                actor_role=role,
+                rep_id=rep["id"] if rep else None,
+                account_code=acc_record.get("account_code") or email,
+                account_email=email,
+                plan_code=plan["plan_code"],
+                plan_name=plan["name"],
+                gb=plan["gb"],
+                days=plan["days"],
+                amount=plan["rep_price"],
+            )
+        except ValueError as exc:
+            await query.answer(f"❌ ایجاد تأیید تمدید ممکن نشد: {exc}", show_alert=True)
             return
 
-        gb = plan["gb"]
-        days = plan["days"]
+        if role == "rep" and acc_record.get("rep_id") is not None:
+            charge_line = f"• هزینه نمایندگی: **{plan['rep_price']:,} تومان**\n"
+        else:
+            charge_line = "• هزینه: **بدون صورت‌حساب نمایندگی (مدیریت کل)**\n"
+        confirmation_text = (
+            f"⚡️ **تأیید تمدید سرویس {email}**\n\n"
+            f"• بسته: **{plan['name']}** ({plan['gb']} گیگابایت / {plan['days']} روز)\n"
+            f"{charge_line}"
+            "این تأیید تا ۱۰ دقیقه معتبر است و فقط یک بار قابل اجراست.\n"
+            "در صورت تمایل، عملیات تمدید یا ثبت رزرو را تأیید کنید."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "✅ تأیید تمدید",
+                callback_data=f"qrenew_confirm:{confirmation_id}"
+            )],
+            [InlineKeyboardButton(
+                "❌ انصراف",
+                callback_data=f"main_menu:{email}"
+            )]
+        ])
+        await safe_edit_message(query, confirmation_text, reply_markup=keyboard)
+        await query.answer("تأیید یک‌بارمصرف تمدید ایجاد شد.")
+
+    # qrenew_confirm has consumed its one-time token before reaching this branch.
+    # The existing direct-vs-reserve decision and accounting pipeline are preserved.
+    elif action == "qrenew_execute":
+        if role not in ("super_admin", "rep"):
+            await query.answer("⛔️ عدم دسترسی", show_alert=True)
+            return
+        if not renewal_confirmation_id:
+            await query.answer(
+                "⛔️ این دکمه قدیمی یا فاقد تأیید یک‌بارمصرف معتبر است؛ از کارت اکانت دوباره اقدام کنید.",
+                show_alert=True
+            )
+            return
+        plan_code = parts[2] if len(parts) > 2 else ""
+        plan = database.get_plan(plan_code)
+        if not plan:
+            await query.answer("❌ پلن مورد نظر دیگر در دسترس نیست.", show_alert=True)
+            return
+
         ok, msg_out, keyboard = await process_account_renewal(
             user=user, role=role, rep=rep, acc_record=acc_record, client_info=client_info,
-            gb=gb, days=days, plan_code=plan_code, effective_first=on_first,
-            curr_comment=curr_comment, comment_updated=False
+            gb=plan["gb"], days=plan["days"], plan_code=plan_code, effective_first=on_first,
+            curr_comment=curr_comment, comment_updated=False,
+            confirmation_id=renewal_confirmation_id,
         )
         await safe_edit_message(query, msg_out, reply_markup=keyboard)
         await query.answer("عملیات تمدید / صف رزرو پردازش شد.")
@@ -1562,22 +2553,64 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "force_res":
         res_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
         res_item = database.get_reservation_by_id(res_id)
-        if not res_item or res_item["status"] != "pending":
-            await query.answer("⚠️ این بسته قبلاً فعال یا لغو شده است.", show_alert=True)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("email", "")).lower() != str(email).lower()
+            or (rep and res_item.get("rep_id") != rep.get("id"))
+        ):
+            await query.answer("⚠️ رزرو در انتظار متعلق به اکانت یا نمایندگی شما نیست.", show_alert=True)
+            return
+
+        lock_key = f"reservation-activation:{res_id}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
+        if not lock_token:
+            await query.answer("⏳ این رزرو در حال فعال‌سازی است یا نتیجه قبلی نیازمند بررسی است.", show_alert=True)
+            return
+        # Re-check after acquiring the lease so a concurrent cancellation cannot race the X-UI call.
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("email", "")).lower() != str(email).lower()
+            or (rep and res_item.get("rep_id") != rep.get("id"))
+        ):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer("⚠️ وضعیت رزرو تغییر کرده است؛ عملیات متوقف شد.", show_alert=True)
             return
 
         res_email = res_item["email"]
         gb = res_item["gb"]
         days = res_item["days"]
         on_first_res = bool(res_item.get("on_first_connect", 0))
+        try:
+            ren_res = await asyncio.to_thread(
+                xui_manager.renew_client,
+                res_email, gb, days, comment=None, rollover=False,
+                countdown=True if on_first_res else "auto",
+                scope=scope_flt, by_code_only=True
+            )
+        except Exception:
+            logger.exception("Force reservation outcome is unknown: %s", res_id)
+            await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
+            return
 
-        ren_res = await asyncio.to_thread(
-            xui_manager.renew_client,
-            res_email, gb, days, comment=None, rollover=False,
-            countdown=True if on_first_res else "auto",
-            scope=scope_flt, by_code_only=True
-        )
-        database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or user.username)
+        if _xui_operation_failed(ren_res):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer("❌ پنل فعال‌سازی رزرو را رد کرد؛ رزرو در صف باقی ماند.", show_alert=True)
+            return
+        if not _xui_operation_succeeded(ren_res):
+            await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
+            return
+
+        try:
+            activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or user.username)
+        except Exception:
+            logger.exception("Reservation persistence failed after confirmed panel renewal: %s", res_id)
+            await query.answer("⚠️ پنل بسته را فعال کرد اما ثبت محلی انجام نشد؛ قفل برای بررسی محفوظ است.", show_alert=True)
+            return
+        if not activated:
+            await query.answer("⚠️ پنل عملیات را انجام داد اما ثبت فعال‌سازی ناموفق بود؛ قفل تطبیق حفظ شد.", show_alert=True)
+            return
+        database.release_operation_lock(lock_key, lock_token)
         report_text = ren_res.get("report", "")
         report_text = f"🚀 **بسته رزرو به صورت فوری فعال شد (اعتبار قبلی صفر و دوره جدید آغاز گردید):**\n\n" + report_text
         keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=on_first_res, role=role, pending_res=None)
@@ -1592,6 +2625,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 9. Cancel Reserved Package and Refund
     elif action == "cancel_res":
         res_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or str(res_item.get("email", "")).lower() != str(email).lower()
+            or (rep and res_item.get("rep_id") != rep.get("id"))
+        ):
+            await query.answer("⛔️ رزرو در انتظار متعلق به اکانت یا نمایندگی شما نیست.", show_alert=True)
+            return
         cancel_res = database.cancel_reservation(res_id, actor_id=user.id, actor_name=user.full_name or user.username)
         if not cancel_res:
             await query.answer("⚠️ این بسته قبلاً لغو یا فعال شده است.", show_alert=True)
@@ -1680,29 +2721,89 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("❌ خطا در ساخت QR کانفیگ", show_alert=True)
 
-    # 11. Reset SubId
+    # 11. Reset SubId — share the verified reset/persistence flow with the user portal.
     elif action == "reset_sub":
-        res_ok, res_msg, new_sub = await asyncio.to_thread(sub_manager.reset_client_sub_id, xui_manager, email)
-        if res_ok:
-            new_url = sub_manager.get_subscription_url(new_sub)
+        lock_key = f"subscription-reset:{str(account_code).lower()}"
+        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
+        if not lock_token:
+            await query.answer("⏳ بازنشانی لینک این اکانت در حال انجام یا نیازمند تطبیق است؛ دوباره تلاش نکنید.", show_alert=True)
+            return
+        try:
+            reset_result = await asyncio.to_thread(
+                sub_manager.reset_client_subscription, xui_manager, email, scope="all"
+            )
+        except Exception:
+            logger.exception("Account-card subscription reset outcome is unknown: %s", account_code)
+            await query.answer(
+                "⚠️ نتیجه بازنشانی پنل مشخص نیست؛ قفل برای بررسی مدیریت نگه داشته شد. فعلاً دوباره اقدام نکنید.",
+                show_alert=True,
+            )
+            return
+
+        if reset_result.get("status") == "unknown":
+            await query.answer(
+                "⚠️ وضعیت شناسه در پنل قابل تأیید نیست؛ قفل تطبیق حفظ شد. فعلاً دوباره تلاش نکنید.",
+                show_alert=True,
+            )
+            return
+        if reset_result.get("status") not in ("ok", "partial") or not reset_result.get("new_sub_id"):
+            database.release_operation_lock(lock_key, lock_token)
+            await query.answer(
+                f"❌ خطا در بازنشانی لینک ساب: {reset_result.get('message', 'بازنشانی تأیید نشد')}",
+                show_alert=True,
+            )
+            return
+
+        try:
+            database.upsert_account_record(
+                rep_id=acc_record.get("rep_id"),
+                email=email,
+                account_code=account_code,
+                sub_id=reset_result["new_sub_id"],
+            )
+        except Exception:
+            logger.exception(
+                "Subscription ID rotated remotely for %s but local persistence failed",
+                email,
+            )
+            await query.answer(
+                "⚠️ شناسه در پنل تغییر کرده اما ثبت محلی انجام نشد؛ قفل تطبیق حفظ شد و بررسی مدیریت لازم است.",
+                show_alert=True,
+            )
+            return
+
+        try:
             target_rep_id = acc_record.get("rep_id") or (rep["id"] if rep else None)
-            database.upsert_account_record(rep_id=target_rep_id, email=email, account_code=account_code, sub_id=new_sub)
             database.log_audit(
                 rep_id=target_rep_id, account_code=account_code, email=email,
-                action="reset_sub_id", actor_id=user.id, actor_name=user.full_name or user.username,
-                details={"new_sub_id": new_sub}, result_status="success"
+                action="reset_sub_id", actor_id=user.id,
+                actor_name=user.full_name or user.username,
+                details={"new_sub_id": reset_result["new_sub_id"]},
+                result_status="success",
             )
+        except Exception:
+            logger.exception("Subscription ID changed and persisted but audit write failed for %s", email)
+
+        database.release_operation_lock(lock_key, lock_token)
+        if reset_result.get("status") == "ok" and reset_result.get("new_sub_url"):
             out_text = (
-                f"🔄 **لینک سابسکریپشن اکانت `{account_code}` با موفقیت بازنشانی شد.**\n\n"
-                f"⚠️ لینک قبلی بی‌درنگ باطل گردید.\n\n"
-                f"🔗 **لینک جدید سابسکریپشن:**\n`{new_url}`"
+                f"🔄 **لینک سابسکریپشن اکانت `{account_code}` با موفقیت بازنشانی شد.**\\n\\n"
+                f"⚠️ لینک قبلی باطل گردید.\\n\\n"
+                f"🔗 **لینک جدید سابسکریپشن:**\\n`{reset_result['new_sub_url']}`"
             )
-            keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role)
+            keyboard = nlp_matcher.build_account_keyboard(
+                account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role
+            )
             await safe_edit_message(query, out_text, reply_markup=keyboard)
             await query.answer("✅ لینک سابسکریپشن بازنشانی شد.")
-            await asyncio.to_thread(send_admin_log, f"🔄 بازنشانی لینک ساب اکانت `{email}` توسط `{user.id}`", target_rep_id)
+            await asyncio.to_thread(
+                send_admin_log, f"بازنشانی لینک ساب اکانت `{email}` توسط `{user.id}`", target_rep_id
+            )
         else:
-            await query.answer(f"❌ خطا در بازنشانی لینک ساب: {res_msg}", show_alert=True)
+            await query.answer(
+                "⚠️ شناسه جدید در پنل و دیتابیس ثبت شد، اما لینک عمومی ساخته نشد. تنظیمات دامنه را بررسی کنید.",
+                show_alert=True,
+            )
 
 # --- Background Reserve Queue Watchdog Task ---
 
@@ -1749,22 +2850,82 @@ async def watchdog_worker(application: Application):
                         reason = f"اتمام حجم (باقیمانده: {rem_gb:.2f} GB)"
 
                     if trigger:
+                        res_id = int(res["id"])
+                        lock_key = f"reservation-activation:{res_id}"
+                        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
+                        if not lock_token:
+                            logger.info(
+                                "Watchdog skipped reservation %s because another activation/reconciliation owns it",
+                                res_id
+                            )
+                            continue
+
+                        # Re-read the reservation after acquiring the same lease used by
+                        # manual activation and cancellation; this closes the race.
+                        current_res = database.get_reservation_by_id(res_id)
+                        if not current_res or current_res.get("status") != "pending":
+                            database.release_operation_lock(lock_key, lock_token)
+                            continue
+                        email = current_res["email"]
+                        gb = current_res["gb"]
+                        days = current_res["days"]
+                        on_first = bool(current_res.get("on_first_connect", 0))
                         logger.info(f"Watchdog auto-activating reserve package for {email} ({reason})")
-                        gb = res["gb"]
-                        days = res["days"]
-                        on_first = bool(res.get("on_first_connect", 0))
 
-                        ren_res = await asyncio.to_thread(
-                            xui_manager.renew_client,
-                            email, gb, days, comment=None, rollover=False,
-                            countdown=True if on_first else "auto",
-                            scope="all", by_code_only=True
-                        )
-                        database.activate_reservation(res["id"], actor_id=0, actor_name="watchdog")
+                        try:
+                            ren_res = await asyncio.to_thread(
+                                xui_manager.renew_client,
+                                email, gb, days, comment=None, rollover=False,
+                                countdown=True if on_first else "auto",
+                                scope="all", by_code_only=True
+                            )
+                        except Exception:
+                            # The request may have reached the panel. Keep the lease
+                            # so another actor cannot blindly issue the same renewal.
+                            logger.exception(
+                                "Watchdog outcome is unknown for reservation %s; activation lease retained",
+                                res_id
+                            )
+                            continue
 
-                        account_code = res["account_code"]
-                        plan_name = res["plan_name"]
-                        rep_id = res["rep_id"]
+                        if _xui_operation_failed(ren_res):
+                            database.release_operation_lock(lock_key, lock_token)
+                            logger.error(
+                                "Watchdog received a definite X-UI failure for reservation %s; "
+                                "reservation remains pending (response=%r)",
+                                res_id, ren_res
+                            )
+                            continue
+
+                        if not _xui_operation_succeeded(ren_res):
+                            logger.error(
+                                "Watchdog received an ambiguous X-UI result for reservation %s; "
+                                "activation lease retained (response=%r)",
+                                res_id, ren_res
+                            )
+                            continue
+
+                        try:
+                            activated = database.activate_reservation(
+                                res_id, actor_id=0, actor_name="watchdog"
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Watchdog X-UI activation succeeded but local reservation state write failed: %s",
+                                res_id,
+                            )
+                            continue
+                        if not activated:
+                            logger.error(
+                                "X-UI renewed reservation %s but database activation failed; lease retained",
+                                res_id
+                            )
+                            continue
+                        database.release_operation_lock(lock_key, lock_token)
+
+                        account_code = current_res["account_code"]
+                        plan_name = current_res["plan_name"]
+                        rep_id = current_res["rep_id"]
                         rep_info = database.get_rep_by_id(rep_id)
 
                         log_msg = (
@@ -1794,17 +2955,36 @@ async def watchdog_worker(application: Application):
                                 logger.error(f"Failed to send rep auto-activation notice: {e}")
 
         except Exception as e:
-            logger.error(f"Error in watchdog worker cycle: {e}")
+            logger.error(f"Error in watchdog worker cycle: {e}", exc_info=True)
 
         interval = database.get_setting("watchdog_interval_sec", default=300, cast_type=int)
         await asyncio.sleep(interval)
 
+async def receipt_notification_worker(application: Application):
+    """Retry durable admin receipt notifications independently of the X-UI watchdog."""
+    logger.info("Starting durable receipt notification outbox worker...")
+    while True:
+        try:
+            result = await process_receipt_notification_outbox(application.bot, limit=10)
+            if result.get("attempted"):
+                logger.info(
+                    "Receipt notification worker attempted=%s sent=%s",
+                    result.get("attempted"), result.get("sent")
+                )
+        except Exception:
+            logger.exception("Receipt notification worker cycle failed")
+        await asyncio.sleep(30)
+
+
 def main():
     database.init_db()
-    database.sync_all_active_reps()
+    startup_sync = database.sync_all_active_reps_detailed()
+    if startup_sync.get("status") != "success":
+        logger.error("Initial X-UI database sync failed: %s", startup_sync.get("message"))
     
     async def post_init(application: Application):
         asyncio.create_task(watchdog_worker(application))
+        asyncio.create_task(receipt_notification_worker(application))
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
@@ -1824,6 +3004,13 @@ def main():
     app.add_handler(CommandHandler("card", card_cmd))
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("sync", sync_cmd))
+    app.add_handler(CommandHandler("operations", operations_cmd))
+    app.add_handler(CommandHandler("unlock", unlock_operation_cmd))
+    app.add_handler(CommandHandler("resolveintent", resolve_user_intent_cmd))
+    app.add_handler(CommandHandler("resolverepintent", resolve_rep_intent_cmd))
+    app.add_handler(CommandHandler("resolvereprenewal", resolve_rep_renewal_cmd))
+    app.add_handler(CommandHandler("resolvereservation", resolve_reservation_cmd))
+    app.add_handler(CommandHandler("resolveadminrenewal", resolve_admin_renewal_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

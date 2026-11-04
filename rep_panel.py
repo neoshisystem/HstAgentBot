@@ -23,9 +23,10 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import database
 import nlp_matcher
 import finance_manager
+from xui_result import XUIResult, classify_xui_result
 
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
 
 logger = logging.getLogger("RepPanel")
 
@@ -140,89 +141,210 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     elif action == "new_plan_chosen":
         plan_code = parts[2] if len(parts) > 2 else "20gb_30d"
         plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ پلن یافت نشد.", show_alert=True)
+        if not plan or not plan.get("is_active", 1):
+            await query.answer("❌ پلن یافت نشد یا غیرفعال است.", show_alert=True)
             return
 
-        # Check rep credit limit first
-        allowed, curr_debt, credit_limit = database.check_rep_credit_limit(rep["id"], plan["rep_price"])
-        if not allowed:
-            await query.answer(f"⛔️ سقف اعتبار تکمیل است (بدهی: {curr_debt:,} ت | سقف: {credit_limit:,} ت)", show_alert=True)
+        try:
+            intent_id = database.create_rep_action_intent(
+                rep_id=rep["id"], actor_tg_id=user.id,
+                plan_code=plan["plan_code"], plan_name=plan["name"],
+                gb=plan["gb"], days=plan["days"], amount=plan["rep_price"],
+            )
+        except ValueError as exc:
+            await query.answer(f"⛔️ ایجاد درخواست صدور ممکن نشد: {exc}", show_alert=True)
             return
 
         context.user_data["rep_state"] = {
             "action": "awaiting_new_acc_name",
-            "plan_code": plan_code,
+            "intent_id": intent_id,
             "rep_id": rep["id"],
             "ts": time.time()
         }
-
-        extra_btns = [
-            [InlineKeyboardButton("⏩ بدون نام / رد کردن", callback_data=f"rep:issue_acc_direct:{plan_code}:noname")]
-        ]
+        extra_btns = [[InlineKeyboardButton(
+            "⏩ بدون نام / رد کردن",
+            callback_data=f"rep:issue_acc_direct:{intent_id}:noname"
+        )]]
         keyboard = build_back_to_rep_keyboard(extra_btns)
         msg = (
             f"👤 **ثبت نام مشتری برای پلن {plan['name']}:**\n\n"
             f"• هزینه پلن: **{plan['rep_price']:,} تومان**\n\n"
-            f"لطفاً **نام مشتری** را ارسال فرمایید یا دکمه «بدون نام / رد کردن» را بزنید:"
+            "لطفاً **نام مشتری** را ارسال فرمایید یا دکمه «بدون نام / رد کردن» را بزنید:\n"
+            "این درخواست تا ۱۵ دقیقه معتبر است و فقط یک بار قابل اجراست."
         )
         await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer()
 
-    # 2.2 Issue account directly
+    # 2.2 Issue account using one durable representative action intent.
     elif action == "issue_acc_direct":
-        plan_code = parts[2] if len(parts) > 2 else "20gb_30d"
-        cust_name = "" if (len(parts) > 3 and parts[3] == "noname") else context.user_data.get("rep_temp_name", "")
-        plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ پلن یافت نشد.", show_alert=True)
+        intent_id = parts[2] if len(parts) > 2 else ""
+        intent = database.get_rep_action_intent(intent_id, rep["id"], user.id)
+        if (
+            not intent or intent["action_type"] != "issue"
+            or intent["status"] != "pending"
+            or float(intent["expires_at"]) <= time.time()
+        ):
+            await query.answer(
+                "⛔️ درخواست صدور منقضی شده، قبلاً استفاده شده یا متعلق به شما نیست؛ از منوی صدور دوباره شروع کنید.",
+                show_alert=True
+            )
             return
 
-        allowed, curr_debt, credit_limit = database.check_rep_credit_limit(rep["id"], plan["rep_price"])
-        if not allowed:
-            await query.answer(f"⛔️ سقف اعتبار تکمیل است.", show_alert=True)
+        try:
+            started = database.begin_rep_action_intent(intent_id, rep["id"], user.id)
+        except ValueError as exc:
+            await query.answer(f"⛔️ ثبت مالی صدور انجام نشد: {exc}", show_alert=True)
+            return
+        except Exception:
+            logger.exception("Could not claim representative issuance intent %s", intent_id)
+            await query.answer("❌ شروع صدور انجام نشد؛ درخواست جدیدی از منوی صدور ایجاد کنید.", show_alert=True)
             return
 
-        gb = plan["gb"]
-        days = plan["days"]
+        if started["status"] != "started":
+            messages = {
+                "not_found": "⛔️ درخواست صدور معتبر نیست یا متعلق به شما نیست.",
+                "already_processed": "⛔️ این درخواست قبلاً اجرا یا برای تطبیق ثبت شده است؛ بدهی مجدد ایجاد نمی‌شود.",
+                "expired": "⌛️ درخواست صدور منقضی شده است؛ منوی صدور را دوباره باز کنید.",
+                "plan_changed": "⚠️ تعرفه از زمان نمایش منو تغییر کرده است؛ منوی صدور را تازه کنید.",
+                "busy": "⏳ این درخواست در حال پردازش است؛ از اجرای مجدد خودداری کنید.",
+            }
+            await query.answer(messages.get(started["status"], "❌ درخواست صدور قابل اجرا نیست."), show_alert=True)
+            return
+
+        intent = started["intent"]
+        amount = int(intent["amount"])
+        gb = float(intent["gb"])
+        days = int(intent["days"])
+        cust_name = str(intent.get("customer_name") or "")
+        lock_key = started["lock_key"]
+        lock_token = started["lock_token"]
+        new_bal = started["new_balance"]
         scope_for_alloc = rep.get("scope_filter") or "all"
 
-        alloc_res = await asyncio.to_thread(xui_manager.allocate_pool_client, gb, days, comment=cust_name, scope=scope_for_alloc)
-        if alloc_res.get("status") == "success":
+        try:
+            alloc_res = await asyncio.to_thread(
+                xui_manager.allocate_pool_client, gb, days,
+                comment=cust_name, scope=scope_for_alloc
+            )
+        except Exception:
+            logger.exception("Representative allocation outcome is unknown for rep %s", rep["id"])
+            try:
+                database.mark_rep_action_intent_for_reconciliation(
+                    intent_id, rep["id"], user.id, lock_key, lock_token,
+                    "X-UI allocation raised an exception; external result must be reconciled",
+                )
+            except Exception:
+                logger.exception("Could not mark representative issuance intent for reconciliation (%s)", intent_id)
+            await query.answer(
+                "⚠️ پاسخ پنل نامشخص است؛ پیش‌پرداخت محفوظ و درخواست برای تطبیق مدیریتی قفل شده است.",
+                show_alert=True
+            )
+            return
+
+        if classify_xui_result(alloc_res) == XUIResult.SUCCESS:
             email = alloc_res.get("email")
+            if not email:
+                try:
+                    database.mark_rep_action_intent_for_reconciliation(
+                        intent_id, rep["id"], user.id, lock_key, lock_token,
+                        "X-UI reported success without an account email",
+                    )
+                except Exception:
+                    logger.exception("Could not mark incomplete representative allocation result (%s)", intent_id)
+                await query.answer("⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ پیش‌پرداخت محفوظ و قفل شد.", show_alert=True)
+                return
+
             sub_id = alloc_res.get("sub_id")
-            code = xui_manager.extract_account_identifier(email) or email
+            try:
+                code = xui_manager.extract_account_identifier(email) or email
+                database.upsert_account_record(
+                    rep_id=rep["id"], email=email, account_code=code,
+                    customer_name=cust_name, sub_id=sub_id, enable=1,
+                    total_gb=gb, expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
+                )
+            except Exception:
+                logger.exception("X-UI allocated %s but local persistence failed", email)
+                try:
+                    database.mark_rep_action_intent_for_reconciliation(
+                        intent_id, rep["id"], user.id, lock_key, lock_token,
+                        f"X-UI created account {email}, but local persistence failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark local account persistence failure (%s)", intent_id)
+                await query.answer(
+                    "⚠️ اکانت در پنل ایجاد شد اما ثبت محلی کامل نشد؛ پیش‌پرداخت محفوظ و قفل تطبیق حفظ شد.",
+                    show_alert=True
+                )
+                return
 
-            database.upsert_account_record(
-                rep_id=rep["id"],
-                email=email,
-                account_code=code,
-                customer_name=cust_name,
-                sub_id=sub_id,
-                enable=1,
-                total_gb=gb,
-                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
-            )
-
-            new_bal = database.record_ledger_entry(
-                rep_id=rep["id"],
-                account_code=code,
-                email=email,
-                plan_code=plan_code,
-                tx_type="debit",
-                amount=plan["rep_price"],
-                description=f"صدور اکانت جدید {int(gb)}G/{int(days)}D ({cust_name or 'بدون نام'})",
-                actor_id=user.id,
-                actor_name=user.full_name or "Rep"
-            )
+            try:
+                database.complete_rep_action_intent(
+                    intent_id, rep["id"], user.id, lock_key, lock_token, code, email
+                )
+            except Exception:
+                logger.exception("Could not finalize successful representative intent %s", intent_id)
+                try:
+                    database.mark_rep_action_intent_for_reconciliation(
+                        intent_id, rep["id"], user.id, lock_key, lock_token,
+                        f"Account {email} exists in panel and local database, but intent finalization failed",
+                    )
+                except Exception:
+                    logger.exception("Could not mark representative intent finalization failure (%s)", intent_id)
+                await query.answer(
+                    "⚠️ اکانت ثبت شد اما نهایی‌سازی مالی کامل نشد؛ قفل برای تطبیق مدیریتی حفظ شده است.",
+                    show_alert=True
+                )
+                return
 
             deliv_text = alloc_res.get("deliverable", "")
-            deliv_text += f"\n\n🧾 **فاکتور:** `{plan['rep_price']:,} تومان` | **مانده بدهی جدید:** `{new_bal:,} تومان`"
-            keyboard = nlp_matcher.build_account_keyboard(code, is_enabled=True, on_first_connect=False, role="rep")
-            await query.message.reply_text(deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            deliv_text += (
+                f"\n\n🧾 **فاکتور:** \`{amount:,} تومان\`"
+                f" | **مانده بدهی جدید:** \`{new_bal:,} تومان\`"
+            )
+            keyboard = nlp_matcher.build_account_keyboard(
+                code, is_enabled=True, on_first_connect=False, role="rep"
+            )
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            await query.message.reply_text(
+                deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            )
             await query.answer("✅ اکانت جدید با موفقیت صادر شد.")
+        elif classify_xui_result(alloc_res) == XUIResult.FAILURE:
+            try:
+                new_balance = database.refund_rep_action_intent(
+                    intent_id, rep["id"], user.id, lock_key, lock_token,
+                    actor_name=user.full_name or "Representative",
+                )
+            except Exception:
+                logger.exception("Representative issuance refund failed; lock retained (%s)", intent_id)
+                await query.answer(
+                    "⚠️ صدور ناموفق بود اما استرداد ثبت نشد؛ قفل برای تطبیق مدیریتی محفوظ مانده است.",
+                    show_alert=True
+                )
+                return
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+            await query.answer(
+                f"❌ پنل صدور را رد کرد؛ پیش‌پرداخت {amount:,} تومان مسترد شد. مانده بدهی: {new_balance:,} تومان.",
+                show_alert=True
+            )
         else:
-            await query.answer(f"❌ خطا: {alloc_res.get('message', 'موجودی استخر تمام شده است')}", show_alert=True)
+            try:
+                database.mark_rep_action_intent_for_reconciliation(
+                    intent_id, rep["id"], user.id, lock_key, lock_token,
+                    f"Ambiguous X-UI allocation response: {alloc_res!r}"[:500],
+                )
+            except Exception:
+                logger.exception("Could not mark ambiguous representative allocation (%s)", intent_id)
+            await query.answer(
+                "⚠️ پاسخ پنل مبهم است؛ پیش‌پرداخت محفوظ و قفل برای تطبیق مدیریتی حفظ شد.",
+                show_alert=True
+            )
 
     # 3. Paginated Accounts List
     elif action == "acc_list":
@@ -269,8 +391,16 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 3.1 View Specific Account Card
     elif action == "view_acc":
-        acc_code = parts[2] if len(parts) > 2 else ""
-        insp = await asyncio.to_thread(xui_manager.inspect_client, acc_code, scope=rep.get("scope_filter", "all"), by_code_only=True)
+        requested_code = parts[2] if len(parts) > 2 else ""
+        owned_account = database.is_account_in_rep_scope(rep["id"], requested_code)
+        if not owned_account:
+            await query.answer("⛔️ این اکانت در محدوده ثبت‌شده نمایندگی شما نیست.", show_alert=True)
+            return
+        acc_code = owned_account["account_code"]
+        insp = await asyncio.to_thread(
+            xui_manager.inspect_client, owned_account["email"],
+            scope=rep.get("scope_filter", "all"), by_code_only=True
+        )
         if insp.get("status") == "ok":
             client_info = insp["data"]
             report_text = xui_manager.format_status_report(client_info, is_admin=False)
@@ -364,43 +494,159 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"  هزینه: `{r['charge_amount']:,} ت` | ثبت: `{r['created_at'][:16]}`"
                 )
                 extra_btns.append([
-                    InlineKeyboardButton(f"🚀 فعال‌سازی {r['account_code']}", callback_data=f"rep:force_res:{r['id']}:{r['account_code']}"),
-                    InlineKeyboardButton(f"🗑 لغو و عودت {r['account_code']}", callback_data=f"rep:cancel_res:{r['id']}:{r['account_code']}")
+                    InlineKeyboardButton(f"🚀 فعال‌سازی {r['account_code']}", callback_data=f"rep:confirm_force_res:{r['id']}:{r['account_code']}"),
+                    InlineKeyboardButton(f"🗑 لغو و عودت {r['account_code']}", callback_data=f"rep:confirm_cancel_res:{r['id']}:{r['account_code']}")
                 ])
 
         keyboard = build_back_to_rep_keyboard(extra_btns)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("صف بسته‌های رزرو")
 
-    # 6.1 Force Activate or Cancel Reserve
+    # 6.1 Legacy single-click reservation callbacks are read-only.
     elif action in ("force_res", "cancel_res"):
-        res_id = int(parts[2])
+        await query.answer(
+            "⚠️ این دکمه قدیمی است و اجرا نشد. صف رزرو یا کارت اکانت را تازه کنید و مرحله تأیید را انجام دهید.",
+            show_alert=True
+        )
+        return
+
+    # 6.2 First click: display second-stage confirmation without side effects.
+    elif action in ("confirm_force_res", "confirm_cancel_res"):
+        try:
+            res_id = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("شناسه رزرو نامعتبر است.", show_alert=True)
+            return
         acc_code = parts[3] if len(parts) > 3 else ""
-        if action == "force_res":
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or res_item.get("rep_id") != rep.get("id")
+            or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+        ):
+            await query.answer("⛔️ رزرو در انتظار و متعلق به نمایندگی شما یافت نشد.", show_alert=True)
+            return
+
+        if action == "confirm_force_res":
+            confirm_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🚀 تأیید فعال‌سازی فوری (بسته فعلی مصرف می‌شود)",
+                    callback_data=f"rep:do_force_res:{res_id}:{acc_code}"
+                )],
+                [InlineKeyboardButton("❌ انصراف / بازگشت به صف", callback_data="rep:reserves")]
+            ])
+            confirm_text = (
+                f"⚠️ **تأیید فعال‌سازی فوری بسته رزرو**\n\n"
+                f"اکانت: {acc_code}\n"
+                f"پلن رزرو: **{res_item['plan_name']}** ({res_item['gb']}G / {res_item['days']}D)\n\n"
+                "با تأیید، بسته فعلی اکانت کنار گذاشته می‌شود و درخواست تمدید فوراً به پنل ارسال خواهد شد."
+            )
+        else:
+            confirm_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"🗑 تأیید لغو و عودت {int(res_item.get('charge_amount') or 0):,} تومان",
+                    callback_data=f"rep:do_cancel_res:{res_id}:{acc_code}"
+                )],
+                [InlineKeyboardButton("❌ انصراف / بازگشت به صف", callback_data="rep:reserves")]
+            ])
+            confirm_text = (
+                f"⚠️ **تأیید لغو بسته رزرو و عودت وجه**\n\n"
+                f"اکانت: {acc_code}\n"
+                f"پلن رزرو: **{res_item['plan_name']}**\n"
+                f"مبلغ قابل عودت به تراز نمایندگی: **{int(res_item.get('charge_amount') or 0):,} تومان**\n\n"
+                "با تأیید، رزرو لغو و اعتبار نمایندگی به‌روزرسانی می‌شود."
+            )
+        await query.edit_message_text(
+            confirm_text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=confirm_keyboard
+        )
+        await query.answer("برای اجرای عملیات، تأیید دوم را بزنید.")
+        return
+
+    # 6.3 Second click: revalidate identity and pending status before mutation.
+    elif action in ("do_force_res", "do_cancel_res"):
+        try:
+            res_id = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("شناسه رزرو نامعتبر است.", show_alert=True)
+            return
+        acc_code = parts[3] if len(parts) > 3 else ""
+        res_item = database.get_reservation_by_id(res_id)
+        if (
+            not res_item or res_item.get("status") != "pending"
+            or res_item.get("rep_id") != rep.get("id")
+            or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+        ):
+            await query.answer("⛔️ رزرو تغییر کرده یا دیگر در محدوده نمایندگی شما نیست.", show_alert=True)
+            return
+
+        if action == "do_force_res":
+            lock_key = f"reservation-activation:{res_id}"
+            lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
+            if not lock_token:
+                await query.answer("⏳ این رزرو در حال فعال‌سازی است یا نتیجه عملیات قبلی نیازمند بررسی است.", show_alert=True)
+                return
+            # Re-read after acquiring the lease to close the cancel/activate race.
             res_item = database.get_reservation_by_id(res_id)
-            if not res_item or res_item["status"] != "pending":
-                await query.answer("⚠️ این بسته قبلاً فعال یا لغو شده است.", show_alert=True)
+            if (
+                not res_item or res_item.get("status") != "pending"
+                or res_item.get("rep_id") != rep.get("id")
+                or str(res_item.get("account_code", "")).lower() != acc_code.lower()
+            ):
+                database.release_operation_lock(lock_key, lock_token)
+                await query.answer("⛔️ وضعیت رزرو تغییر کرده یا در محدوده نمایندگی شما نیست.", show_alert=True)
                 return
             gb = res_item["gb"]
             days = res_item["days"]
             on_first = bool(res_item.get("on_first_connect", 0))
-            await asyncio.to_thread(
-                xui_manager.renew_client,
-                res_item["email"], gb, days, comment=None, rollover=False,
-                countdown=True if on_first else "auto", scope="all", by_code_only=True
-            )
-            database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
-            await query.answer(f"🚀 بسته رزرو اکانت {acc_code} با موفقیت فعال شد.", show_alert=True)
+            try:
+                renew_result = await asyncio.to_thread(
+                    xui_manager.renew_client,
+                    res_item["email"], gb, days, comment=None, rollover=False,
+                    countdown=True if on_first else "auto",
+                    scope=rep.get("scope_filter") or "all", by_code_only=True
+                )
+            except Exception:
+                logger.exception("Representative force-reserve outcome is unknown: %s", res_id)
+                # Keep the lease until it expires: the panel may have renewed the account.
+                await query.answer("⚠️ پاسخ پنل نامشخص است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
+                return
+            if classify_xui_result(renew_result) == XUIResult.FAILURE:
+                # Explicit and consistent negative response only.
+                database.release_operation_lock(lock_key, lock_token)
+                await query.answer("❌ پنل فعال‌سازی رزرو را رد کرد؛ رزرو در صف باقی ماند.", show_alert=True)
+                return
+            if classify_xui_result(renew_result) != XUIResult.SUCCESS:
+                await query.answer("⚠️ پاسخ پنل مبهم است؛ رزرو و قفل تطبیق حفظ شدند.", show_alert=True)
+                return
+            try:
+                activated = database.activate_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
+            except Exception:
+                logger.exception("Reservation state write failed after confirmed panel renewal: %s", res_id)
+                await query.answer("⚠️ پنل بسته را فعال کرد اما ثبت محلی انجام نشد؛ قفل برای بررسی محفوظ است.", show_alert=True)
+                return
+            if not activated:
+                await query.answer("⚠️ پنل عملیات را انجام داد اما ثبت فعال‌سازی ناموفق بود؛ قفل تطبیق حفظ شد.", show_alert=True)
+                return
+            database.release_operation_lock(lock_key, lock_token)
+            result_msg = f"🚀 بسته رزرو اکانت {acc_code} فعال شد."
         else:
-            cancel_res = database.cancel_reservation(res_id, actor_id=user.id, actor_name=user.full_name or "Rep")
-            if cancel_res:
-                res_data, new_bal = cancel_res
-                await query.answer(f"🗑 بسته رزرو لغو و {res_data['charge_amount']:,} ت عودت داده شد.", show_alert=True)
-            else:
-                await query.answer("⚠️ این بسته قبلاً لغو یا فعال شده است.", show_alert=True)
+            cancel_result = database.cancel_reservation(
+                res_id, actor_id=user.id, actor_name=user.full_name or "Rep"
+            )
+            if not cancel_result:
+                await query.answer("⚠️ رزرو قبلاً تغییر وضعیت داده است یا در حال فعال‌سازی است.", show_alert=True)
+                return
+            res_data, new_bal = cancel_result
+            result_msg = f"🗑 رزرو {acc_code} لغو و {res_data['charge_amount']:,} تومان به تراز نماینده عودت داده شد."
 
-        # Refresh view
-        await handle_rep_callbacks(update, context, rep)
+        await query.answer(result_msg, show_alert=True)
+        await query.edit_message_text(
+            result_msg + "\n\nبرای مشاهده صف به‌روزشده از دکمه زیر استفاده کنید.",
+            reply_markup=build_back_to_rep_keyboard([
+                [InlineKeyboardButton("⏳ بازخوانی صف رزرو", callback_data="rep:reserves")]
+            ])
+        )
         return
 
     # 7. Wholesale Pricing Plans
@@ -444,6 +690,14 @@ async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_T
     if not rep_state:
         return False
 
+    if int(rep_state.get("rep_id") or -1) != int(rep.get("id") or -2):
+        context.user_data.pop("rep_state", None)
+        await update.message.reply_text(
+            "⛔️ زمینه این درخواست متعلق به نمایندگی دیگری است یا دیگر معتبر نیست؛ از پیشخوان نمایندگی دوباره شروع کنید.",
+            reply_markup=build_rep_main_keyboard(),
+        )
+        return True
+
     # Check timeout (90s)
     if time.time() - rep_state.get("ts", 0) > 90:
         context.user_data.pop("rep_state", None)
@@ -458,65 +712,54 @@ async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_T
         return True
 
     if action == "awaiting_new_acc_name":
-        plan_code = rep_state["plan_code"]
-        context.user_data["rep_temp_name"] = msg_text
+        intent_id = rep_state.get("intent_id", "")
+        intent = database.get_rep_action_intent(intent_id, rep["id"], update.effective_user.id)
+        if not intent or intent.get("status") != "pending":
+            context.user_data.pop("rep_state", None)
+            await update.message.reply_text("❌ درخواست صدور منقضی شده یا دیگر معتبر نیست؛ از منوی صدور دوباره شروع کنید.")
+            return True
+        if not database.set_rep_action_intent_customer_name(
+            intent_id, rep["id"], update.effective_user.id, msg_text
+        ):
+            context.user_data.pop("rep_state", None)
+            await update.message.reply_text("❌ ثبت نام مشتری برای این درخواست ممکن نشد؛ منوی صدور را دوباره باز کنید.")
+            return True
         context.user_data.pop("rep_state", None)
-
-        # Trigger issue directly with provided name
-        plan = database.get_plan(plan_code)
-        gb = plan["gb"]
-        days = plan["days"]
-        scope_for_alloc = rep.get("scope_filter") or "all"
-
-        alloc_res = await asyncio.to_thread(xui_manager.allocate_pool_client, gb, days, comment=msg_text, scope=scope_for_alloc)
-        if alloc_res.get("status") == "success":
-            email = alloc_res.get("email")
-            sub_id = alloc_res.get("sub_id")
-            code = xui_manager.extract_account_identifier(email) or email
-
-            database.upsert_account_record(
-                rep_id=rep["id"],
-                email=email,
-                account_code=code,
-                customer_name=msg_text,
-                sub_id=sub_id,
-                enable=1,
-                total_gb=gb,
-                expiry_time=alloc_res.get("data", {}).get("expiry_time", 0)
-            )
-
-            new_bal = database.record_ledger_entry(
-                rep_id=rep["id"],
-                account_code=code,
-                email=email,
-                plan_code=plan_code,
-                tx_type="debit",
-                amount=plan["rep_price"],
-                description=f"صدور اکانت جدید {int(gb)}G/{int(days)}D ({msg_text})",
-                actor_id=update.effective_user.id,
-                actor_name=update.effective_user.full_name or "Rep"
-            )
-
-            deliv_text = alloc_res.get("deliverable", "")
-            deliv_text += f"\n\n🧾 **فاکتور:** `{plan['rep_price']:,} تومان` | **مانده بدهی جدید:** `{new_bal:,} تومان`"
-            keyboard = nlp_matcher.build_account_keyboard(code, is_enabled=True, on_first_connect=False, role="rep")
-            await update.message.reply_text(deliv_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        else:
-            await update.message.reply_text(f"❌ خطا: {alloc_res.get('message', 'موجودی استخر تمام شده است')}")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"✅ تایید صدور با هزینه {intent['amount']:,} تومان",
+                callback_data=f"rep:issue_acc_direct:{intent_id}"
+            )],
+            [InlineKeyboardButton("❌ انصراف", callback_data="rep:new_acc_plans")]
+        ])
+        await update.message.reply_text(
+            f"👤 **نام مشتری:** {msg_text}\n"
+            f"📦 **پلن:** {intent['plan_name']} ({intent['gb']} گیگ / {intent['days']} روز)\n"
+            f"💳 **هزینه:** {intent['amount']:,} تومان\n\n"
+            "برای ادامه، صدور را تایید کنید. این درخواست یک شناسه یک‌بارمصرف دارد.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard
+        )
         return True
-
     elif action == "awaiting_search_query":
         context.user_data.pop("rep_state", None)
         insp = await asyncio.to_thread(xui_manager.inspect_client, msg_text, scope=rep.get("scope_filter", "all"), by_code_only=False)
         if insp.get("status") == "ok":
             client_info = insp["data"]
-            acc_code = client_info["email"]
+            owned_account = database.is_account_in_rep_scope(rep["id"], client_info.get("email", ""))
+            if not owned_account:
+                await update.message.reply_text(
+                    f"⚠️ اکانت {msg_text} در محدوده ثبت‌شده نمایندگی شما یافت نشد.",
+                    reply_markup=build_rep_main_keyboard(),
+                )
+                return True
+            acc_code = owned_account["account_code"]
             report_text = xui_manager.format_status_report(client_info, is_admin=False)
             pending_res = database.get_pending_reservation(acc_code)
             keyboard = nlp_matcher.build_account_keyboard(acc_code, is_enabled=bool(client_info["raw"].get("enable", True)), role="rep", pending_res=pending_res)
             await update.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         else:
-            await update.message.reply_text(f"⚠️ اکانت `{msg_text}` در محدوده نمایندگی شما یافت نشد.", reply_markup=build_rep_main_keyboard())
+            await update.message.reply_text(f"⚠️ اکانت {msg_text} در محدوده نمایندگی شما یافت نشد.", reply_markup=build_rep_main_keyboard())
         return True
 
     return False
