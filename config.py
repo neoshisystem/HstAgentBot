@@ -29,6 +29,19 @@ REPRESENTATIVES = {}
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "data" / "agent_bot.db"))
 BACKUP_DIR = os.getenv("BACKUP_DIR", str(BASE_DIR / "backups"))
 
+# Public subscription URL configuration. No live-domain fallback is embedded in code.
+SUB_DOMAIN = os.getenv("SUB_DOMAIN", "").strip()
+def _read_subscription_port():
+    try:
+        value = int(os.getenv("SUB_PORT", "443"))
+        return value if 1 <= value <= 65535 else 443
+    except (TypeError, ValueError):
+        return 443
+SUB_PORT = _read_subscription_port()
+SUB_PATH = os.getenv("SUB_PATH", "sub").strip("/")
+
 # Ensure local directories exist
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+db_parent = os.path.dirname(DB_PATH)
+if db_parent:
+    os.makedirs(db_parent, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)

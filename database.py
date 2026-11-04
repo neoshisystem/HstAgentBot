@@ -2,6 +2,10 @@ import os
 import sys
 import sqlite3
 import json
+import secrets
+import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from config import (
@@ -16,8 +20,8 @@ from config import (
 MY_PROJECT_GROUP_ID = int(MAIN_GROUP_ID)
 
 # Add scripts directory to path to access xui_manager
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
 
 DEFAULT_PLANS = [
     ("20gb_30d", "۲۰ گیگ ۱ ماهه", 20.0, 30, 300000, 450000, 1, 1),
@@ -48,15 +52,97 @@ DEFAULT_SETTINGS = [
     ("admin_telegram_id", str(ADMIN_TELEGRAM_ID), "شناسه تلگرام ادمین کل", "شناسه عددی ادمین اصلی سیستم")
 ]
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+def _insert_audit(cur, rep_id, account_code, email, action, actor_id, actor_name, details, result_status):
+    cur.execute("""
+        INSERT INTO audit_logs (rep_id, account_code, email, action, actor_id, actor_name, details_json, result_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        rep_id, str(account_code or ""), str(email or ""), action, actor_id,
+        actor_name, json.dumps(details, ensure_ascii=False) if isinstance(details, (dict, list)) else str(details),
+        result_status
+    ))
 
+
+def _record_rep_ledger_entry(cur, rep_id, account_code, email, plan_code, tx_type, amount, description, actor_id, actor_name):
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("Financial ledger amount must be a positive integer")
+    if tx_type not in ("debit", "credit"):
+        raise ValueError("Unsupported representative transaction type")
+    rep = cur.execute(
+        "SELECT balance_toman, credit_limit_toman, is_active FROM representatives WHERE id = ?",
+        (rep_id,)
+    ).fetchone()
+    if not rep:
+        raise ValueError("Representative not found")
+    current = int(rep["balance_toman"] or 0)
+    if tx_type == "debit":
+        if not bool(rep["is_active"]):
+            raise ValueError("Representative is inactive; new debits are not allowed")
+        limit = int(rep["credit_limit_toman"] if rep["credit_limit_toman"] is not None else 5_000_000)
+        if limit > 0 and current + amount > limit:
+            raise ValueError(
+                f"Representative credit limit exceeded: current={current}, charge={amount}, limit={limit}"
+            )
+    new_balance = current + amount if tx_type == "debit" else current - amount
+    cur.execute("""
+        INSERT INTO financial_ledger
+        (rep_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        rep_id, str(account_code or ""), str(email or ""), str(plan_code or ""),
+        tx_type, amount, new_balance, description, actor_id, actor_name
+    ))
+    cur.execute("UPDATE representatives SET balance_toman = ? WHERE id = ?", (new_balance, rep_id))
+    return new_balance
+
+
+def _credit_user_wallet(cur, user_id, amount, description, actor_id, actor_name):
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("Wallet credit amount must be a positive integer")
+    cur.execute("""
+        INSERT INTO user_wallets (user_id, balance_toman, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            balance_toman = user_wallets.balance_toman + excluded.balance_toman,
+            updated_at = CURRENT_TIMESTAMP
+    """, (user_id, amount))
+    row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
+    new_balance = int(row["balance_toman"])
+    cur.execute("""
+        INSERT INTO financial_ledger
+        (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
+        VALUES (NULL, ?, 'credit', ?, ?, ?, ?, ?)
+    """, (user_id, amount, new_balance, description, actor_id, actor_name))
+    return new_balance
+
+
+@contextmanager
+def get_db():
+    """Yield a configured SQLite connection and always close it.
+
+    The context commits on success and rolls back on failure. Callers may still
+    explicitly commit within the context when a result must be durable before
+    a subsequent operation.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db_parent = os.path.dirname(DB_PATH)
+    if db_parent:
+        os.makedirs(db_parent, exist_ok=True)
     with get_db() as conn:
         cur = conn.cursor()
         
@@ -163,8 +249,6 @@ def init_db():
             FOREIGN KEY (rep_id) REFERENCES representatives(id)
         )
         """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_rep ON financial_ledger(rep_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user ON financial_ledger(user_id)")
         
         # 7. User Settings (e.g. On First Connect toggle per user/session)
         cur.execute("""
@@ -247,11 +331,158 @@ def init_db():
             rejection_reason TEXT,
             reviewed_by INTEGER,
             reviewed_at TIMESTAMP,
+            cancelled_by INTEGER,
+            cancelled_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (rep_id) REFERENCES representatives(id)
         )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_status ON payment_receipts(status)")
+
+        # Durable delivery state for each submitted receipt's admin notification.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS receipt_notification_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            receipt_id INTEGER NOT NULL UNIQUE,
+            recipient_chat_id INTEGER,
+            recipient_thread_id INTEGER,
+            sender_name TEXT NOT NULL DEFAULT '',
+            sender_username TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'sent', 'superseded')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL NOT NULL DEFAULT 0,
+            lease_token TEXT,
+            lease_until REAL,
+            delivery_method TEXT,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            delivered_at TIMESTAMP,
+            FOREIGN KEY (receipt_id) REFERENCES payment_receipts(id) ON DELETE CASCADE
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_receipt_notification_outbox_due "
+            "ON receipt_notification_outbox(status, next_attempt_at, lease_until, id)"
+        )
+
+        # 13. Cross-process operation locks for sensitive portal actions
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS operation_locks (
+            lock_key TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            expires_at REAL NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_action_intents (
+            intent_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('buy', 'renew')),
+            account_code TEXT,
+            account_email TEXT,
+            plan_code TEXT NOT NULL,
+            plan_name TEXT NOT NULL,
+            gb REAL NOT NULL,
+            days INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            operation_lock_key TEXT,
+            operation_lock_token TEXT,
+            result_note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at REAL NOT NULL
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_action_intents_user_status "
+            "ON user_action_intents(user_id, status, expires_at)"
+        )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rep_action_intents (
+            intent_id TEXT PRIMARY KEY,
+            rep_id INTEGER NOT NULL,
+            actor_tg_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('issue')),
+            plan_code TEXT NOT NULL,
+            plan_name TEXT NOT NULL,
+            gb REAL NOT NULL,
+            days INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            customer_name TEXT NOT NULL DEFAULT '',
+            account_code TEXT,
+            account_email TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            operation_lock_key TEXT,
+            operation_lock_token TEXT,
+            result_note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at REAL NOT NULL,
+            FOREIGN KEY (rep_id) REFERENCES representatives(id)
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rep_action_intents_owner_status "
+            "ON rep_action_intents(rep_id, actor_tg_id, status, expires_at)"
+        )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rep_renewal_intents (
+            intent_id TEXT PRIMARY KEY,
+            rep_id INTEGER NOT NULL,
+            actor_tg_id INTEGER NOT NULL,
+            account_code TEXT NOT NULL,
+            account_email TEXT NOT NULL,
+            plan_code TEXT NOT NULL,
+            plan_name TEXT NOT NULL,
+            gb REAL NOT NULL,
+            days INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            confirmation_id TEXT,
+            status TEXT NOT NULL DEFAULT 'processing',
+            operation_lock_key TEXT NOT NULL,
+            operation_lock_token TEXT NOT NULL,
+            result_note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (rep_id) REFERENCES representatives(id)
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rep_renewal_intents_owner_status "
+            "ON rep_renewal_intents(rep_id, actor_tg_id, status, created_at)"
+        )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS account_renewal_confirmations (
+            intent_id TEXT PRIMARY KEY,
+            actor_id INTEGER NOT NULL,
+            actor_role TEXT NOT NULL CHECK (actor_role IN ('rep', 'super_admin')),
+            rep_id INTEGER,
+            account_code TEXT NOT NULL,
+            account_email TEXT NOT NULL,
+            plan_code TEXT NOT NULL,
+            plan_name TEXT NOT NULL,
+            gb REAL NOT NULL,
+            days INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            operation_ref_type TEXT,
+            operation_ref_id TEXT,
+            operation_lock_key TEXT,
+            operation_lock_token TEXT,
+            result_note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at REAL NOT NULL
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_account_renewal_confirmations_actor_status "
+            "ON account_renewal_confirmations(actor_id, status, expires_at)"
+        )
 
         # Migrations check
         cols_acc = [c[1] for c in cur.execute("PRAGMA table_info(accounts)").fetchall()]
@@ -267,6 +498,27 @@ def init_db():
         cols_plans = [c[1] for c in cur.execute("PRAGMA table_info(pricing_plans)").fetchall()]
         if "is_active" not in cols_plans:
             cur.execute("ALTER TABLE pricing_plans ADD COLUMN is_active INTEGER DEFAULT 1")
+
+        cols_confirmations = [c[1] for c in cur.execute("PRAGMA table_info(account_renewal_confirmations)").fetchall()]
+        for col, sql_type in (
+            ("operation_ref_type", "TEXT"),
+            ("operation_ref_id", "TEXT"),
+            ("operation_lock_key", "TEXT"),
+            ("operation_lock_token", "TEXT"),
+            ("result_note", "TEXT"),
+        ):
+            if col not in cols_confirmations:
+                cur.execute(f"ALTER TABLE account_renewal_confirmations ADD COLUMN {col} {sql_type}")
+
+        cols_rep_renewals = [c[1] for c in cur.execute("PRAGMA table_info(rep_renewal_intents)").fetchall()]
+        if "confirmation_id" not in cols_rep_renewals:
+            cur.execute("ALTER TABLE rep_renewal_intents ADD COLUMN confirmation_id TEXT")
+
+        cols_receipts = [c[1] for c in cur.execute("PRAGMA table_info(payment_receipts)").fetchall()]
+        if "cancelled_by" not in cols_receipts:
+            cur.execute("ALTER TABLE payment_receipts ADD COLUMN cancelled_by INTEGER")
+        if "cancelled_at" not in cols_receipts:
+            cur.execute("ALTER TABLE payment_receipts ADD COLUMN cancelled_at TIMESTAMP")
 
         led_info = cur.execute("PRAGMA table_info(financial_ledger)").fetchall()
         rep_col = next((c for c in led_info if c[1] == "rep_id"), None)
@@ -295,12 +547,14 @@ def init_db():
             """)
             cur.execute("DROP TABLE financial_ledger")
             cur.execute("ALTER TABLE financial_ledger_migration RENAME TO financial_ledger")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_rep ON financial_ledger(rep_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user ON financial_ledger(user_id)")
         else:
             cols_led = [c[1] for c in led_info]
             if "user_id" not in cols_led:
                 cur.execute("ALTER TABLE financial_ledger ADD COLUMN user_id INTEGER DEFAULT NULL")
+
+        # Indexes are created only after legacy financial_ledger columns/table are migrated.
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_rep ON financial_ledger(rep_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user ON financial_ledger(user_id)")
 
         # Seed default settings
         for s in DEFAULT_SETTINGS:
@@ -385,23 +639,90 @@ def get_all_settings():
 
 # --- Reserved Packages Queue Management ---
 
-def create_reservation(rep_id, account_code, email, plan_code, plan_name, gb, days, on_first_connect, charge_amount, actor_id, actor_name):
+def create_reservation(
+    rep_id, account_code, email, plan_code, plan_name, gb, days, on_first_connect,
+    charge_amount, actor_id, actor_name, confirmation_id=None, actor_role=None,
+    confirmation_rep_id=None,
+):
+    """Create one pending reservation and charge the representative in one transaction."""
+    charge_amount = int(charge_amount)
+    if charge_amount < 0:
+        raise ValueError("Reservation charge cannot be negative")
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        confirmation_amount = None
+        if confirmation_id:
+            plan_row = cur.execute(
+                "SELECT rep_price FROM pricing_plans WHERE plan_code=?",
+                (str(plan_code),),
+            ).fetchone()
+            if not plan_row:
+                raise ValueError("Quick-renew plan no longer exists")
+            confirmation_amount = int(plan_row["rep_price"])
+            _validate_account_renewal_confirmation_for_claim(
+                cur, confirmation_id, actor_id, actor_role or "",
+                rep_id, account_code, email, plan_code, plan_name, gb, days,
+                confirmation_amount, confirmation_rep_id=confirmation_rep_id,
+            )
+        existing = cur.execute("""
+            SELECT id FROM reserved_packages
+            WHERE status = 'pending' AND LOWER(account_code) = LOWER(?)
+            LIMIT 1
+        """, (account_code,)).fetchone()
+        if existing:
+            raise ValueError("A pending reservation already exists for this account")
+
+        if rep_id is not None and charge_amount > 0:
+            rep = cur.execute(
+                "SELECT balance_toman, credit_limit_toman FROM representatives WHERE id = ?",
+                (rep_id,)
+            ).fetchone()
+            if not rep:
+                raise ValueError("Representative not found")
+            current_debt = int(rep["balance_toman"] or 0)
+            credit_limit = int(rep["credit_limit_toman"] if rep["credit_limit_toman"] is not None else 5000000)
+            if credit_limit > 0 and current_debt + charge_amount > credit_limit:
+                raise ValueError("Representative credit limit would be exceeded")
+
         cur.execute("""
-        INSERT INTO reserved_packages (rep_id, account_code, email, plan_code, plan_name, gb, days, on_first_connect, charge_amount, actor_id, actor_name, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        """, (rep_id, account_code, email, plan_code, plan_name, float(gb), int(days), int(on_first_connect), int(charge_amount), actor_id, actor_name))
-        conn.commit()
+            INSERT INTO reserved_packages
+            (rep_id, account_code, email, plan_code, plan_name, gb, days, on_first_connect, charge_amount, actor_id, actor_name, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        """, (
+            rep_id, account_code, email, plan_code, plan_name, float(gb), int(days),
+            int(on_first_connect), charge_amount, actor_id, actor_name
+        ))
         res_id = cur.lastrowid
-        log_audit(
-            rep_id=rep_id, account_code=account_code, email=email, action="create_reservation",
-            actor_id=actor_id, actor_name=actor_name,
-            details={"res_id": res_id, "plan_code": plan_code, "plan_name": plan_name, "gb": gb, "days": days, "charge": charge_amount},
-            result_status="success"
+
+        if rep_id is not None and charge_amount > 0:
+            new_balance = _record_rep_ledger_entry(
+                cur, rep_id, account_code, email, plan_code, "debit", charge_amount,
+                f"رزرو بسته {plan_name}", actor_id, actor_name
+            )
+        else:
+            new_balance = 0
+
+        if confirmation_id:
+            cur.execute("""
+                UPDATE account_renewal_confirmations
+                SET status='reserved', operation_ref_type='reservation',
+                    operation_ref_id=?, operation_lock_key=NULL, operation_lock_token=NULL,
+                    result_note='Reservation created and representative charge committed',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE intent_id=? AND actor_id=? AND status='pending'
+            """, (str(res_id), str(confirmation_id), int(actor_id)))
+            if cur.rowcount != 1:
+                raise RuntimeError("Could not atomically claim quick-renew confirmation for reservation")
+
+        _insert_audit(
+            cur, rep_id, account_code, email, "create_reservation",
+            actor_id, actor_name,
+            {"res_id": res_id, "plan_code": plan_code, "plan_name": plan_name,
+             "gb": gb, "days": days, "charge": charge_amount, "balance_after": new_balance},
+            "success"
         )
         return res_id
-
 def get_pending_reservation(account_code: str):
     if not account_code:
         return None
@@ -433,54 +754,145 @@ def get_all_pending_reservations():
         return [dict(r) for r in rows]
 
 def activate_reservation(res_id: int, actor_id=0, actor_name="system"):
+    """Mark a pending reservation activated once; return None on stale/replayed IDs."""
     with get_db() as conn:
         cur = conn.cursor()
-        row = cur.execute("SELECT * FROM reserved_packages WHERE id = ?", (res_id,)).fetchone()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT * FROM reserved_packages WHERE id = ? AND status = 'pending'",
+            (res_id,)
+        ).fetchone()
         if not row:
             return None
-        cur.execute("UPDATE reserved_packages SET status = 'activated', activated_at = CURRENT_TIMESTAMP WHERE id = ?", (res_id,))
-        conn.commit()
-        log_audit(
-            rep_id=row["rep_id"], account_code=row["account_code"], email=row["email"],
+        cur.execute("""
+            UPDATE reserved_packages
+            SET status = 'activated', activated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+        """, (res_id,))
+        if cur.rowcount != 1:
+            return None
+        data = dict(row)
+        data["status"] = "activated"
+        _insert_audit(
+            cur, rep_id=row["rep_id"], account_code=row["account_code"], email=row["email"],
             action="activate_reservation", actor_id=actor_id, actor_name=actor_name,
             details={"res_id": res_id, "plan_code": row["plan_code"], "plan_name": row["plan_name"]},
             result_status="success"
         )
-        return dict(row)
+        return data
+def resolve_reservation_activation(
+    res_id: int, actor_id: int, actor_name: str, resolution: str, evidence_note: str
+) -> dict:
+    """Resolve an ambiguous reservation activation and consume its exact persistent lock."""
+    res_id = int(res_id)
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if choice not in ("APPLIED", "NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or NOT_APPLIED")
+    prefix = "APPLIED:" if choice == "APPLIED" else "NOT_APPLIED:"
+    if not note.startswith(prefix) or len(note) < len(prefix) + 15:
+        raise ValueError(f"Evidence must start with {prefix} and contain at least 15 characters after it")
 
-def cancel_reservation(res_id: int, actor_id=0, actor_name="admin"):
+    lock_key = f"reservation-activation:{res_id}"
     with get_db() as conn:
         cur = conn.cursor()
-        row = cur.execute("SELECT * FROM reserved_packages WHERE id = ? AND status = 'pending'", (res_id,)).fetchone()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT * FROM reserved_packages WHERE id=?", (res_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError("Reservation not found")
+        reservation = dict(row)
+        if reservation["status"] not in ("pending", "activated"):
+            raise ValueError(f"Reservation is already {reservation['status']} and cannot be activation-resolved")
+
+        lock = cur.execute(
+            "SELECT token, created_at FROM operation_locks WHERE lock_key=? AND expires_at>?",
+            (lock_key, time.time()),
+        ).fetchone()
+        if not lock:
+            raise ValueError("No active activation lock exists for this reservation")
+        if choice == "NOT_APPLIED" and reservation["status"] == "activated":
+            raise ValueError("Reservation is already marked activated; NOT_APPLIED would contradict local state")
+
+        if choice == "APPLIED" and reservation["status"] == "pending":
+            cur.execute("""
+                UPDATE reserved_packages
+                SET status='activated', activated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND status='pending'
+            """, (res_id,))
+            if cur.rowcount != 1:
+                raise RuntimeError("Could not mark reservation activated during reconciliation")
+
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (lock_key, lock["token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume exact reservation activation lock")
+
+        final_status = "activated" if choice == "APPLIED" else "pending"
+        _insert_audit(
+            cur, reservation.get("rep_id"), reservation["account_code"], reservation["email"],
+            "resolve_reservation_activation", int(actor_id), str(actor_name or "Super Admin"),
+            {
+                "res_id": res_id, "resolution": choice, "evidence_note": note,
+                "lock_key": lock_key, "lock_created_at": lock["created_at"],
+                "previous_status": reservation["status"], "final_status": final_status,
+            },
+            "success",
+        )
+        return {
+            "status": final_status, "reservation_id": res_id,
+            "account_code": reservation["account_code"], "lock_key": lock_key,
+            "rep_id": reservation.get("rep_id"),
+        }
+
+
+def cancel_reservation(res_id: int, actor_id=0, actor_name="admin"):
+    """Cancel one pending reservation and refund its representative atomically."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        activation_lock = cur.execute(
+            "SELECT 1 FROM operation_locks WHERE lock_key = ? AND expires_at > ?",
+            (f"reservation-activation:{int(res_id)}", time.time())
+        ).fetchone()
+        if activation_lock:
+            return None
+        row = cur.execute(
+            "SELECT * FROM reserved_packages WHERE id = ? AND status = 'pending'",
+            (res_id,)
+        ).fetchone()
         if not row:
             return None
-        res_data = dict(row)
-        cur.execute("UPDATE reserved_packages SET status = 'cancelled' WHERE id = ?", (res_id,))
-        conn.commit()
-        
-    # Refund the charged amount to representative balance if applicable
-    refund_amount = res_data.get("charge_amount", 0)
-    new_bal = 0
-    if res_data.get("rep_id") is not None and refund_amount > 0:
-        new_bal = record_ledger_entry(
-            rep_id=res_data["rep_id"],
-            account_code=res_data["account_code"],
-            email=res_data["email"],
-            plan_code=res_data["plan_code"],
-            tx_type="credit",
-            amount=refund_amount,
-            description=f"لغو بسته رزرو {res_data['plan_name']} و عودت وجه",
-            actor_id=actor_id,
-            actor_name=actor_name
-        )
-    log_audit(
-        rep_id=res_data.get("rep_id"), account_code=res_data["account_code"], email=res_data["email"],
-        action="cancel_reservation_refund", actor_id=actor_id, actor_name=actor_name,
-        details={"res_id": res_id, "refund_amount": refund_amount, "new_balance": new_bal},
-        result_status="success"
-    )
-    return res_data, new_bal
 
+        res_data = dict(row)
+        cur.execute(
+            "UPDATE reserved_packages SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
+            (res_id,)
+        )
+        if cur.rowcount != 1:
+            return None
+
+        refund_amount = int(res_data.get("charge_amount") or 0)
+        new_bal = 0
+        if res_data.get("rep_id") is not None and refund_amount > 0:
+            new_bal = _record_rep_ledger_entry(
+                cur, rep_id=res_data["rep_id"], account_code=res_data["account_code"],
+                email=res_data["email"], plan_code=res_data["plan_code"],
+                tx_type="credit", amount=refund_amount,
+                description=f"لغو بسته رزرو {res_data['plan_name']} و عودت وجه",
+                actor_id=actor_id, actor_name=actor_name
+            )
+        _insert_audit(
+            cur, rep_id=res_data.get("rep_id"), account_code=res_data["account_code"],
+            email=res_data["email"], action="cancel_reservation_refund",
+            actor_id=actor_id, actor_name=actor_name,
+            details={"res_id": res_id, "refund_amount": refund_amount, "new_balance": new_bal},
+            result_status="success"
+        )
+        return res_data, new_bal
 def get_pricing_plans(quick_only=False, active_only=False):
     with get_db() as conn:
         cur = conn.cursor()
@@ -510,23 +922,33 @@ def get_plan(plan_code):
         return dict(row) if row else None
 
 def update_plan_price(plan_code, rep_price=None, user_price=None):
+    if rep_price is not None and int(rep_price) <= 0:
+        raise ValueError("Representative price must be positive")
+    if user_price is not None and int(user_price) <= 0:
+        raise ValueError("User price must be positive")
     with get_db() as conn:
         cur = conn.cursor()
         if rep_price is not None and user_price is not None:
-            cur.execute("UPDATE pricing_plans SET rep_price = ?, user_price = ? WHERE plan_code = ?", (rep_price, user_price, plan_code))
+            cur.execute(
+                "UPDATE pricing_plans SET rep_price = ?, user_price = ? WHERE plan_code = ?",
+                (int(rep_price), int(user_price), plan_code)
+            )
         elif rep_price is not None:
-            cur.execute("UPDATE pricing_plans SET rep_price = ? WHERE plan_code = ?", (rep_price, plan_code))
+            cur.execute("UPDATE pricing_plans SET rep_price = ? WHERE plan_code = ?", (int(rep_price), plan_code))
         elif user_price is not None:
-            cur.execute("UPDATE pricing_plans SET user_price = ? WHERE plan_code = ?", (user_price, plan_code))
-        conn.commit()
-        log_audit(
-            rep_id=None, account_code=plan_code, email=None, action="update_plan_price",
-            actor_id=0, actor_name="admin", details={"rep_price": rep_price, "user_price": user_price},
-            result_status="success"
-        )
-        return get_plan(plan_code)
-
+            cur.execute("UPDATE pricing_plans SET user_price = ? WHERE plan_code = ?", (int(user_price), plan_code))
+        else:
+            raise ValueError("At least one price must be supplied")
+        if cur.rowcount != 1:
+            return None
+    return get_plan(plan_code)
 def add_or_update_plan(plan_code, name, gb, days, rep_price, user_price, is_quick=0):
+    plan_code = str(plan_code or "").strip()
+    name = str(name or "").strip()
+    gb, days = float(gb), int(days)
+    rep_price, user_price = int(rep_price), int(user_price)
+    if not plan_code or not name or gb <= 0 or days <= 0 or rep_price <= 0 or user_price <= 0:
+        raise ValueError("Plan code/name, volume, duration and both prices must be valid positive values")
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -539,23 +961,27 @@ def add_or_update_plan(plan_code, name, gb, days, rep_price, user_price, is_quic
             rep_price = excluded.rep_price,
             user_price = excluded.user_price,
             is_quick = excluded.is_quick
-        """, (plan_code, name, float(gb), int(days), int(rep_price), int(user_price), int(is_quick)))
+        """, (plan_code, name, gb, days, rep_price, user_price, int(bool(is_quick))))
         conn.commit()
         log_audit(
             rep_id=None, account_code=plan_code, email=None, action="add_or_update_plan",
-            actor_id=0, actor_name="admin", details={"name": name, "gb": gb, "days": days, "rep_price": rep_price, "user_price": user_price, "is_quick": is_quick},
+            actor_id=0, actor_name="admin",
+            details={"name": name, "gb": gb, "days": days, "rep_price": rep_price, "user_price": user_price, "is_quick": is_quick},
             result_status="success"
         )
         return get_plan(plan_code)
-
-def delete_plan(plan_code):
+def delete_plan(plan_code: str) -> bool:
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        pending = cur.execute(
+            "SELECT 1 FROM reserved_packages WHERE plan_code = ? AND status = 'pending' LIMIT 1",
+            (plan_code,)
+        ).fetchone()
+        if pending:
+            raise ValueError("Cannot delete a plan while pending reservations use it")
         cur.execute("DELETE FROM pricing_plans WHERE plan_code = ?", (plan_code,))
-        conn.commit()
-
-# --- Representatives & User Management ---
-
+        return cur.rowcount == 1
 def get_all_reps():
     with get_db() as conn:
         cur = conn.cursor()
@@ -616,105 +1042,239 @@ def get_all_bot_users():
         return [dict(r) for r in rows]
 
 def reassign_account(account_code, new_rep_id=None, new_owner_tg_id=None):
+    if not account_code or ((new_rep_id is None) == (new_owner_tg_id is None)):
+        return {"status": "error", "message": "یک مقصد معتبر (نماینده یا کاربر) باید مشخص شود."}
     with get_db() as conn:
         cur = conn.cursor()
-        acc = cur.execute("SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) LIKE ? LIMIT 1", (account_code.lower(), f"%{account_code.lower()}%")).fetchone()
-        if not acc:
-            return {"status": "error", "message": "اکانت یافت نشد"}
-        
-        updates = []
-        params = []
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM accounts
+            WHERE LOWER(account_code) = LOWER(?) OR LOWER(email) = LOWER(?)
+            LIMIT 1
+        """, (account_code, account_code)).fetchone()
+        if not row:
+            return {"status": "error", "message": "اکانت یافت نشد."}
         if new_rep_id is not None:
-            updates.append("rep_id = ?")
-            params.append(new_rep_id)
-        if new_owner_tg_id is not None:
-            updates.append("owner_tg_id = ?")
-            params.append(new_owner_tg_id)
-            
-        if not updates:
-            return {"status": "ok", "account": dict(acc)}
-            
-        params.append(acc["id"])
-        sql = f"UPDATE accounts SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-        cur.execute(sql, tuple(params))
-        conn.commit()
-        
-        updated = cur.execute("SELECT * FROM accounts WHERE id = ?", (acc["id"],)).fetchone()
-        log_audit(
-            rep_id=new_rep_id, account_code=account_code, email=acc["email"],
-            action="reassign_account", actor_id=0, actor_name="admin",
-            details={"new_rep_id": new_rep_id, "new_owner_tg_id": new_owner_tg_id},
+            rep = cur.execute("SELECT id FROM representatives WHERE id = ? AND is_active = 1", (new_rep_id,)).fetchone()
+            if not rep:
+                return {"status": "error", "message": "نماینده مقصد یافت نشد یا فعال نیست."}
+            cur.execute(
+                "UPDATE accounts SET rep_id = ?, owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_rep_id, row["id"])
+            )
+        else:
+            user = cur.execute("SELECT telegram_id FROM bot_users WHERE telegram_id = ?", (int(new_owner_tg_id),)).fetchone()
+            if not user:
+                return {"status": "error", "message": "کاربر مقصد در سیستم ثبت نشده است."}
+            cur.execute(
+                "UPDATE accounts SET owner_tg_id = ?, rep_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (int(new_owner_tg_id), row["id"])
+            )
+        return {"status": "ok", "account_code": row["account_code"]}
+def acquire_operation_lock(lock_key: str, ttl_seconds: int | None = 300) -> str | None:
+    """Acquire a DB-backed operation lease.
+
+    Pass ttl_seconds=None for an unresolved external side effect. Such a lock
+    never expires automatically and must be resolved by a Super Admin after
+    inspecting the external panel and local state.
+    """
+    key = str(lock_key or "").strip()
+    if not key:
+        raise ValueError("Operation lock key is required")
+    if ttl_seconds is None:
+        expires_at = 253402300799.0  # 9999-12-31 UTC; effectively persistent
+    else:
+        expires_at = time.time() + max(1, int(ttl_seconds))
+    now = time.time()
+    token = uuid.uuid4().hex
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (now,))
+        row = cur.execute(
+            "SELECT token FROM operation_locks WHERE lock_key = ?", (key,)
+        ).fetchone()
+        if row:
+            return None
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (key, token, expires_at)
+        )
+        return token
+
+
+def get_operation_locks() -> list[dict]:
+    """List active operation leases and linked recovery intent metadata, never tokens."""
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT o.lock_key, o.expires_at, o.created_at,
+                   COALESCE(i.intent_id, r.intent_id, rr.intent_id, ac.intent_id,
+                       CASE WHEN rp.id IS NOT NULL THEN 'reservation:' || CAST(rp.id AS TEXT) END) AS intent_id,
+                   COALESCE(i.action_type, r.action_type,
+                       CASE WHEN rr.intent_id IS NOT NULL THEN 'renew'
+                            WHEN ac.intent_id IS NOT NULL THEN 'admin_renewal'
+                            WHEN rp.id IS NOT NULL THEN 'reservation_activation' END) AS action_type,
+                   COALESCE(i.user_id, r.actor_tg_id, rr.actor_tg_id, ac.actor_id, rp.actor_id) AS user_id,
+                   COALESCE(i.account_code, r.account_code, rr.account_code, ac.account_code, rp.account_code) AS account_code,
+                   COALESCE(i.status, r.status, rr.status, ac.status, rp.status) AS intent_status,
+                   CASE
+                       WHEN r.intent_id IS NOT NULL OR rr.intent_id IS NOT NULL THEN 'representative'
+                       WHEN i.intent_id IS NOT NULL THEN 'end_user'
+                       WHEN ac.intent_id IS NOT NULL THEN 'super_admin'
+                       WHEN rp.id IS NOT NULL AND rp.rep_id IS NOT NULL THEN 'representative'
+                       WHEN rp.id IS NOT NULL THEN 'super_admin'
+                       ELSE 'unlinked'
+                   END AS intent_owner_type,
+                   rp.id AS reservation_id
+            FROM operation_locks o
+            LEFT JOIN user_action_intents i
+              ON i.operation_lock_key = o.lock_key
+             AND i.operation_lock_token = o.token
+            LEFT JOIN rep_action_intents r
+              ON r.operation_lock_key = o.lock_key
+             AND r.operation_lock_token = o.token
+            LEFT JOIN rep_renewal_intents rr
+              ON rr.operation_lock_key = o.lock_key
+             AND rr.operation_lock_token = o.token
+            LEFT JOIN reserved_packages rp
+              ON o.lock_key = 'reservation-activation:' || CAST(rp.id AS TEXT)
+            LEFT JOIN account_renewal_confirmations ac
+              ON ac.operation_lock_key = o.lock_key
+             AND ac.operation_lock_token = o.token
+             AND ac.operation_ref_type = 'admin_renewal'
+             AND ac.status IN ('processing', 'needs_reconciliation')
+            WHERE o.expires_at > ?
+            ORDER BY o.created_at ASC
+        """, (time.time(),)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def resolve_operation_lock(
+    lock_key: str, actor_id: int, actor_name: str, evidence_note: str
+) -> bool:
+    """Release an unresolved operation lock after an administrator records evidence."""
+    key = str(lock_key or "").strip()
+    note = str(evidence_note or "").strip()
+    if not key or len(note) < 15:
+        raise ValueError("A lock key and evidence note of at least 15 characters are required")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT lock_key, created_at FROM operation_locks WHERE lock_key = ?",
+            (key,)
+        ).fetchone()
+        if not row:
+            return False
+        linked_intent = cur.execute("""
+            SELECT intent_id, status, 'end_user' AS owner_type, action_type FROM user_action_intents
+            WHERE operation_lock_key = ?
+              AND operation_lock_token = (
+                  SELECT token FROM operation_locks WHERE lock_key = ?
+              )
+              AND status IN ('processing', 'needs_reconciliation')
+            UNION ALL
+            SELECT intent_id, status, 'representative' AS owner_type, action_type FROM rep_action_intents
+            WHERE operation_lock_key = ?
+              AND operation_lock_token = (
+                  SELECT token FROM operation_locks WHERE lock_key = ?
+              )
+              AND status IN ('processing', 'needs_reconciliation')
+            UNION ALL
+            SELECT intent_id, status, 'representative' AS owner_type, 'renew' AS action_type
+            FROM rep_renewal_intents
+            WHERE operation_lock_key = ?
+              AND operation_lock_token = (
+                  SELECT token FROM operation_locks WHERE lock_key = ?
+              )
+              AND status IN ('processing', 'needs_reconciliation')
+            UNION ALL
+            SELECT 'reservation:' || CAST(id AS TEXT), status,
+                   CASE WHEN rep_id IS NULL THEN 'super_admin' ELSE 'representative' END AS owner_type,
+                   'reservation_activation' AS action_type
+            FROM reserved_packages
+            WHERE ('reservation-activation:' || CAST(id AS TEXT)) = ?
+              AND status IN ('pending', 'activated')
+            UNION ALL
+            SELECT intent_id, status, 'super_admin' AS owner_type, 'admin_renewal' AS action_type
+            FROM account_renewal_confirmations
+            WHERE operation_lock_key = ?
+              AND operation_lock_token = (
+                  SELECT token FROM operation_locks WHERE lock_key = ?
+              )
+              AND operation_ref_type = 'admin_renewal'
+              AND status IN ('processing', 'needs_reconciliation')
+            LIMIT 1
+        """, (key, key, key, key, key, key, key, key, key)).fetchone()
+        if linked_intent:
+            if linked_intent["action_type"] == "reservation_activation":
+                resolve_command = "/resolvereservation"
+            elif linked_intent["action_type"] == "admin_renewal":
+                resolve_command = "/resolveadminrenewal"
+            elif linked_intent["owner_type"] == "end_user":
+                resolve_command = "/resolveintent"
+            elif linked_intent["action_type"] == "renew":
+                resolve_command = "/resolvereprenewal"
+            else:
+                resolve_command = "/resolverepintent"
+            raise ValueError(
+                f"Operation lock belongs to {linked_intent['owner_type']} action intent {linked_intent['intent_id']} "
+                f"({linked_intent['status']}); use {resolve_command} so ledger and intent state are reconciled together"
+            )
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ?",
+            (key,)
+        )
+        deleted = cur.rowcount
+        if deleted != 1:
+            return False
+        _insert_audit(
+            cur, rep_id=None, account_code="", email="", action="resolve_operation_lock",
+            actor_id=actor_id, actor_name=actor_name,
+            details={"lock_key": key, "lock_created_at": row["created_at"], "evidence_note": note},
             result_status="success"
         )
-        return {"status": "ok", "account": dict(updated)}
+        return True
 
-# --- Idempotency & Accidental Double-Click Guard ---
 
-_RENEWAL_LOCKS = {}
+def release_operation_lock(lock_key: str, token: str) -> bool:
+    """Release a lease only when the supplied token still owns it."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ? AND token = ?",
+            (str(lock_key), str(token))
+        )
+        return cur.rowcount == 1
+
 
 def acquire_renewal_lock(account_code: str, ttl_seconds: int = 20) -> bool:
-    """
-    Prevents accidental double-clicks or rapid successive duplicate renewal requests.
-    Returns True if lock acquired, False if locked (must wait).
-    """
-    import time
-    now = time.time()
-    code = str(account_code).strip().lower()
-    last_time = _RENEWAL_LOCKS.get(code, 0)
-    if now - last_time < ttl_seconds:
-        return False
-    _RENEWAL_LOCKS[code] = now
-    return True
+    """Prevent concurrent repeated renewal requests for the same account."""
+    code = str(account_code or "").strip().lower()
+    return bool(acquire_operation_lock(f"renewal:{code}", ttl_seconds))
 
 # --- Financial Ledger & Accounting ---
 
 def record_ledger_entry(rep_id, account_code, email, plan_code, tx_type, amount, description, actor_id, actor_name):
-    """
-    Records a financial transaction and atomically updates the representative's balance_toman.
-    tx_type: 'debit' increases debt (cost of renewal/new account)
-             'credit' decreases debt (payment/settlement)
-    """
+    """Atomically updates representative balance and its ledger entry."""
     if not rep_id:
+        if int(amount) <= 0:
+            raise ValueError("Financial amount must be positive")
         return 0
-
     with get_db() as conn:
         cur = conn.cursor()
-        rep = cur.execute("SELECT balance_toman FROM representatives WHERE id = ?", (rep_id,)).fetchone()
-        curr_bal = (rep["balance_toman"] or 0) if rep else 0
-        
-        if tx_type == "debit":
-            new_bal = curr_bal + amount
-        elif tx_type == "credit":
-            new_bal = curr_bal - amount
-        else: # adjust
-            new_bal = amount
-            
-        cur.execute("""
-        INSERT INTO financial_ledger (rep_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rep_id,
-            str(account_code),
-            str(email or ""),
-            str(plan_code or ""),
-            tx_type,
-            int(amount),
-            new_bal,
-            description,
-            actor_id,
-            actor_name
-        ))
-        
-        cur.execute("UPDATE representatives SET balance_toman = ? WHERE id = ?", (new_bal, rep_id))
-        conn.commit()
-        log_audit(
-            rep_id=rep_id, account_code=str(account_code or ""), email=str(email or ""),
-            action=f"financial_{tx_type}", actor_id=actor_id, actor_name=actor_name,
-            details={"amount": amount, "plan_code": plan_code, "description": description, "balance_after": new_bal},
-            result_status="success"
+        cur.execute("BEGIN IMMEDIATE")
+        new_balance = _record_rep_ledger_entry(
+            cur, rep_id, account_code, email, plan_code, tx_type, amount,
+            description, actor_id, actor_name
         )
-        return new_bal
-
+        _insert_audit(
+            cur, rep_id, account_code, email, f"financial_{tx_type}",
+            actor_id, actor_name,
+            {"amount": int(amount), "plan_code": plan_code, "description": description, "balance_after": new_balance},
+            "success"
+        )
+        return new_balance
 def register_rep_payment(rep_id, amount, description, actor_id, actor_name):
     return record_ledger_entry(
         rep_id=rep_id,
@@ -788,22 +1348,27 @@ def get_recent_ledger_entries(rep_id=None, limit=10):
         return [dict(r) for r in rows]
 
 def get_financial_ledger_paginated(rep_id=None, page=1, page_size=10) -> tuple[list, int, int]:
+    page_size = max(1, min(int(page_size), 100))
+    page = max(1, int(page))
     with get_db() as conn:
         cur = conn.cursor()
         base_where = "1=1"
         params = []
-        if rep_id:
+        if rep_id is not None:
             base_where += " AND l.rep_id = ?"
             params.append(rep_id)
-        
-        total = cur.execute(f"SELECT COUNT(*) FROM financial_ledger l WHERE {base_where}", tuple(params)).fetchone()[0]
+
+        total = cur.execute(
+            f"SELECT COUNT(*) FROM financial_ledger l WHERE {base_where}", tuple(params)
+        ).fetchone()[0]
         total_pages = max(1, (total + page_size - 1) // page_size)
-        page = min(max(1, page), total_pages)
+        page = min(page, total_pages)
         offset = (page - 1) * page_size
-        
+
         query = f"""
-        SELECT l.*, 
+        SELECT l.*,
                r.name as rep_name,
+               r.rep_code as rep_code,
                u.full_name as user_full_name,
                u.username as user_username
         FROM financial_ledger l
@@ -815,18 +1380,27 @@ def get_financial_ledger_paginated(rep_id=None, page=1, page_size=10) -> tuple[l
         """
         rows = cur.execute(query, tuple(params + [page_size, offset])).fetchall()
         return [dict(r) for r in rows], total, total_pages
-
-record_payment = register_rep_payment
-
-# --- User Settings (On First Connect Mode) ---
-
 def get_user_first_connect_mode(user_id: int) -> bool:
     with get_db() as conn:
         cur = conn.cursor()
         row = cur.execute("SELECT first_connect_mode FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
         return bool(row["first_connect_mode"]) if row else False
 
+def set_user_first_connect_mode(user_id: int, enabled: bool) -> bool:
+    """Set an explicit per-user renewal mode; replaying the same callback is harmless."""
+    value = 1 if bool(enabled) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO user_settings (user_id, first_connect_mode)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET first_connect_mode = excluded.first_connect_mode
+        """, (int(user_id), value))
+        return bool(value)
+
+
 def toggle_user_first_connect_mode(user_id: int) -> bool:
+    """Legacy helper retained for non-callback callers."""
     with get_db() as conn:
         cur = conn.cursor()
         curr = get_user_first_connect_mode(user_id)
@@ -928,23 +1502,50 @@ def resolve_account_rep_id(email: str) -> int | None:
             return r["id"]
     return None
 
-def link_user_to_account(account_code: str, user_tg_id: int, username: str = "", full_name: str = "") -> dict:
+def get_user_owned_account(user_id: int, account_code_or_email: str) -> dict | None:
+    """Return an exact account only when it belongs to the requesting Telegram user."""
+    identifier = str(account_code_or_email or "").strip().lower()
+    if not identifier:
+        return None
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT * FROM accounts
+            WHERE owner_tg_id = ? AND (LOWER(account_code) = ? OR LOWER(email) = ?)
+            LIMIT 1
+        """, (int(user_id), identifier, identifier)).fetchone()
+        return dict(row) if row else None
+
+
+def link_user_to_account(account_code: str, user_tg_id: int, username: str = "", full_name: str = "", allow_reassign: bool = False) -> dict:
+    """Link an exact account identifier without allowing cross-user account takeover."""
+    identifier = str(account_code or "").strip().lower()
+    if not identifier:
+        return {"status": "error", "message": "Account identifier is required"}
     with get_db() as conn:
         cur = conn.cursor()
-        acc = cur.execute("SELECT * FROM accounts WHERE LOWER(account_code) = ? OR LOWER(email) LIKE ? LIMIT 1", (account_code.lower(), f"%{account_code.lower()}%")).fetchone()
+        cur.execute("BEGIN IMMEDIATE")
+        acc = cur.execute("""
+            SELECT * FROM accounts
+            WHERE LOWER(account_code) = ? OR LOWER(email) = ?
+            ORDER BY id DESC LIMIT 1
+        """, (identifier, identifier)).fetchone()
         if not acc:
             return {"status": "error", "message": "Account not found"}
-        cur.execute("UPDATE accounts SET owner_tg_id = ? WHERE id = ?", (user_tg_id, acc["id"]))
+        owner_id = acc["owner_tg_id"]
+        if owner_id is not None and int(owner_id) != int(user_tg_id) and not allow_reassign:
+            return {"status": "error", "message": "Account is already linked to another Telegram user"}
+        cur.execute(
+            "UPDATE accounts SET owner_tg_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (int(user_tg_id), acc["id"])
+        )
         cur.execute("""
-        INSERT INTO bot_users (telegram_id, role, rep_id, username, full_name)
-        VALUES (?, 'end_user', ?, ?, ?)
-        ON CONFLICT(telegram_id) DO UPDATE SET
-            username = excluded.username,
-            full_name = excluded.full_name
-        """, (user_tg_id, acc["rep_id"], username, full_name))
-        conn.commit()
+            INSERT INTO bot_users (telegram_id, role, rep_id, username, full_name)
+            VALUES (?, 'end_user', ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                username = CASE WHEN excluded.username != '' THEN excluded.username ELSE bot_users.username END,
+                full_name = CASE WHEN excluded.full_name != '' THEN excluded.full_name ELSE bot_users.full_name END
+        """, (int(user_tg_id), acc["rep_id"], username or "", full_name or ""))
         return {"status": "ok", "account": dict(acc)}
-
 def get_user_accounts(user_tg_id: int) -> list:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1016,12 +1617,118 @@ def sync_rep_accounts(rep_code=None):
         conn.commit()
         return count
 
-def sync_all_active_reps() -> int:
+def sync_all_active_reps_detailed() -> dict:
+    """Reconcile panel accounts against active representative scopes without arbitrary reassignment."""
     reps = get_all_active_reps()
-    total = 0
-    for r in reps:
-        total += sync_rep_accounts(r["rep_code"])
-    return total
+    if not reps:
+        return {"status": "success", "count": 0, "ambiguous": 0, "unmatched": 0, "message": "No active representatives"}
+
+    try:
+        session = xui_manager.get_session()
+        response = session.get(f"{xui_manager.BASE_URL}/panel/api/clients/list", timeout=20)
+        if not response.ok:
+            return {
+                "status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+                "message": f"3X-UI returned HTTP {response.status_code}"
+            }
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("obj"), list):
+            return {
+                "status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+                "message": "3X-UI response did not contain a client list"
+            }
+        clients = [c for c in payload["obj"] if isinstance(c, dict) and c.get("email")]
+    except Exception as exc:
+        return {
+            "status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+            "message": f"Failed to read 3X-UI clients: {exc}"
+        }
+
+    rep_scopes = []
+    for rep in reps:
+        scope = str(rep.get("scope_filter") or "").strip().lower()
+        tokens = [token.strip() for token in scope.split(",") if token.strip()]
+        rep_scopes.append((rep, scope, tokens))
+
+    count = ambiguous = unmatched = 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        existing_rows = cur.execute("SELECT email, rep_id, owner_tg_id FROM accounts").fetchall()
+        existing = {str(row["email"]).lower(): dict(row) for row in existing_rows}
+
+        for client in clients:
+            email = str(client["email"]).strip()
+            email_l = email.lower()
+            comment = str(client.get("comment") or "")
+            candidates = []
+            for rep, scope, tokens in rep_scopes:
+                if scope == "all" or any(
+                    token in email_l or token in comment.lower() for token in tokens
+                ):
+                    candidates.append(rep)
+
+            previous = existing.get(email_l)
+            previous_rep_id = previous.get("rep_id") if previous else None
+            selected_rep_id = None
+
+            if len(candidates) == 1:
+                selected_rep_id = candidates[0]["id"]
+            elif len(candidates) > 1:
+                candidate_ids = {item["id"] for item in candidates}
+                if previous_rep_id in candidate_ids:
+                    selected_rep_id = previous_rep_id
+                else:
+                    ambiguous += 1
+                    continue
+            else:
+                unmatched += 1
+                # Retain an existing assignment, but do not invent a new one.
+                selected_rep_id = previous_rep_id
+
+            code = xui_manager.extract_account_identifier(email) or email
+            total_gb = round(float(client.get("totalGB") or 0) / (1024 ** 3), 2)
+            expiry_time = int(client.get("expiryTime") or 0)
+            enabled = 1 if client.get("enable", True) else 0
+            sub_id = str(client.get("subId") or "")
+            tg_id = client.get("tgId") or (previous.get("owner_tg_id") if previous else None)
+
+            cur.execute("""
+                INSERT INTO accounts
+                    (rep_id, account_code, email, customer_name, sub_id, enable,
+                     total_gb, expiry_time, owner_tg_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(email) DO UPDATE SET
+                    rep_id = excluded.rep_id,
+                    account_code = excluded.account_code,
+                    customer_name = excluded.customer_name,
+                    sub_id = excluded.sub_id,
+                    enable = excluded.enable,
+                    total_gb = excluded.total_gb,
+                    expiry_time = excluded.expiry_time,
+                    owner_tg_id = CASE
+                        WHEN excluded.owner_tg_id IS NOT NULL THEN excluded.owner_tg_id
+                        ELSE accounts.owner_tg_id
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                selected_rep_id, str(code), email, comment, sub_id, enabled,
+                total_gb, expiry_time, tg_id
+            ))
+            count += 1
+
+    return {
+        "status": "success", "count": count, "ambiguous": ambiguous,
+        "unmatched": unmatched,
+        "message": "Reconciliation completed without arbitrary scope reassignment"
+    }
+
+
+def sync_all_active_reps() -> int:
+    """Backward-compatible wrapper for callers that only need a count."""
+    result = sync_all_active_reps_detailed()
+    return int(result.get("count", 0)) if result.get("status") == "success" else 0
+
 
 def upsert_account_record(rep_id, email, account_code, customer_name="", sub_id="", enable=1, total_gb=0, expiry_time=0, owner_tg_id=None):
     with get_db() as conn:
@@ -1043,23 +1750,21 @@ def upsert_account_record(rep_id, email, account_code, customer_name="", sub_id=
         conn.commit()
 
 def is_account_in_rep_scope(rep_id, query):
-    q = str(query).strip().lower()
+    """Resolve an exact account identifier only within the representative's scope."""
+    q = str(query or "").strip().lower()
+    if not q:
+        return None
     with get_db() as conn:
-        cur = conn.cursor()
-        row = cur.execute("""
-        SELECT * FROM accounts 
-        WHERE rep_id = ? AND (
-            LOWER(email) = ? OR 
-            LOWER(account_code) = ? OR 
-            LOWER(sub_id) = ? OR 
-            LOWER(email) LIKE ? OR
-            account_code LIKE ?
-        )
-        LIMIT 1
-        """, (rep_id, q, q, q, f"%{q}%", f"%{q}%")).fetchone()
-        if row:
-            return dict(row)
-    return None
+        row = conn.execute("""
+            SELECT * FROM accounts
+            WHERE rep_id = ? AND (
+                LOWER(email) = ? OR
+                LOWER(account_code) = ? OR
+                LOWER(sub_id) = ?
+            )
+            LIMIT 1
+        """, (rep_id, q, q, q)).fetchone()
+        return dict(row) if row else None
 
 def log_audit(rep_id, account_code, email, action, actor_id, actor_name, details, result_status):
     with get_db() as conn:
@@ -1079,8 +1784,6 @@ def log_audit(rep_id, account_code, email, action, actor_id, actor_name, details
         ))
         conn.commit()
 
-def sync_all_active_reps():
-    return sync_rep_accounts(None)
 
 # ==========================================
 # Phase 4: Financial & Dual-Wallet Operations
@@ -1115,56 +1818,1764 @@ def get_user_wallet_balance(user_id: int) -> int:
         return row["balance_toman"] if row else 0
 
 def record_user_payment(user_id: int, amount: int, description: str, actor_id: int, actor_name: str = "") -> int:
-    """Credits an end-user's wallet atomically and logs to financial_ledger."""
+    """Credit a user wallet and ledger in one serialized SQLite transaction."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        return _credit_user_wallet(cur, user_id, amount, description, actor_id, actor_name)
+
+
+
+def create_user_action_intent(
+    user_id: int,
+    action_type: str,
+    plan_code: str,
+    plan_name: str,
+    gb: float,
+    days: int,
+    amount: int,
+    account_code: str = "",
+    account_email: str = "",
+    ttl_seconds: int = 900,
+) -> str:
+    """Create one opaque, expiring idempotency key for a single user menu action."""
+    action = str(action_type or "").strip().lower()
+    if action not in ("buy", "renew"):
+        raise ValueError("Unsupported user action type")
+    amount, days, gb = int(amount), int(days), float(gb)
+    if amount <= 0 or days <= 0 or gb <= 0 or not str(plan_code or "").strip():
+        raise ValueError("A valid plan snapshot and positive price are required")
+    code = str(account_code or "").strip()
+    email = str(account_email or "").strip()
+    if action == "renew" and (not code or not email):
+        raise ValueError("Renewal intent requires the canonical account code and email")
+
+    intent_id = secrets.token_hex(16)
+    expires_at = time.time() + max(60, int(ttl_seconds))
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
-        INSERT INTO user_wallets (user_id, balance_toman, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET
-            balance_toman = user_wallets.balance_toman + excluded.balance_toman,
-            updated_at = CURRENT_TIMESTAMP
-        """, (user_id, amount))
-        
-        row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
-        new_balance = row["balance_toman"] if row else amount
+            INSERT INTO user_action_intents
+            (intent_id, user_id, action_type, account_code, account_email,
+             plan_code, plan_name, gb, days, amount, status, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            intent_id, int(user_id), action, code or None, email or None,
+            str(plan_code), str(plan_name), gb, days, amount, expires_at
+        ))
+    return intent_id
 
-        cur.execute("""
-        INSERT INTO financial_ledger (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
-        VALUES (NULL, ?, 'credit', ?, ?, ?, ?, ?)
-        """, (user_id, amount, new_balance, description, actor_id, actor_name))
-        conn.commit()
-        return new_balance
 
-def deduct_user_wallet(user_id: int, amount: int, description: str, plan_code: str = "", account_code: str = "", email: str = "") -> bool:
-    """Atomically deducts funds from an end-user's wallet if sufficient balance exists."""
+def get_user_action_intent(intent_id: str, user_id: int) -> dict | None:
+    """Fetch an intent only for its owning Telegram user; never expose lock tokens."""
+    key = str(intent_id or "").strip()
+    if not key:
+        return None
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_action_intents WHERE intent_id = ? AND user_id = ?",
+            (key, int(user_id))
+        ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result.pop("operation_lock_token", None)
+        return result
+
+
+def begin_user_action_intent(
+    intent_id: str,
+    user_id: int,
+    expected_action: str,
+) -> dict:
+    """Atomically consume an intent, acquire its durable lock and debit the wallet.
+
+    A consumed token is never executable again. A new menu creates a new token,
+    allowing a deliberate later purchase or renewal of the same plan.
+    """
+    key = str(intent_id or "").strip()
+    action = str(expected_action or "").strip().lower()
+    if not key or action not in ("buy", "renew"):
+        raise ValueError("A valid intent token and action are required")
+
     with get_db() as conn:
         cur = conn.cursor()
-        row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
-        curr_bal = row["balance_toman"] if row else 0
-        if curr_bal < amount:
-            return False
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT * FROM user_action_intents WHERE intent_id = ? AND user_id = ?",
+            (key, int(user_id))
+        ).fetchone()
+        if not row:
+            return {"status": "not_found"}
+        intent = dict(row)
+        if intent["action_type"] != action:
+            return {"status": "wrong_action"}
+        if intent["status"] != "pending":
+            return {"status": "already_processed", "intent_status": intent["status"]}
+        now = time.time()
+        if float(intent["expires_at"]) <= now:
+            cur.execute(
+                "UPDATE user_action_intents SET status = 'expired', updated_at = CURRENT_TIMESTAMP "
+                "WHERE intent_id = ? AND status = 'pending'",
+                (key,)
+            )
+            return {"status": "expired"}
 
-        new_bal = curr_bal - amount
-        cur.execute("UPDATE user_wallets SET balance_toman = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?", (new_bal, user_id))
+        plan = cur.execute(
+            "SELECT name, gb, days, user_price, is_active FROM pricing_plans WHERE plan_code = ?",
+            (intent["plan_code"],)
+        ).fetchone()
+        if (
+            not plan
+            or not int(plan["is_active"] or 0)
+            or int(plan["user_price"]) != int(intent["amount"])
+            or str(plan["name"]) != str(intent["plan_name"])
+            or float(plan["gb"]) != float(intent["gb"])
+            or int(plan["days"]) != int(intent["days"])
+        ):
+            cur.execute(
+                "UPDATE user_action_intents SET status = 'cancelled', result_note = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE intent_id = ? AND status = 'pending'",
+                ("Plan changed or became inactive after the menu was displayed", key)
+            )
+            return {"status": "plan_changed"}
+
+        if action == "renew":
+            owner = cur.execute("""
+                SELECT 1 FROM accounts
+                WHERE owner_tg_id = ?
+                  AND LOWER(account_code) = LOWER(?)
+                  AND LOWER(email) = LOWER(?)
+                LIMIT 1
+            """, (
+                int(user_id), str(intent["account_code"] or ""),
+                str(intent["account_email"] or "")
+            )).fetchone()
+            if not owner:
+                cur.execute(
+                    "UPDATE user_action_intents SET status = 'cancelled', result_note = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE intent_id = ? AND status = 'pending'",
+                    ("Account ownership changed or could not be re-verified", key)
+                )
+                return {"status": "not_owned"}
+            lock_key = f"account-renewal:{str(intent['account_code']).lower()}"
+        else:
+            lock_key = f"user-buy:{int(user_id)}"
+
+        # The lock and wallet mutation are in this same transaction. A second
+        # intent that collides with an active operation is cancelled; it must
+        # not unexpectedly execute later from a stale button.
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (now,))
+        existing = cur.execute(
+            "SELECT 1 FROM operation_locks WHERE lock_key = ?", (lock_key,)
+        ).fetchone()
+        if existing:
+            cur.execute(
+                "UPDATE user_action_intents SET status = 'cancelled', result_note = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE intent_id = ? AND status = 'pending'",
+                ("Another operation currently owns the account/user lock; reopen the menu", key)
+            )
+            return {"status": "busy"}
+
+        wallet = cur.execute(
+            "SELECT balance_toman FROM user_wallets WHERE user_id = ?",
+            (int(user_id),)
+        ).fetchone()
+        current = int(wallet["balance_toman"] or 0) if wallet else 0
+        amount = int(intent["amount"])
+        if current < amount:
+            return {"status": "insufficient_funds", "balance": current, "required": amount}
+
+        new_balance = current - amount
         cur.execute("""
-        INSERT INTO financial_ledger (rep_id, user_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name)
-        VALUES (NULL, ?, ?, ?, ?, 'debit', ?, ?, ?, ?, 'User')
-        """, (user_id, account_code, email, plan_code, amount, new_bal, description, user_id))
-        conn.commit()
+            UPDATE user_wallets SET balance_toman = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND balance_toman >= ?
+        """, (new_balance, int(user_id), amount))
+        if cur.rowcount != 1:
+            return {"status": "insufficient_funds", "balance": current, "required": amount}
+
+        cur.execute("""
+            INSERT INTO financial_ledger
+            (rep_id, user_id, account_code, email, plan_code, transaction_type,
+             amount, balance_after, description, actor_id, actor_name)
+            VALUES (NULL, ?, ?, ?, ?, 'debit', ?, ?, ?, ?, 'User')
+        """, (
+            int(user_id), intent["account_code"], intent["account_email"],
+            intent["plan_code"], amount,
+            new_balance,
+            (f"خرید سرویس {intent['plan_name']}" if action == "buy" else
+             f"تمدید سرویس {intent['account_code']} ({intent['plan_name']})"),
+            int(user_id)
+        ))
+
+        lock_token = uuid.uuid4().hex
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (lock_key, lock_token, 253402300799.0)
+        )
+        cur.execute("""
+            UPDATE user_action_intents
+            SET status = 'processing', operation_lock_key = ?, operation_lock_token = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND user_id = ? AND status = 'pending'
+        """, (lock_key, lock_token, key, int(user_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not atomically claim the user action intent")
+
+        intent["status"] = "processing"
+        return {
+            "status": "started",
+            "intent": intent,
+            "lock_key": lock_key,
+            "lock_token": lock_token,
+            "new_balance": new_balance,
+        }
+
+
+def _verify_user_action_lock(cur, intent_id: str, user_id: int, lock_key: str, token: str):
+    intent = cur.execute(
+        "SELECT * FROM user_action_intents WHERE intent_id = ? AND user_id = ?",
+        (str(intent_id), int(user_id))
+    ).fetchone()
+    if not intent or intent["status"] != "processing":
+        raise ValueError("User action intent is not in processing state")
+    if str(intent["operation_lock_key"] or "") != str(lock_key):
+        raise ValueError("User action intent lock key mismatch")
+    if not secrets.compare_digest(str(intent["operation_lock_token"] or ""), str(token)):
+        raise ValueError("User action intent lock ownership mismatch")
+    lock = cur.execute(
+        "SELECT token FROM operation_locks WHERE lock_key = ?", (str(lock_key),)
+    ).fetchone()
+    if not lock or not secrets.compare_digest(str(lock["token"]), str(token)):
+        raise ValueError("Operation lock ownership mismatch")
+    return intent
+
+
+def complete_user_action_intent(
+    intent_id: str, user_id: int, lock_key: str, token: str, result_note: str = ""
+) -> bool:
+    """Atomically mark a user action successful and release its exact owned lock."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        _verify_user_action_lock(cur, intent_id, user_id, lock_key, token)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ? AND token = ?",
+            (str(lock_key), str(token))
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release the owned operation lock")
+        cur.execute("""
+            UPDATE user_action_intents
+            SET status = 'succeeded', operation_lock_key = NULL,
+                operation_lock_token = NULL, result_note = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND user_id = ? AND status = 'processing'
+        """, (str(result_note or "")[:500], str(intent_id), int(user_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize the user action intent")
         return True
 
-def create_payment_receipt(user_id: int, role: str, amount_toman: int, rep_id: int | None = None, photo_id: str | None = None, note: str | None = None) -> str:
-    import random, string
-    code = "RCP-" + "".join(random.choices(string.digits, k=6))
+
+def mark_user_action_intent_for_reconciliation(
+    intent_id: str, user_id: int, lock_key: str, token: str, result_note: str
+) -> bool:
+    """Mark an uncertain external outcome without releasing its persistent lock."""
+    note = str(result_note or "").strip()
+    if len(note) < 5:
+        raise ValueError("A reconciliation note is required")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        _verify_user_action_lock(cur, intent_id, user_id, lock_key, token)
+        cur.execute("""
+            UPDATE user_action_intents
+            SET status = 'needs_reconciliation', result_note = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND user_id = ? AND status = 'processing'
+        """, (note[:500], str(intent_id), int(user_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not mark user action for reconciliation")
+        return True
+
+
+def _validate_account_renewal_confirmation_for_claim(
+    cur, confirmation_id: str, actor_id: int, actor_role: str, rep_id: int | None,
+    account_code: str, account_email: str, plan_code: str, plan_name: str,
+    gb: float, days: int, amount: int, confirmation_rep_id: int | None = None,
+) -> dict:
+    key = str(confirmation_id or "").strip()
+    role = str(actor_role or "").strip().lower()
+    expected_rep_id = rep_id if confirmation_rep_id is None else confirmation_rep_id
+    row = cur.execute("""
+        SELECT * FROM account_renewal_confirmations
+        WHERE intent_id=? AND actor_id=?
+    """, (key, int(actor_id))).fetchone()
+    if not row:
+        raise ValueError("Quick-renew confirmation not found for this actor")
+    intent = dict(row)
+    if intent["status"] != "pending":
+        raise ValueError(f"Quick-renew confirmation is already {intent['status']}")
+    if float(intent["expires_at"]) <= time.time():
+        raise ValueError("Quick-renew confirmation expired")
+    if intent["actor_role"] != role:
+        raise ValueError("Quick-renew confirmation role mismatch")
+    if (intent.get("rep_id") is None) != (expected_rep_id is None):
+        raise ValueError("Quick-renew representative context mismatch")
+    if intent.get("rep_id") is not None and int(intent["rep_id"]) != int(expected_rep_id):
+        raise ValueError("Quick-renew representative mismatch")
+    if (
+        str(intent["account_code"]).lower() != str(account_code).lower()
+        or str(intent["account_email"]).lower() != str(account_email).lower()
+        or str(intent["plan_code"]) != str(plan_code)
+        or str(intent["plan_name"]) != str(plan_name)
+        or float(intent["gb"]) != float(gb)
+        or int(intent["days"]) != int(days)
+        or int(intent["amount"]) != int(amount)
+    ):
+        raise ValueError("Quick-renew account or plan snapshot mismatch")
+    plan = cur.execute("""
+        SELECT name, gb, days, rep_price, is_active
+        FROM pricing_plans WHERE plan_code=?
+    """, (str(plan_code),)).fetchone()
+    if (
+        not plan or not int(plan["is_active"] or 0)
+        or str(plan["name"]) != str(plan_name)
+        or float(plan["gb"]) != float(gb)
+        or int(plan["days"]) != int(days)
+        or int(plan["rep_price"]) != int(amount)
+    ):
+        raise ValueError("Quick-renew plan changed or is inactive")
+    return intent
+
+
+def begin_rep_renewal_intent(
+    rep_id: int,
+    actor_tg_id: int,
+    account_code: str,
+    account_email: str,
+    plan_code: str,
+    plan_name: str,
+    gb: float,
+    days: int,
+    amount: int,
+    confirmation_id: str | None = None,
+    actor_role: str = "rep",
+) -> dict:
+    """Atomically precharge a representative and bind the exact account renewal lock to a durable intent."""
+    rep_id, actor_tg_id = int(rep_id), int(actor_tg_id)
+    code = str(account_code or "").strip()
+    email = str(account_email or "").strip()
+    plan_code, plan_name = str(plan_code or "").strip(), str(plan_name or "").strip()
+    gb, days, amount = float(gb), int(days), int(amount)
+    if not code or not email or not plan_code or not plan_name or gb <= 0 or days <= 0 or amount <= 0:
+        raise ValueError("A complete positive representative renewal snapshot is required")
+
+    intent_id = secrets.token_hex(16)
+    lock_key = f"account-renewal:{code.lower()}"
+    lock_token = uuid.uuid4().hex
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (now,))
+        if confirmation_id:
+            _validate_account_renewal_confirmation_for_claim(
+                cur, confirmation_id, actor_tg_id, actor_role, rep_id,
+                code, email, plan_code, plan_name, gb, days, amount,
+            )
+        if cur.execute(
+            "SELECT 1 FROM operation_locks WHERE lock_key=?", (lock_key,)
+        ).fetchone():
+            return {"status": "busy"}
+
+        new_balance = _record_rep_ledger_entry(
+            cur, rep_id, code, email, plan_code, "debit", amount,
+            f"پیش‌پرداخت تمدید {plan_name} (در انتظار تأیید پنل)",
+            actor_tg_id, "Representative",
+        )
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (lock_key, lock_token, 253402300799.0),
+        )
+        cur.execute("""
+            INSERT INTO rep_renewal_intents
+            (intent_id, rep_id, actor_tg_id, account_code, account_email,
+             plan_code, plan_name, gb, days, amount, confirmation_id, status,
+             operation_lock_key, operation_lock_token)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
+        """, (
+            intent_id, rep_id, actor_tg_id, code, email, plan_code, plan_name,
+            gb, days, amount, confirmation_id, lock_key, lock_token,
+        ))
+        if confirmation_id:
+            cur.execute("""
+                UPDATE account_renewal_confirmations
+                SET status='processing', operation_ref_type='rep_renewal',
+                    operation_ref_id=?, operation_lock_key=?, operation_lock_token=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE intent_id=? AND actor_id=? AND status='pending'
+            """, (intent_id, lock_key, lock_token, str(confirmation_id), actor_tg_id))
+            if cur.rowcount != 1:
+                raise RuntimeError("Could not atomically claim quick-renew confirmation")
+        _insert_audit(
+            cur, rep_id, code, email, "rep_renewal_intent_started",
+            actor_tg_id, "Representative",
+            {"intent_id": intent_id, "plan_code": plan_code, "amount": amount,
+             "balance_after": new_balance, "lock_key": lock_key},
+            "success",
+        )
+        return {
+            "status": "started", "intent_id": intent_id, "rep_id": rep_id,
+            "lock_key": lock_key, "lock_token": lock_token,
+            "new_balance": new_balance,
+        }
+
+
+def begin_admin_renewal_confirmation(
+    confirmation_id: str, actor_id: int, actor_role: str, confirmation_rep_id: int | None,
+    account_code: str, account_email: str, plan_code: str, plan_name: str,
+    gb: float, days: int, amount: int,
+) -> dict:
+    """Atomically claim a Super Admin quick-renew confirmation and its persistent operation lock."""
+    key = str(confirmation_id or "").strip()
+    code = str(account_code or "").strip()
+    lock_key = f"account-renewal:{code.lower()}"
+    lock_token = uuid.uuid4().hex
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        _validate_account_renewal_confirmation_for_claim(
+            cur, key, actor_id, actor_role, None, code, account_email,
+            plan_code, plan_name, gb, days, amount,
+            confirmation_rep_id=confirmation_rep_id,
+        )
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (time.time(),))
+        if cur.execute("SELECT 1 FROM operation_locks WHERE lock_key=?", (lock_key,)).fetchone():
+            return {"status": "busy"}
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (lock_key, lock_token, 253402300799.0),
+        )
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='processing', operation_ref_type='admin_renewal',
+                operation_ref_id=?, operation_lock_key=?, operation_lock_token=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND actor_id=? AND status='pending'
+        """, (key, lock_key, lock_token, key, int(actor_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not atomically claim Super Admin renewal confirmation")
+        _insert_audit(
+            cur, None, code, account_email, "admin_renewal_confirmation_started",
+            int(actor_id), "Super Admin",
+            {"confirmation_id": key, "plan_code": plan_code, "amount": int(amount), "lock_key": lock_key},
+            "success",
+        )
+        return {"status": "started", "confirmation_id": key, "lock_key": lock_key, "lock_token": lock_token}
+
+
+def _verify_admin_renewal_confirmation_lock(cur, confirmation_id: str, actor_id: int):
+    row = cur.execute("""
+        SELECT * FROM account_renewal_confirmations
+        WHERE intent_id=? AND actor_id=? AND actor_role='super_admin'
+          AND operation_ref_type='admin_renewal'
+          AND status IN ('processing', 'needs_reconciliation')
+    """, (str(confirmation_id), int(actor_id))).fetchone()
+    if not row:
+        raise ValueError("No unresolved Super Admin renewal confirmation was found")
+    intent = dict(row)
+    lock = cur.execute(
+        "SELECT token, created_at FROM operation_locks WHERE lock_key=?",
+        (intent["operation_lock_key"],),
+    ).fetchone()
+    if not lock or not secrets.compare_digest(str(lock["token"]), str(intent["operation_lock_token"] or "")):
+        raise ValueError("Super Admin renewal confirmation's exact operation lock is missing or ownership differs")
+    return intent, lock
+
+
+def complete_admin_renewal_confirmation(
+    confirmation_id: str, actor_id: int, result_note: str = "X-UI renewal succeeded"
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, _ = _verify_admin_renewal_confirmation_lock(cur, confirmation_id, actor_id)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release exact Super Admin renewal lock")
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='succeeded', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(result_note)[:500], str(confirmation_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize Super Admin renewal confirmation")
+        _insert_audit(
+            cur, None, intent["account_code"], intent["account_email"],
+            "admin_renewal_confirmation_succeeded", int(actor_id), "Super Admin",
+            {"confirmation_id": str(confirmation_id), "lock_key": intent["operation_lock_key"]},
+            "success",
+        )
+        return True
+
+
+def fail_admin_renewal_confirmation(
+    confirmation_id: str, actor_id: int, result_note: str
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, _ = _verify_admin_renewal_confirmation_lock(cur, confirmation_id, actor_id)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release exact Super Admin renewal lock")
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='failed', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(result_note)[:500], str(confirmation_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize Super Admin renewal failure")
+        _insert_audit(
+            cur, None, intent["account_code"], intent["account_email"],
+            "admin_renewal_confirmation_failed", int(actor_id), "Super Admin",
+            {"confirmation_id": str(confirmation_id), "lock_key": intent["operation_lock_key"],
+             "result_note": str(result_note)[:500]},
+            "success",
+        )
+        return True
+
+
+def mark_admin_renewal_confirmation_for_reconciliation(
+    confirmation_id: str, actor_id: int, note: str
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, _ = _verify_admin_renewal_confirmation_lock(cur, confirmation_id, actor_id)
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='needs_reconciliation', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(note or "Ambiguous Super Admin renewal")[:500], str(confirmation_id)))
+        return cur.rowcount == 1
+
+
+def resolve_admin_renewal_confirmation(
+    confirmation_id: str, actor_id: int, actor_name: str, resolution: str, evidence_note: str
+) -> dict:
+    key = str(confirmation_id or "").strip()
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if choice not in ("APPLIED", "NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or NOT_APPLIED")
+    prefix = "APPLIED:" if choice == "APPLIED" else "NOT_APPLIED:"
+    if not note.startswith(prefix) or len(note) < len(prefix) + 15:
+        raise ValueError(f"Evidence must start with {prefix} and contain at least 15 characters after it")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, lock = _verify_admin_renewal_confirmation_lock(cur, key, actor_id)
+        status = "succeeded" if choice == "APPLIED" else "failed"
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume exact Super Admin renewal lock")
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status=?, result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (status, note[:500], key))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize Super Admin renewal resolution")
+        _insert_audit(
+            cur, None, intent["account_code"], intent["account_email"],
+            "resolve_admin_renewal_confirmation", int(actor_id), str(actor_name or "Super Admin"),
+            {"confirmation_id": key, "resolution": choice, "evidence_note": note,
+             "lock_key": intent["operation_lock_key"], "lock_created_at": lock["created_at"]},
+            "success",
+        )
+        return {"status": status, "lock_key": intent["operation_lock_key"], "account_code": intent["account_code"]}
+
+
+def _sync_linked_renewal_confirmation(cur, intent: dict, status: str, result_note: str | None = None):
+    confirmation_id = intent.get("confirmation_id")
+    if not confirmation_id:
+        return
+    cur.execute("""
+        UPDATE account_renewal_confirmations
+        SET status=?, result_note=?, updated_at=CURRENT_TIMESTAMP
+        WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+    """, (str(status), str(result_note or "")[:500], str(confirmation_id)))
+    if cur.rowcount != 1:
+        raise RuntimeError("Could not synchronize linked quick-renew confirmation state")
+
+
+def _verify_rep_renewal_lock(cur, intent_id: str, rep_id: int, actor_tg_id: int):
+    row = cur.execute("""
+        SELECT * FROM rep_renewal_intents
+        WHERE intent_id=? AND rep_id=? AND actor_tg_id=?
+    """, (str(intent_id), int(rep_id), int(actor_tg_id))).fetchone()
+    if not row or row["status"] not in ("processing", "needs_reconciliation"):
+        raise ValueError("Representative renewal intent is not unresolved")
+    intent = dict(row)
+    lock = cur.execute(
+        "SELECT token, created_at FROM operation_locks WHERE lock_key=?",
+        (intent["operation_lock_key"],),
+    ).fetchone()
+    if not lock or not secrets.compare_digest(str(lock["token"]), str(intent["operation_lock_token"])):
+        raise ValueError("Representative renewal intent's exact operation lock is missing or ownership differs")
+    return intent, lock
+
+
+def complete_rep_renewal_intent(
+    intent_id: str, rep_id: int, actor_tg_id: int, result_note: str = "X-UI renewal succeeded"
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, lock = _verify_rep_renewal_lock(cur, intent_id, rep_id, actor_tg_id)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release exact representative renewal lock")
+        cur.execute("""
+            UPDATE rep_renewal_intents
+            SET status='succeeded', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(result_note)[:500], str(intent_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative renewal intent")
+        _sync_linked_renewal_confirmation(cur, intent, "succeeded", result_note)
+        _insert_audit(
+            cur, int(rep_id), intent["account_code"], intent["account_email"],
+            "rep_renewal_intent_succeeded", int(actor_tg_id), "Representative",
+            {"intent_id": str(intent_id), "plan_code": intent["plan_code"],
+             "amount": int(intent["amount"]), "lock_key": intent["operation_lock_key"]},
+            "success",
+        )
+        return True
+
+
+def refund_rep_renewal_intent(
+    intent_id: str, rep_id: int, actor_tg_id: int, reason: str
+) -> dict:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, lock = _verify_rep_renewal_lock(cur, intent_id, rep_id, actor_tg_id)
+        new_balance = _record_rep_ledger_entry(
+            cur, int(rep_id), intent["account_code"], intent["account_email"],
+            intent["plan_code"], "credit", int(intent["amount"]),
+            str(reason or "استرداد پیش‌پرداخت تمدید"), int(actor_tg_id), "Representative",
+        )
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release exact representative renewal lock")
+        cur.execute("""
+            UPDATE rep_renewal_intents
+            SET status='refunded', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(reason or "Definite X-UI failure")[:500], str(intent_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative renewal refund")
+        _sync_linked_renewal_confirmation(cur, intent, "refunded", reason)
+        _insert_audit(
+            cur, int(rep_id), intent["account_code"], intent["account_email"],
+            "rep_renewal_intent_refunded", int(actor_tg_id), "Representative",
+            {"intent_id": str(intent_id), "plan_code": intent["plan_code"],
+             "amount": int(intent["amount"]), "new_balance": new_balance,
+             "lock_key": intent["operation_lock_key"]},
+            "success",
+        )
+        return {"status": "refunded", "new_balance": new_balance, "amount": int(intent["amount"])}
+
+
+def mark_rep_renewal_for_reconciliation(
+    intent_id: str, rep_id: int, actor_tg_id: int, note: str
+) -> bool:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent, _ = _verify_rep_renewal_lock(cur, intent_id, rep_id, actor_tg_id)
+        cur.execute("""
+            UPDATE rep_renewal_intents
+            SET status='needs_reconciliation', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (str(note or "Ambiguous renewal result")[:500], str(intent_id)))
+        if cur.rowcount != 1:
+            return False
+        _sync_linked_renewal_confirmation(cur, intent, "needs_reconciliation", note)
+        return True
+
+
+def resolve_rep_renewal_intent(
+    intent_id: str, actor_id: int, actor_name: str, resolution: str, evidence_note: str
+) -> dict:
+    key = str(intent_id or "").strip()
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if not key:
+        raise ValueError("Representative renewal intent ID is required")
+    if choice not in ("APPLIED", "REFUND_NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or REFUND_NOT_APPLIED")
+    prefix = "APPLIED:" if choice == "APPLIED" else "REFUND_NOT_APPLIED:"
+    if not note.startswith(prefix) or len(note) < len(prefix) + 15:
+        raise ValueError(f"Evidence must start with {prefix} and contain at least 15 characters after it")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM rep_renewal_intents
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (key,)).fetchone()
+        if not row:
+            raise ValueError("No unresolved representative renewal intent with that ID was found")
+        intent = dict(row)
+        lock = cur.execute(
+            "SELECT token, created_at FROM operation_locks WHERE lock_key=?",
+            (intent["operation_lock_key"],),
+        ).fetchone()
+        if not lock or not secrets.compare_digest(str(lock["token"]), str(intent["operation_lock_token"])):
+            raise ValueError("Representative renewal intent's exact operation lock is missing or ownership differs")
+
+        new_balance = None
+        if choice == "REFUND_NOT_APPLIED":
+            new_balance = _record_rep_ledger_entry(
+                cur, int(intent["rep_id"]), intent["account_code"], intent["account_email"],
+                intent["plan_code"], "credit", int(intent["amount"]),
+                "استرداد پس از تطبیق مدیریتی؛ تمدید خارجی انجام نشده است",
+                int(actor_id), str(actor_name or "Super Admin"),
+            )
+            status, audit_action = "refunded", "resolve_rep_renewal_intent_refund"
+        else:
+            status, audit_action = "succeeded", "resolve_rep_renewal_intent_applied"
+
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (intent["operation_lock_key"], intent["operation_lock_token"]),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume representative renewal lock")
+        cur.execute("""
+            UPDATE rep_renewal_intents
+            SET status=?, result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (status, note[:500], key))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative renewal resolution")
+        _sync_linked_renewal_confirmation(cur, intent, status, note)
+        _insert_audit(
+            cur, int(intent["rep_id"]), intent["account_code"], intent["account_email"],
+            audit_action, int(actor_id), str(actor_name or "Super Admin"),
+            {"intent_id": key, "actor_tg_id": int(intent["actor_tg_id"]),
+             "plan_code": intent["plan_code"], "amount": int(intent["amount"]),
+             "resolution": choice, "evidence_note": note,
+             "lock_key": intent["operation_lock_key"], "lock_created_at": lock["created_at"],
+             "new_balance": new_balance},
+            "success",
+        )
+        return {
+            "status": status, "rep_id": int(intent["rep_id"]),
+            "amount": int(intent["amount"]), "new_balance": new_balance,
+            "lock_key": intent["operation_lock_key"],
+        }
+
+
+def create_account_renewal_confirmation(
+    actor_id: int,
+    actor_role: str,
+    rep_id: int | None,
+    account_code: str,
+    account_email: str,
+    plan_code: str,
+    plan_name: str,
+    gb: float,
+    days: int,
+    amount: int,
+    ttl_seconds: int = 600,
+) -> str:
+    """Create a one-time confirmation token for a quick-renew button."""
+    role = str(actor_role or "").strip().lower()
+    code = str(account_code or "").strip()
+    email = str(account_email or "").strip()
+    plan_code = str(plan_code or "").strip()
+    gb, days, amount = float(gb), int(days), int(amount)
+    if role not in ("rep", "super_admin"):
+        raise ValueError("Only representatives and Super Admin can create quick-renew confirmations")
+    if role == "rep" and rep_id is None:
+        raise ValueError("Representative renewal confirmation requires a representative ID")
+    if not code or not email or not plan_code or gb <= 0 or days <= 0 or amount <= 0:
+        raise ValueError("Valid account and plan snapshot are required")
+    token = secrets.token_hex(16)
+    with get_db() as conn:
+        cur = conn.cursor()
+        plan = cur.execute("""
+            SELECT name, gb, days, rep_price, is_active
+            FROM pricing_plans WHERE plan_code = ?
+        """, (plan_code,)).fetchone()
+        if (
+            not plan or not int(plan["is_active"] or 0)
+            or str(plan["name"]) != str(plan_name)
+            or float(plan["gb"]) != gb or int(plan["days"]) != days
+            or int(plan["rep_price"]) != amount
+        ):
+            raise ValueError("Plan is not active or its current values differ from the displayed plan")
+        if role == "rep":
+            owned = cur.execute("""
+                SELECT 1 FROM accounts
+                WHERE rep_id = ?
+                  AND (LOWER(account_code) = LOWER(?) OR LOWER(email) = LOWER(?))
+                LIMIT 1
+            """, (int(rep_id), code, email)).fetchone()
+            if not owned:
+                raise ValueError("Account is no longer within this representative's scope")
+        cur.execute("""
+            INSERT INTO account_renewal_confirmations
+            (intent_id, actor_id, actor_role, rep_id, account_code, account_email,
+             plan_code, plan_name, gb, days, amount, status, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            token, int(actor_id), role, int(rep_id) if rep_id is not None else None,
+            code, email, plan_code, str(plan_name), gb, days, amount,
+            time.time() + max(60, int(ttl_seconds))
+        ))
+    return token
+
+
+def get_account_renewal_confirmation(intent_id: str, actor_id: int) -> dict | None:
+    token = str(intent_id or "").strip()
+    if not token:
+        return None
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT * FROM account_renewal_confirmations
+            WHERE intent_id = ? AND actor_id = ?
+        """, (token, int(actor_id))).fetchone()
+        return dict(row) if row else None
+
+
+def consume_account_renewal_confirmation(
+    intent_id: str, actor_id: int, actor_role: str, rep_id: int | None
+) -> dict:
+    """Atomically consume a one-time confirmation after role/scope checks."""
+    token = str(intent_id or "").strip()
+    role = str(actor_role or "").strip().lower()
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM account_renewal_confirmations
+            WHERE intent_id = ? AND actor_id = ?
+        """, (token, int(actor_id))).fetchone()
+        if not row:
+            return {"status": "not_found"}
+        intent = dict(row)
+        if intent["actor_role"] != role:
+            return {"status": "wrong_role"}
+        if intent.get("rep_id") is not None and int(intent["rep_id"]) != int(rep_id or -1):
+            return {"status": "wrong_representative"}
+        if intent["status"] != "pending":
+            return {"status": "already_processed", "intent_status": intent["status"]}
+        if float(intent["expires_at"]) <= time.time():
+            cur.execute("""
+                UPDATE account_renewal_confirmations
+                SET status='expired', updated_at=CURRENT_TIMESTAMP
+                WHERE intent_id=? AND status='pending'
+            """, (token,))
+            return {"status": "expired"}
+
+        plan = cur.execute("""
+            SELECT name, gb, days, rep_price, is_active
+            FROM pricing_plans WHERE plan_code = ?
+        """, (intent["plan_code"],)).fetchone()
+        if (
+            not plan or not int(plan["is_active"] or 0)
+            or str(plan["name"]) != str(intent["plan_name"])
+            or float(plan["gb"]) != float(intent["gb"])
+            or int(plan["days"]) != int(intent["days"])
+            or int(plan["rep_price"]) != int(intent["amount"])
+        ):
+            cur.execute("""
+                UPDATE account_renewal_confirmations
+                SET status='cancelled', updated_at=CURRENT_TIMESTAMP
+                WHERE intent_id=? AND status='pending'
+            """, (token,))
+            return {"status": "plan_changed"}
+
+        cur.execute("""
+            UPDATE account_renewal_confirmations
+            SET status='consumed', updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND actor_id=? AND status='pending'
+        """, (token, int(actor_id)))
+        if cur.rowcount != 1:
+            return {"status": "already_processed", "intent_status": "consumed"}
+        intent["status"] = "consumed"
+        return {"status": "consumed", "intent": intent}
+
+
+def create_rep_action_intent(
+    rep_id: int,
+    actor_tg_id: int,
+    plan_code: str,
+    plan_name: str,
+    gb: float,
+    days: int,
+    amount: int,
+    ttl_seconds: int = 900,
+) -> str:
+    """Create one expiring representative issuance intent for one confirmation flow."""
+    plan_code = str(plan_code or "").strip()
+    gb, days, amount = float(gb), int(days), int(amount)
+    if not plan_code or gb <= 0 or days <= 0 or amount <= 0:
+        raise ValueError("A valid positive representative plan snapshot is required")
+    intent_id = secrets.token_hex(16)
+    with get_db() as conn:
+        cur = conn.cursor()
+        rep = cur.execute(
+            "SELECT is_active FROM representatives WHERE id = ?", (int(rep_id),)
+        ).fetchone()
+        if not rep or not bool(rep["is_active"]):
+            raise ValueError("Representative is inactive or does not exist")
+        cur.execute("""
+            INSERT INTO rep_action_intents
+            (intent_id, rep_id, actor_tg_id, action_type, plan_code, plan_name,
+             gb, days, amount, status, expires_at)
+            VALUES (?, ?, ?, 'issue', ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            intent_id, int(rep_id), int(actor_tg_id), plan_code, str(plan_name),
+            gb, days, amount, time.time() + max(60, int(ttl_seconds))
+        ))
+    return intent_id
+
+
+def set_rep_action_intent_customer_name(
+    intent_id: str, rep_id: int, actor_tg_id: int, customer_name: str
+) -> bool:
+    """Update the display/customer comment only while the intent remains pending."""
+    name = str(customer_name or "").strip()[:100]
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
-        INSERT INTO payment_receipts (tracking_code, user_id, role, rep_id, amount_toman, receipt_photo_id, receipt_note, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-        """, (code, user_id, role, rep_id, amount_toman, photo_id, note))
-        conn.commit()
-    return code
+            UPDATE rep_action_intents
+            SET customer_name = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND rep_id = ? AND actor_tg_id = ? AND status = 'pending'
+        """, (name, str(intent_id), int(rep_id), int(actor_tg_id)))
+        return cur.rowcount == 1
+
+
+def get_rep_action_intent(intent_id: str, rep_id: int, actor_tg_id: int) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT * FROM rep_action_intents
+            WHERE intent_id = ? AND rep_id = ? AND actor_tg_id = ?
+        """, (str(intent_id or ""), int(rep_id), int(actor_tg_id))).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result.pop("operation_lock_token", None)
+        return result
+
+
+def begin_rep_action_intent(intent_id: str, rep_id: int, actor_tg_id: int) -> dict:
+    """Atomically validate plan/rep, debit ledger and acquire a durable operation lock."""
+    key = str(intent_id or "").strip()
+    if not key:
+        return {"status": "not_found"}
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM rep_action_intents
+            WHERE intent_id = ? AND rep_id = ? AND actor_tg_id = ?
+        """, (key, int(rep_id), int(actor_tg_id))).fetchone()
+        if not row:
+            return {"status": "not_found"}
+        intent = dict(row)
+        if intent["status"] != "pending":
+            return {"status": "already_processed", "intent_status": intent["status"]}
+        now = time.time()
+        if float(intent["expires_at"]) <= now:
+            cur.execute(
+                "UPDATE rep_action_intents SET status='expired', updated_at=CURRENT_TIMESTAMP "
+                "WHERE intent_id=? AND status='pending'", (key,)
+            )
+            return {"status": "expired"}
+
+        plan = cur.execute("""
+            SELECT name, gb, days, rep_price, is_active FROM pricing_plans
+            WHERE plan_code = ?
+        """, (intent["plan_code"],)).fetchone()
+        if (
+            not plan or not int(plan["is_active"] or 0)
+            or int(plan["rep_price"]) != int(intent["amount"])
+            or str(plan["name"]) != str(intent["plan_name"])
+            or float(plan["gb"]) != float(intent["gb"])
+            or int(plan["days"]) != int(intent["days"])
+        ):
+            cur.execute(
+                "UPDATE rep_action_intents SET status='cancelled', result_note=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE intent_id=? AND status='pending'",
+                ("Plan changed or became inactive after the menu was displayed", key)
+            )
+            return {"status": "plan_changed"}
+
+        lock_key = f"rep-issue-intent:{key}"
+        cur.execute("DELETE FROM operation_locks WHERE expires_at <= ?", (now,))
+        if cur.execute(
+            "SELECT 1 FROM operation_locks WHERE lock_key=?", (lock_key,)
+        ).fetchone():
+            return {"status": "busy"}
+
+        new_balance = _record_rep_ledger_entry(
+            cur,
+            int(rep_id),
+            "",
+            "",
+            intent["plan_code"],
+            "debit",
+            int(intent["amount"]),
+            f"پیش‌پرداخت صدور {intent['plan_name']} (در انتظار تأیید پنل)",
+            int(actor_tg_id),
+            "Representative",
+        )
+        _insert_audit(
+            cur, int(rep_id), "", "", "rep_issue_intent_started",
+            int(actor_tg_id), "Representative",
+            {"intent_id": key, "plan_code": intent["plan_code"], "amount": int(intent["amount"]),
+             "balance_after": new_balance},
+            "success"
+        )
+        lock_token = uuid.uuid4().hex
+        cur.execute(
+            "INSERT INTO operation_locks (lock_key, token, expires_at) VALUES (?, ?, ?)",
+            (lock_key, lock_token, 253402300799.0)
+        )
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status='processing', operation_lock_key=?, operation_lock_token=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND rep_id=? AND actor_tg_id=? AND status='pending'
+        """, (lock_key, lock_token, key, int(rep_id), int(actor_tg_id)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not atomically claim representative action intent")
+        intent["status"] = "processing"
+        return {
+            "status": "started", "intent": intent, "lock_key": lock_key,
+            "lock_token": lock_token, "new_balance": new_balance,
+        }
+
+
+def _verify_rep_action_lock(cur, intent_id: str, rep_id: int, actor_tg_id: int, lock_key: str, token: str):
+    intent = cur.execute("""
+        SELECT * FROM rep_action_intents
+        WHERE intent_id=? AND rep_id=? AND actor_tg_id=?
+    """, (str(intent_id), int(rep_id), int(actor_tg_id))).fetchone()
+    if not intent or intent["status"] != "processing":
+        raise ValueError("Representative action intent is not processing")
+    if str(intent["operation_lock_key"] or "") != str(lock_key):
+        raise ValueError("Representative intent lock key mismatch")
+    if not secrets.compare_digest(str(intent["operation_lock_token"] or ""), str(token)):
+        raise ValueError("Representative intent lock ownership mismatch")
+    lock = cur.execute("SELECT token FROM operation_locks WHERE lock_key=?", (str(lock_key),)).fetchone()
+    if not lock or not secrets.compare_digest(str(lock["token"]), str(token)):
+        raise ValueError("Operation lock ownership mismatch")
+    return intent
+
+
+def complete_rep_action_intent(
+    intent_id: str, rep_id: int, actor_tg_id: int, lock_key: str, token: str,
+    account_code: str, account_email: str,
+) -> bool:
+    """Finalize a successful representative issuance and release the exact lock."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent = _verify_rep_action_lock(cur, intent_id, rep_id, actor_tg_id, lock_key, token)
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?", (str(lock_key), str(token))
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not release representative issuance lock")
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status='succeeded', account_code=?, account_email=?,
+                operation_lock_key=NULL, operation_lock_token=NULL,
+                result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status='processing'
+        """, (
+            str(account_code), str(account_email),
+            f"Issued account {account_code}"[:500], str(intent_id)
+        ))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative issuance intent")
+        _insert_audit(
+            cur, int(rep_id), str(account_code), str(account_email), "rep_issue_intent_succeeded",
+            int(actor_tg_id), "Representative",
+            {"intent_id": str(intent_id), "plan_code": intent["plan_code"], "amount": int(intent["amount"])},
+            "success"
+        )
+        return True
+
+
+def mark_rep_action_intent_for_reconciliation(
+    intent_id: str, rep_id: int, actor_tg_id: int,
+    lock_key: str, token: str, result_note: str,
+) -> bool:
+    note = str(result_note or "").strip()
+    if len(note) < 5:
+        raise ValueError("A reconciliation note is required")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        _verify_rep_action_lock(cur, intent_id, rep_id, actor_tg_id, lock_key, token)
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status='needs_reconciliation', result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status='processing'
+        """, (note[:500], str(intent_id)))
+        return cur.rowcount == 1
+
+
+def resolve_rep_action_intent(
+    intent_id: str,
+    actor_id: int,
+    actor_name: str,
+    resolution: str,
+    evidence_note: str,
+) -> dict:
+    """Evidence-gated resolution of an uncertain representative issuance."""
+    key = str(intent_id or "").strip()
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if not key:
+        raise ValueError("Representative intent ID is required")
+    if choice not in ("APPLIED", "REFUND_NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or REFUND_NOT_APPLIED")
+    prefix = "APPLIED:" if choice == "APPLIED" else "REFUND_NOT_APPLIED:"
+    if not note.startswith(prefix) or len(note) < len(prefix) + 15:
+        raise ValueError(
+            f"Evidence must start with {prefix} and contain at least 15 characters after it"
+        )
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("""
+            SELECT * FROM rep_action_intents
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (key,)).fetchone()
+        if not row:
+            raise ValueError("No unresolved representative intent with that ID was found")
+        intent = dict(row)
+        lock_key = str(intent.get("operation_lock_key") or "")
+        lock_token = str(intent.get("operation_lock_token") or "")
+        lock = cur.execute(
+            "SELECT token, created_at FROM operation_locks WHERE lock_key=?", (lock_key,)
+        ).fetchone()
+        if not lock_key or not lock_token or not lock or not secrets.compare_digest(str(lock["token"]), lock_token):
+            raise ValueError("Representative intent's exact operation lock is missing or ownership differs")
+
+        new_balance = None
+        if choice == "REFUND_NOT_APPLIED":
+            new_balance = _record_rep_ledger_entry(
+                cur,
+                int(intent["rep_id"]),
+                "",
+                "",
+                intent["plan_code"],
+                "credit",
+                int(intent["amount"]),
+                "استرداد پس از تطبیق مدیریتی؛ صدور خارجی انجام نشده است",
+                int(actor_id),
+                str(actor_name or "Super Admin"),
+            )
+            new_status = "refunded"
+            audit_action = "resolve_rep_action_intent_refund"
+        else:
+            new_status = "succeeded"
+            audit_action = "resolve_rep_action_intent_applied"
+
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key=? AND token=?",
+            (lock_key, lock_token)
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume representative intent lock")
+
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status=?, operation_lock_key=NULL, operation_lock_token=NULL,
+                result_note=?, updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status IN ('processing', 'needs_reconciliation')
+        """, (new_status, note[:500], key))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative intent resolution")
+
+        _insert_audit(
+            cur,
+            int(intent["rep_id"]),
+            str(intent.get("account_code") or ""),
+            str(intent.get("account_email") or ""),
+            audit_action,
+            int(actor_id),
+            str(actor_name or "Super Admin"),
+            {
+                "intent_id": key,
+                "actor_tg_id": int(intent["actor_tg_id"]),
+                "plan_code": intent["plan_code"],
+                "amount": int(intent["amount"]),
+                "resolution": choice,
+                "evidence_note": note,
+                "lock_key": lock_key,
+                "lock_created_at": lock["created_at"],
+                "new_balance": new_balance,
+            },
+            "success",
+        )
+        return {
+            "status": new_status,
+            "rep_id": int(intent["rep_id"]),
+            "amount": int(intent["amount"]),
+            "new_balance": new_balance,
+            "lock_key": lock_key,
+        }
+
+
+def refund_rep_action_intent(
+    intent_id: str, rep_id: int, actor_tg_id: int,
+    lock_key: str, token: str, actor_name: str = "Representative",
+) -> int:
+    """Atomically credit back a definite failed representative precharge and consume intent."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent = _verify_rep_action_lock(cur, intent_id, rep_id, actor_tg_id, lock_key, token)
+        new_balance = _record_rep_ledger_entry(
+            cur, int(rep_id), "", "", intent["plan_code"], "credit",
+            int(intent["amount"]),
+            f"استرداد پیش‌پرداخت پس از شکست قطعی صدور {intent['plan_code']}",
+            int(actor_tg_id), str(actor_name or "Representative"),
+        )
+        cur.execute("DELETE FROM operation_locks WHERE lock_key=? AND token=?", (str(lock_key), str(token)))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume representative issuance lock")
+        cur.execute("""
+            UPDATE rep_action_intents
+            SET status='refunded', operation_lock_key=NULL, operation_lock_token=NULL,
+                result_note='Definite external allocation failure; precharge refunded',
+                updated_at=CURRENT_TIMESTAMP
+            WHERE intent_id=? AND status='processing'
+        """, (str(intent_id),))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize representative issuance refund")
+        _insert_audit(
+            cur, int(rep_id), "", "", "rep_issue_intent_refunded",
+            int(actor_tg_id), str(actor_name or "Representative"),
+            {"intent_id": str(intent_id), "amount": int(intent["amount"]), "new_balance": new_balance},
+            "success"
+        )
+        return new_balance
+
+
+def mark_rep_action_intent_for_reconciliation_from_admin(
+    intent_id: str, rep_id: int, actor_tg_id: int, lock_key: str, token: str, note: str
+):
+    return mark_rep_action_intent_for_reconciliation(
+        intent_id, rep_id, actor_tg_id, lock_key, token, note
+    )
+
+
+def resolve_user_action_intent(
+    intent_id: str,
+    actor_id: int,
+    actor_name: str,
+    resolution: str,
+    evidence_note: str,
+) -> dict:
+    """Resolve an uncertain user action with evidence and atomic wallet/lock semantics.
+
+    APPLIED keeps the existing debit and marks the action succeeded.
+    REFUND_NOT_APPLIED credits the wallet, writes the ledger and marks the action
+    refunded. Both paths consume the exact operation-lock token in one transaction.
+    """
+    key = str(intent_id or "").strip()
+    choice = str(resolution or "").strip().upper()
+    note = str(evidence_note or "").strip()
+    if not key:
+        raise ValueError("A user action intent ID is required")
+    if choice not in ("APPLIED", "REFUND_NOT_APPLIED"):
+        raise ValueError("Resolution must be APPLIED or REFUND_NOT_APPLIED")
+    expected_prefix = "APPLIED:" if choice == "APPLIED" else "REFUND_NOT_APPLIED:"
+    if not note.startswith(expected_prefix) or len(note) < len(expected_prefix) + 15:
+        raise ValueError(
+            f"Evidence must start with {expected_prefix} and contain at least 15 characters after it"
+        )
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        intent_row = cur.execute("""
+            SELECT * FROM user_action_intents
+            WHERE intent_id = ? AND status IN ('processing', 'needs_reconciliation')
+        """, (key,)).fetchone()
+        if not intent_row:
+            raise ValueError("No unresolved user action intent with that ID was found")
+        intent = dict(intent_row)
+        lock_key = str(intent.get("operation_lock_key") or "")
+        lock_token = str(intent.get("operation_lock_token") or "")
+        if not lock_key or not lock_token:
+            raise ValueError("The unresolved intent has no matching operation-lock ownership data")
+
+        lock = cur.execute(
+            "SELECT token, created_at FROM operation_locks WHERE lock_key = ?",
+            (lock_key,)
+        ).fetchone()
+        if not lock or not secrets.compare_digest(str(lock["token"]), lock_token):
+            raise ValueError("The intent's exact operation lock is missing or has different ownership")
+
+        new_balance = None
+        if choice == "REFUND_NOT_APPLIED":
+            new_balance = _credit_user_wallet(
+                cur,
+                int(intent["user_id"]),
+                int(intent["amount"]),
+                "استرداد پس از تطبیق مدیریتی؛ عملیات خارجی انجام نشده است",
+                int(actor_id),
+                str(actor_name or "Super Admin"),
+            )
+            new_status = "refunded"
+            audit_action = "resolve_user_action_intent_refund"
+        else:
+            new_status = "succeeded"
+            audit_action = "resolve_user_action_intent_applied"
+
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ? AND token = ?",
+            (lock_key, lock_token)
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not consume the exact user action operation lock")
+
+        cur.execute("""
+            UPDATE user_action_intents
+            SET status = ?, operation_lock_key = NULL, operation_lock_token = NULL,
+                result_note = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE intent_id = ? AND status IN ('processing', 'needs_reconciliation')
+        """, (new_status, note[:500], key))
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not finalize the user action intent resolution")
+
+        _insert_audit(
+            cur,
+            rep_id=None,
+            account_code=str(intent.get("account_code") or ""),
+            email=str(intent.get("account_email") or ""),
+            action=audit_action,
+            actor_id=int(actor_id),
+            actor_name=str(actor_name or "Super Admin"),
+            details={
+                "intent_id": key,
+                "user_id": int(intent["user_id"]),
+                "action_type": intent["action_type"],
+                "plan_code": intent["plan_code"],
+                "amount": int(intent["amount"]),
+                "resolution": choice,
+                "evidence_note": note,
+                "lock_key": lock_key,
+                "lock_created_at": lock["created_at"],
+                "new_balance": new_balance,
+            },
+            result_status="success",
+        )
+        return {
+            "status": new_status,
+            "user_id": int(intent["user_id"]),
+            "amount": int(intent["amount"]),
+            "new_balance": new_balance,
+            "lock_key": lock_key,
+        }
+
+
+def refund_user_wallet_and_release_operation_lock(
+    user_id: int,
+    amount: int,
+    description: str,
+    actor_id: int,
+    actor_name: str,
+    lock_key: str,
+    token: str,
+    intent_id: str | None = None,
+) -> int:
+    """Atomically refund a user and consume the exact operation-lock token.
+
+    If the refund or lock resolution fails, the transaction rolls back and the
+    persistent lock remains available for audited reconciliation. Reusing a
+    consumed token cannot issue a second refund.
+    """
+    amount = int(amount)
+    key = str(lock_key or "").strip()
+    lock_token = str(token or "")
+    if amount <= 0:
+        raise ValueError("Refund amount must be a positive integer")
+    if not key or not lock_token:
+        raise ValueError("Operation lock key and token are required")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        if intent_id is not None:
+            intent = _verify_user_action_lock(cur, intent_id, user_id, key, lock_token)
+            if int(intent["amount"]) != amount:
+                raise ValueError("Refund amount does not match the consumed user action intent")
+        else:
+            lock = cur.execute(
+                "SELECT token FROM operation_locks WHERE lock_key = ?",
+                (key,),
+            ).fetchone()
+            if not lock or not secrets.compare_digest(str(lock["token"]), lock_token):
+                raise ValueError("Operation lock ownership mismatch; refund was not applied")
+
+        new_balance = _credit_user_wallet(
+            cur, user_id, amount, description, actor_id, actor_name
+        )
+        cur.execute(
+            "DELETE FROM operation_locks WHERE lock_key = ? AND token = ?",
+            (key, lock_token),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not atomically resolve the owned operation lock")
+        if intent_id is not None:
+            cur.execute("""
+                UPDATE user_action_intents
+                SET status = 'refunded', operation_lock_key = NULL,
+                    operation_lock_token = NULL, result_note = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE intent_id = ? AND user_id = ? AND status = 'processing'
+            """, (
+                str(description or "Refunded after definite external failure")[:500],
+                str(intent_id), int(user_id)
+            ))
+            if cur.rowcount != 1:
+                raise RuntimeError("Could not finalize refunded user action intent")
+        return new_balance
+def deduct_user_wallet(user_id: int, amount: int, description: str, plan_code: str = "", account_code: str = "", email: str = "") -> tuple[bool, int]:
+    """Atomically debit a positive amount; return (success, resulting balance)."""
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("Wallet debit amount must be a positive integer")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
+        current = int(row["balance_toman"] or 0) if row else 0
+        if current < amount:
+            return False, current
+        new_balance = current - amount
+        cur.execute("""
+            UPDATE user_wallets SET balance_toman = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND balance_toman >= ?
+        """, (new_balance, user_id, amount))
+        if cur.rowcount != 1:
+            return False, current
+        cur.execute("""
+            INSERT INTO financial_ledger
+            (rep_id, user_id, account_code, email, plan_code, transaction_type, amount, balance_after, description, actor_id, actor_name)
+            VALUES (NULL, ?, ?, ?, ?, 'debit', ?, ?, ?, ?, 'User')
+        """, (user_id, account_code, email, plan_code, amount, new_balance, description, user_id))
+        return True, new_balance
+def create_payment_receipt(user_id: int, role: str, amount_toman: int, rep_id: int | None = None, photo_id: str | None = None, note: str | None = None) -> str:
+    """Create a receipt and return the one canonical persisted tracking code."""
+    amount_toman = int(amount_toman)
+    if amount_toman <= 0:
+        raise ValueError("Receipt amount must be a positive integer")
+    if role not in ("rep", "end_user"):
+        raise ValueError("Invalid receipt role")
+    if role == "rep" and rep_id is None:
+        raise ValueError("Representative receipt requires a representative ID")
+    with get_db() as conn:
+        cur = conn.cursor()
+        for _ in range(8):
+            code = f"RCP-{secrets.randbelow(100_000_000):08d}"
+            try:
+                cur.execute("""
+                    INSERT INTO payment_receipts
+                    (tracking_code, user_id, role, rep_id, amount_toman, receipt_photo_id, receipt_note, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                """, (code, user_id, role, rep_id, amount_toman, photo_id, note))
+                return code
+            except sqlite3.IntegrityError:
+                continue
+        raise RuntimeError("Could not allocate a unique payment receipt tracking code")
+
+def _insert_receipt_notification_outbox_cur(
+    cur, receipt_id: int, recipient_chat_id=None, recipient_thread_id=None,
+    sender_name: str = "", sender_username: str = ""
+):
+    """Insert the single canonical admin notification row for a submitted receipt."""
+    cur.execute("""
+        INSERT OR IGNORE INTO receipt_notification_outbox
+        (receipt_id, recipient_chat_id, recipient_thread_id, sender_name, sender_username,
+         status, attempts, next_attempt_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', 0, 0)
+    """, (
+        int(receipt_id),
+        int(recipient_chat_id) if recipient_chat_id else None,
+        int(recipient_thread_id) if recipient_thread_id else None,
+        str(sender_name or "")[:200],
+        str(sender_username or "")[:100],
+    ))
+    row = cur.execute(
+        "SELECT * FROM receipt_notification_outbox WHERE receipt_id = ?",
+        (int(receipt_id),)
+    ).fetchone()
+    if not row:
+        raise RuntimeError("Receipt notification outbox row was not persisted")
+    return dict(row)
+
+
+def submit_payment_receipt(
+    user_id: int,
+    role: str,
+    amount_toman: int,
+    photo_id: str,
+    rep_id: int | None = None,
+    receipt_id_or_code=None,
+    note: str | None = None,
+    recipient_chat_id=None,
+    recipient_thread_id=None,
+    sender_name: str = "",
+    sender_username: str = "",
+) -> dict:
+    """Persist a submitted receipt and its admin notification in one SQLite transaction.
+
+    The existing FSM receipt is attached to its photo atomically with its outbox row.
+    A direct-photo submission creates both rows atomically. Replays with the same
+    Telegram file_id are idempotent; a different photo cannot silently replace a
+    receipt that has already been submitted.
+    """
+    user_id = int(user_id)
+    amount_toman = int(amount_toman)
+    role = str(role or "").strip()
+    photo_id = str(photo_id or "").strip()
+    if amount_toman <= 0:
+        raise ValueError("Receipt amount must be a positive integer")
+    if role not in ("rep", "end_user"):
+        raise ValueError("Invalid receipt role")
+    if role == "rep" and rep_id is None:
+        raise ValueError("Representative receipt requires a representative ID")
+    if not photo_id:
+        raise ValueError("A Telegram receipt photo file_id is required")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+
+        if receipt_id_or_code is None:
+            receipt_id = None
+            for _ in range(8):
+                code = f"RCP-{secrets.randbelow(100_000_000):08d}"
+                try:
+                    cur.execute("""
+                        INSERT INTO payment_receipts
+                        (tracking_code, user_id, role, rep_id, amount_toman,
+                         receipt_photo_id, receipt_note, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                    """, (code, user_id, role, rep_id, amount_toman, photo_id, note))
+                    receipt_id = cur.lastrowid
+                    break
+                except sqlite3.IntegrityError:
+                    continue
+            if receipt_id is None:
+                raise RuntimeError("Could not allocate a unique payment receipt tracking code")
+        else:
+            if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+                row = cur.execute(
+                    "SELECT * FROM payment_receipts WHERE id = ?",
+                    (int(receipt_id_or_code),)
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT * FROM payment_receipts WHERE tracking_code = ?",
+                    (str(receipt_id_or_code),)
+                ).fetchone()
+            if not row:
+                raise ValueError("Receipt not found")
+            existing = dict(row)
+            if int(existing["user_id"]) != user_id:
+                raise PermissionError("Receipt does not belong to this user")
+            if existing["role"] != role:
+                raise PermissionError("Receipt role does not match the active user role")
+            if role == "rep" and int(existing.get("rep_id") or -1) != int(rep_id):
+                raise PermissionError("Receipt does not belong to this representative")
+            if existing["status"] != "pending":
+                raise ValueError("Receipt is no longer pending")
+            existing_photo = existing.get("receipt_photo_id")
+            if existing_photo and str(existing_photo) != photo_id:
+                raise ValueError("A different photo is already attached to this receipt")
+            receipt_id = int(existing["id"])
+            if not existing_photo:
+                cur.execute("""
+                    UPDATE payment_receipts
+                    SET receipt_photo_id = ?, receipt_note = ?,
+                        amount_toman = CASE WHEN amount_toman = 0 THEN ? ELSE amount_toman END
+                    WHERE id = ? AND user_id = ? AND status = 'pending'
+                      AND receipt_photo_id IS NULL
+                """, (photo_id, note, amount_toman, receipt_id, user_id))
+                if cur.rowcount != 1:
+                    raise RuntimeError("Receipt changed while attaching its submitted photo")
+
+        stored = cur.execute(
+            "SELECT * FROM payment_receipts WHERE id = ?", (receipt_id,)
+        ).fetchone()
+        if not stored or stored["status"] != "pending" or not stored["receipt_photo_id"]:
+            raise RuntimeError("Submitted receipt could not be verified after persistence")
+
+        _insert_receipt_notification_outbox_cur(
+            cur,
+            receipt_id=receipt_id,
+            recipient_chat_id=recipient_chat_id,
+            recipient_thread_id=recipient_thread_id,
+            sender_name=sender_name,
+            sender_username=sender_username,
+        )
+        return dict(stored)
+
+
+def get_receipt_notification_outbox(receipt_id: int) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM receipt_notification_outbox WHERE receipt_id = ?",
+            (int(receipt_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def claim_next_receipt_notification(now: float | None = None, lease_seconds: int = 120) -> dict | None:
+    """Claim one due notification under an immediate transaction and a finite lease."""
+    now = time.time() if now is None else float(now)
+    lease_seconds = max(30, int(lease_seconds))
+    token = uuid.uuid4().hex
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        # Do not send stale review notifications after a receipt was already settled.
+        cur.execute("""
+            UPDATE receipt_notification_outbox
+            SET status = 'superseded', lease_token = NULL, lease_until = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'pending'
+              AND EXISTS (
+                  SELECT 1 FROM payment_receipts r
+                  WHERE r.id = receipt_notification_outbox.receipt_id
+                    AND r.status != 'pending'
+              )
+        """)
+        row = cur.execute("""
+            SELECT id
+            FROM receipt_notification_outbox
+            WHERE status = 'pending'
+              AND next_attempt_at <= ?
+              AND (lease_until IS NULL OR lease_until <= ?)
+            ORDER BY next_attempt_at ASC, id ASC
+            LIMIT 1
+        """, (now, now)).fetchone()
+        if not row:
+            return None
+        notification_id = int(row["id"])
+        cur.execute("""
+            UPDATE receipt_notification_outbox
+            SET attempts = attempts + 1, lease_token = ?, lease_until = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+              AND (lease_until IS NULL OR lease_until <= ?)
+        """, (token, now + lease_seconds, notification_id, now))
+        if cur.rowcount != 1:
+            return None
+        item = cur.execute("""
+            SELECT
+                n.id AS notification_id,
+                n.receipt_id,
+                n.recipient_chat_id,
+                n.recipient_thread_id,
+                n.sender_name,
+                n.sender_username,
+                n.attempts,
+                n.lease_token,
+                r.tracking_code,
+                r.user_id,
+                r.role,
+                r.rep_id,
+                r.amount_toman,
+                r.receipt_photo_id,
+                r.receipt_note,
+                r.created_at
+            FROM receipt_notification_outbox n
+            JOIN payment_receipts r ON r.id = n.receipt_id
+            WHERE n.id = ?
+        """, (notification_id,)).fetchone()
+        return dict(item) if item else None
+
+
+def mark_receipt_notification_sent(
+    notification_id: int, lease_token: str, delivery_method: str
+) -> bool:
+    if delivery_method not in ("photo", "text_fallback"):
+        raise ValueError("Unsupported receipt notification delivery method")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE receipt_notification_outbox
+            SET status = 'sent', delivery_method = ?, delivered_at = CURRENT_TIMESTAMP,
+                last_error = NULL, lease_token = NULL, lease_until = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending' AND lease_token = ?
+        """, (delivery_method, int(notification_id), str(lease_token)))
+        return cur.rowcount == 1
+
+
+def retry_receipt_notification(
+    notification_id: int, lease_token: str, error: str, now: float | None = None
+) -> bool:
+    """Release a failed claim and persist capped exponential retry backoff."""
+    now = time.time() if now is None else float(now)
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute("""
+            SELECT attempts FROM receipt_notification_outbox
+            WHERE id = ? AND status = 'pending' AND lease_token = ?
+        """, (int(notification_id), str(lease_token))).fetchone()
+        if not row:
+            return False
+        attempts = max(1, int(row["attempts"] or 1))
+        delay = min(60 * (2 ** min(attempts - 1, 6)), 3600)
+        cur.execute("""
+            UPDATE receipt_notification_outbox
+            SET next_attempt_at = ?, last_error = ?,
+                lease_token = NULL, lease_until = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending' AND lease_token = ?
+        """, (
+            now + delay, str(error or "unknown delivery failure")[:1000],
+            int(notification_id), str(lease_token)
+        ))
+        return cur.rowcount == 1
+
 
 def get_payment_receipt(receipt_id_or_code):
     with get_db() as conn:
@@ -1184,59 +3595,110 @@ def get_pending_payment_receipts():
         return [dict(r) for r in rows]
 
 def approve_payment_receipt(receipt_id_or_code, admin_tg_id: int, admin_name: str = "Admin") -> dict:
-    rcp = get_payment_receipt(receipt_id_or_code)
-    if not rcp:
-        raise ValueError("Receipt not found")
-    if rcp["status"] != "pending":
-        return rcp
-
+    """Approve a receipt and apply the associated credit exactly once, atomically."""
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+            row = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (int(receipt_id_or_code),)).fetchone()
+        else:
+            row = cur.execute("SELECT * FROM payment_receipts WHERE tracking_code = ?", (str(receipt_id_or_code),)).fetchone()
+        if not row:
+            raise ValueError("Receipt not found")
+        receipt = dict(row)
+        if receipt["status"] != "pending":
+            return receipt
+
         cur.execute("""
-        UPDATE payment_receipts
-        SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND status = 'pending'
-        """, (admin_tg_id, rcp["id"]))
-        if cur.rowcount == 0:
-            return get_payment_receipt(rcp["id"])
-        conn.commit()
+            UPDATE payment_receipts
+            SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+        """, (admin_tg_id, receipt["id"]))
+        if cur.rowcount != 1:
+            latest = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt["id"],)).fetchone()
+            return dict(latest) if latest else receipt
 
-    if rcp["role"] == "rep" and rcp.get("rep_id"):
-        record_payment(
-            rep_id=rcp["rep_id"],
-            amount=rcp["amount_toman"],
-            description=f"تسویه فیش کارت‌به‌کارت {rcp['tracking_code']}",
-            actor_id=admin_tg_id,
-            actor_name=admin_name
-        )
-    else:
-        record_user_payment(
-            user_id=rcp["user_id"],
-            amount=rcp["amount_toman"],
-            description=f"شارژ کیف پول با فیش {rcp['tracking_code']}",
-            actor_id=admin_tg_id,
-            actor_name=admin_name
-        )
+        amount = int(receipt["amount_toman"])
+        if amount <= 0:
+            raise ValueError("Receipt has an invalid amount")
+        if receipt["role"] == "rep":
+            if receipt.get("rep_id") is None:
+                raise ValueError("Representative receipt has no representative account")
+            _record_rep_ledger_entry(
+                cur, receipt["rep_id"], "", "", "",
+                "credit", amount, f"تسویه فیش کارت‌به‌کارت {receipt['tracking_code']}",
+                admin_tg_id, admin_name
+            )
+        elif receipt["role"] == "end_user":
+            _credit_user_wallet(
+                cur, receipt["user_id"], amount,
+                f"شارژ کیف پول با فیش {receipt['tracking_code']}",
+                admin_tg_id, admin_name
+            )
+        else:
+            raise ValueError("Receipt role is invalid")
 
-    return get_payment_receipt(rcp["id"])
+        updated = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt["id"],)).fetchone()
+        return dict(updated)
+def cancel_payment_receipt(receipt_id_or_code, user_id: int) -> dict:
+    """Cancel an unsubmitted pending receipt owned by this user, without ledger effects."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+            row = cur.execute(
+                "SELECT * FROM payment_receipts WHERE id = ?", (int(receipt_id_or_code),)
+            ).fetchone()
+        else:
+            row = cur.execute(
+                "SELECT * FROM payment_receipts WHERE tracking_code = ?", (str(receipt_id_or_code),)
+            ).fetchone()
+        if not row:
+            raise ValueError("Receipt not found")
+        receipt = dict(row)
+        if int(receipt["user_id"]) != int(user_id):
+            raise PermissionError("Receipt does not belong to this user")
+
+        # Replays by the original owner are read-only and idempotent.
+        if receipt["status"] == "cancelled" and int(receipt.get("cancelled_by") or -1) == int(user_id):
+            return receipt
+
+        # Only an unreviewed receipt without an uploaded photo can be cancelled.
+        # Once a photo is attached, the receipt must remain available for admin review.
+        if receipt["status"] != "pending" or receipt.get("receipt_photo_id"):
+            return receipt
+
+        cur.execute("""
+            UPDATE payment_receipts
+            SET status = 'cancelled', cancelled_by = ?, cancelled_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND user_id = ? AND status = 'pending' AND receipt_photo_id IS NULL
+        """, (int(user_id), receipt["id"], int(user_id)))
+        latest = cur.execute(
+            "SELECT * FROM payment_receipts WHERE id = ?", (receipt["id"],)
+        ).fetchone()
+        return dict(latest) if latest else receipt
+
 
 def reject_payment_receipt(receipt_id_or_code, admin_tg_id: int, reason: str = "عدم تطابق با گردش حساب") -> dict:
-    rcp = get_payment_receipt(receipt_id_or_code)
-    if not rcp:
-        raise ValueError("Receipt not found")
-    if rcp["status"] != "pending":
-        return rcp
-
+    """Reject a pending receipt once; repeated callbacks are read-only."""
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+            row = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (int(receipt_id_or_code),)).fetchone()
+        else:
+            row = cur.execute("SELECT * FROM payment_receipts WHERE tracking_code = ?", (str(receipt_id_or_code),)).fetchone()
+        if not row:
+            raise ValueError("Receipt not found")
+        if row["status"] != "pending":
+            return dict(row)
         cur.execute("""
-        UPDATE payment_receipts
-        SET status = 'rejected', rejection_reason = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND status = 'pending'
-        """, (reason, admin_tg_id, rcp["id"]))
-        conn.commit()
-    return get_payment_receipt(rcp["id"])
-
+            UPDATE payment_receipts
+            SET status = 'rejected', rejection_reason = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+        """, (reason, admin_tg_id, row["id"]))
+        latest = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (row["id"],)).fetchone()
+        return dict(latest) if latest else dict(row)
 def get_rep_credit_limit(rep_id: int) -> int:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1244,11 +3706,14 @@ def get_rep_credit_limit(rep_id: int) -> int:
         return row["credit_limit_toman"] if row and row["credit_limit_toman"] is not None else 5000000
 
 def update_rep_credit_limit(rep_id: int, credit_limit: int):
+    credit_limit = int(credit_limit)
+    if credit_limit < 0:
+        raise ValueError("Credit limit cannot be negative; use 0 for unlimited")
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE representatives SET credit_limit_toman = ? WHERE id = ?", (credit_limit, rep_id))
-        conn.commit()
-
+        if cur.rowcount != 1:
+            raise ValueError("Representative not found")
 def check_rep_credit_limit(rep_id: int, pending_charge: int) -> tuple[bool, int, int]:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1299,6 +3764,32 @@ def toggle_user_block(user_id: int) -> int:
         conn.commit()
         return new_val
 
+def set_user_block_status(
+    user_id: int, is_blocked: bool, actor_id: int = 0, actor_name: str = "Admin"
+) -> int:
+    """Set an explicit user access state; replaying the same callback is harmless."""
+    user_id = int(user_id)
+    if user_id <= 0:
+        raise ValueError("Telegram user ID must be positive")
+    value = 1 if bool(is_blocked) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("""
+            INSERT INTO bot_users (telegram_id, is_blocked)
+            VALUES (?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET is_blocked = excluded.is_blocked
+        """, (user_id, value))
+        _insert_audit(
+            cur, None, "", "", "set_user_block_status", int(actor_id),
+            str(actor_name or "Admin"),
+            {"telegram_id": user_id, "is_blocked": bool(value)},
+            "success",
+        )
+        return value
+
+
+
 def get_bot_user_by_tg_id(user_id: int) -> dict | None:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1346,56 +3837,95 @@ def search_bot_users(query: str) -> list:
         return [dict(r) for r in rows]
 
 def update_user_wallet_manual(user_id: int, delta_amount: int, description: str, actor_id: int, actor_name: str = "Admin") -> int:
+    """Apply a manual wallet adjustment without permitting an accidental negative balance."""
+    delta_amount = int(delta_amount)
+    if delta_amount == 0:
+        raise ValueError("Adjustment amount must not be zero")
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("""
-        INSERT INTO user_wallets (user_id, balance_toman, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET
-            balance_toman = user_wallets.balance_toman + excluded.balance_toman,
-            updated_at = CURRENT_TIMESTAMP
-        """, (user_id, delta_amount))
-        
+        cur.execute("BEGIN IMMEDIATE")
         row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
-        new_balance = row["balance_toman"] if row else delta_amount
-        tx_type = "credit" if delta_amount >= 0 else "debit"
-
+        current = int(row["balance_toman"] or 0) if row else 0
+        new_balance = current + delta_amount
+        if new_balance < 0:
+            raise ValueError("Insufficient wallet balance for this deduction")
         cur.execute("""
-        INSERT INTO financial_ledger (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
-        VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO user_wallets (user_id, balance_toman, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                balance_toman = excluded.balance_toman, updated_at = CURRENT_TIMESTAMP
+        """, (user_id, new_balance))
+        tx_type = "credit" if delta_amount > 0 else "debit"
+        cur.execute("""
+            INSERT INTO financial_ledger
+            (rep_id, user_id, transaction_type, amount, balance_after, description, actor_id, actor_name)
+            VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
         """, (user_id, tx_type, abs(delta_amount), new_balance, description, actor_id, actor_name))
-        conn.commit()
         return new_balance
-
-def unlink_account_owner(account_code_or_email: str) -> bool:
+def unlink_account_owner(account_code_or_email: str, user_tg_id: int | None = None) -> bool:
+    """Unlink an exact account; when user_tg_id is supplied, only its owner may unlink it."""
+    identifier = str(account_code_or_email or "").strip().lower()
+    if not identifier:
+        return False
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("""
-        UPDATE accounts SET owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP
-        WHERE LOWER(account_code) = ? OR LOWER(email) = ? OR LOWER(email) LIKE ?
-        """, (account_code_or_email.lower(), account_code_or_email.lower(), f"%{account_code_or_email.lower()}%"))
-        conn.commit()
+        sql = """
+            UPDATE accounts SET owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE (LOWER(account_code) = ? OR LOWER(email) = ?)
+        """
+        params = [identifier, identifier]
+        if user_tg_id is not None:
+            sql += " AND owner_tg_id = ?"
+            params.append(int(user_tg_id))
+        cur.execute(sql, tuple(params))
         return cur.rowcount > 0
-
 def change_user_tg_id(old_tg_id: int, new_tg_id: int) -> bool:
+    old_tg_id, new_tg_id = int(old_tg_id), int(new_tg_id)
+    if old_tg_id <= 0 or new_tg_id <= 0:
+        raise ValueError("Telegram IDs must be positive")
+    if old_tg_id == new_tg_id:
+        return True
     with get_db() as conn:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        existing = cur.execute(
+            "SELECT 1 FROM bot_users WHERE telegram_id = ?", (new_tg_id,)
+        ).fetchone()
+        wallet_exists = cur.execute(
+            "SELECT 1 FROM user_wallets WHERE user_id = ?", (new_tg_id,)
+        ).fetchone()
+        settings_exists = cur.execute(
+            "SELECT 1 FROM user_settings WHERE user_id = ?", (new_tg_id,)
+        ).fetchone()
+        owned_exists = cur.execute(
+            "SELECT 1 FROM accounts WHERE owner_tg_id = ? LIMIT 1", (new_tg_id,)
+        ).fetchone()
+        if existing or wallet_exists or settings_exists or owned_exists:
+            raise ValueError("The new Telegram ID is already present in the system")
+        changed = cur.execute("SELECT 1 FROM bot_users WHERE telegram_id = ?", (old_tg_id,)).fetchone()
+        if not changed:
+            raise ValueError("Original Telegram user was not found")
         cur.execute("UPDATE bot_users SET telegram_id = ? WHERE telegram_id = ?", (new_tg_id, old_tg_id))
         cur.execute("UPDATE accounts SET owner_tg_id = ? WHERE owner_tg_id = ?", (new_tg_id, old_tg_id))
         cur.execute("UPDATE user_wallets SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
+        cur.execute("UPDATE user_settings SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
         cur.execute("UPDATE financial_ledger SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
         cur.execute("UPDATE payment_receipts SET user_id = ? WHERE user_id = ?", (new_tg_id, old_tg_id))
-        conn.commit()
         return True
-
 def delete_bot_user(tg_id: int) -> bool:
+    """Remove portal profile and links while retaining financial history and wallet records."""
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE accounts SET owner_tg_id = NULL WHERE owner_tg_id = ?", (tg_id,))
+        cur.execute("BEGIN IMMEDIATE")
+        exists = cur.execute("SELECT 1 FROM bot_users WHERE telegram_id = ?", (tg_id,)).fetchone()
+        if not exists:
+            return False
+        cur.execute(
+            "UPDATE accounts SET owner_tg_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE owner_tg_id = ?",
+            (tg_id,)
+        )
         cur.execute("DELETE FROM bot_users WHERE telegram_id = ?", (tg_id,))
-        conn.commit()
-        return True
-
+        return cur.rowcount == 1
 def toggle_rep_active(rep_id: int) -> int:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1405,14 +3935,38 @@ def toggle_rep_active(rep_id: int) -> int:
         conn.commit()
         return new_val
 
-def delete_rep(rep_id: int) -> bool:
+def set_rep_active_status(
+    rep_id: int, is_active: bool, actor_id: int = 0, actor_name: str = "Admin"
+) -> int:
+    """Set a representative active state explicitly and audit the desired value."""
+    value = 1 if bool(is_active) else 0
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE accounts SET rep_id = NULL WHERE rep_id = ?", (rep_id,))
-        cur.execute("DELETE FROM representatives WHERE id = ?", (rep_id,))
-        conn.commit()
-        return True
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE representatives SET is_active = ? WHERE id = ?",
+            (value, int(rep_id))
+        )
+        if cur.rowcount != 1:
+            raise ValueError("Representative not found")
+        _insert_audit(
+            cur, int(rep_id), "", "", "set_rep_active_status", int(actor_id),
+            str(actor_name or "Admin"), {"is_active": bool(value)}, "success"
+        )
+        return value
 
+
+
+def delete_rep(rep_id: int) -> bool:
+    """Archive a representative instead of destroying financial/audit references."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE representatives SET is_active = 0 WHERE id = ?",
+            (rep_id,)
+        )
+        return cur.rowcount == 1
 def update_rep_full(rep_id: int, name: str, rep_code: str, telegram_id: int, group_id: int, topic_id: int, scope_filter: str):
     with get_db() as conn:
         cur = conn.cursor()
@@ -1432,7 +3986,39 @@ def toggle_plan_quick(plan_code: str) -> int:
         conn.commit()
         return new_val
 
+def set_plan_quick_status(
+    plan_code: str, is_quick: bool, actor_id: int = 0, actor_name: str = "Admin"
+) -> int:
+    """Set a plan's quick-display state to an explicit value; callback replay is idempotent."""
+    value = 1 if bool(is_quick) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE pricing_plans SET is_quick = ? WHERE plan_code = ?",
+            (value, str(plan_code))
+        )
+        if cur.rowcount != 1:
+            raise ValueError("Plan not found")
+        _insert_audit(
+            cur, None, "", "", "set_plan_quick_status", int(actor_id),
+            str(actor_name or "Admin"),
+            {"plan_code": str(plan_code), "is_quick": bool(value)},
+            "success",
+        )
+        return value
+
+
+
 def update_plan_specs(plan_code: str, name: str, gb: float, days: int, rep_price: int = None, user_price: int = None):
+    name = str(name or "").strip()
+    gb, days = float(gb), int(days)
+    if not name or gb <= 0 or days <= 0:
+        raise ValueError("Plan name, volume and duration must be positive")
+    if rep_price is not None and int(rep_price) <= 0:
+        raise ValueError("Representative price must be positive")
+    if user_price is not None and int(user_price) <= 0:
+        raise ValueError("User price must be positive")
     with get_db() as conn:
         cur = conn.cursor()
         if rep_price is not None and user_price is not None:
@@ -1440,17 +4026,19 @@ def update_plan_specs(plan_code: str, name: str, gb: float, days: int, rep_price
             UPDATE pricing_plans
             SET name = ?, gb = ?, days = ?, rep_price = ?, user_price = ?
             WHERE plan_code = ?
-            """, (name, gb, days, rep_price, user_price, plan_code))
+            """, (name, gb, days, int(rep_price), int(user_price), plan_code))
         else:
             cur.execute("""
             UPDATE pricing_plans
             SET name = ?, gb = ?, days = ?
             WHERE plan_code = ?
             """, (name, gb, days, plan_code))
-        conn.commit()
-
+        if cur.rowcount != 1:
+            raise ValueError("Plan not found")
 def get_rep_accounts_paginated(rep_id: int, filter_type: str = 'all', page: int = 1, page_size: int = 10) -> tuple[list, int, int]:
     import time
+    page_size = max(1, min(int(page_size), 100))
+    page = max(1, int(page))
     now_ms = int(time.time() * 1000)
     with get_db() as conn:
         cur = conn.cursor()
@@ -1466,19 +4054,17 @@ def get_rep_accounts_paginated(rep_id: int, filter_type: str = 'all', page: int 
         elif filter_type == "reserved":
             base_where += " AND account_code IN (SELECT account_code FROM reserved_packages WHERE status = 'pending')"
 
-        total = cur.execute(f"SELECT COUNT(*) FROM accounts WHERE {base_where}", tuple(params)).fetchone()[0]
+        total = cur.execute(
+            f"SELECT COUNT(*) FROM accounts WHERE {base_where}", tuple(params)
+        ).fetchone()[0]
         total_pages = max(1, (total + page_size - 1) // page_size)
-        page = min(max(1, page), total_pages)
+        page = min(page, total_pages)
         offset = (page - 1) * page_size
-
-        rows = cur.execute(f"""
-        SELECT * FROM accounts
-        WHERE {base_where}
-        ORDER BY updated_at DESC
-        LIMIT ? OFFSET ?
-        """, tuple(params + [page_size, offset])).fetchall()
+        rows = cur.execute(
+            f"SELECT * FROM accounts WHERE {base_where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, offset])
+        ).fetchall()
         return [dict(r) for r in rows], total, total_pages
-
 def get_rep_reservations(rep_id: int) -> list:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1519,6 +4105,34 @@ def get_all_receipts(status: str = None, limit: int = 30) -> list:
         else:
             rows = cur.execute("SELECT * FROM payment_receipts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_receipts_paginated(status: str | None = None, page: int = 1, page_size: int = 10) -> tuple[list, int, int]:
+    """Return a stable newest-first receipt page plus total count and page count."""
+    page_size = max(1, min(int(page_size), 100))
+    page = max(1, int(page))
+    allowed_statuses = {None, "pending", "approved", "rejected", "cancelled"}
+    if status not in allowed_statuses:
+        raise ValueError("Unsupported receipt status")
+    with get_db() as conn:
+        cur = conn.cursor()
+        if status is None:
+            total = cur.execute("SELECT COUNT(*) FROM payment_receipts").fetchone()[0]
+            where = ""
+            params = []
+        else:
+            total = cur.execute(
+                "SELECT COUNT(*) FROM payment_receipts WHERE status = ?", (status,)
+            ).fetchone()[0]
+            where = "WHERE status = ?"
+            params = [status]
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        rows = cur.execute(
+            f"SELECT * FROM payment_receipts {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, (page - 1) * page_size]),
+        ).fetchall()
+        return [dict(row) for row in rows], int(total), int(total_pages)
 
 if __name__ == "__main__":
     init_db()
