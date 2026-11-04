@@ -311,3 +311,126 @@ def test_t02b_schema_migration_adds_atomic_renewal_link_columns_without_data_los
         assert connection.execute("SELECT COUNT(*) FROM account_renewal_confirmations").fetchone()[0] == 1
     finally:
         connection.close()
+
+
+
+def test_init_db_releases_pending_thread_blocked_outbox_rows_idempotently_without_financial_changes(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "receipt-outbox-thread-migration.sqlite3"
+    monkeypatch.setattr(database, "DB_PATH", str(db_path))
+    database.init_db()
+
+    receipts = {}
+    for user_id in (93001, 93002, 93003, 93004):
+        receipts[user_id] = database.submit_payment_receipt(
+            user_id=user_id,
+            role="end_user",
+            amount_toman=175_000,
+            photo_id=f"migration-photo-{user_id}",
+            recipient_chat_id=-1009300,
+            recipient_thread_id=77,
+        )
+
+    with database.get_db() as conn:
+        conn.execute(
+            "INSERT INTO user_wallets (user_id, balance_toman) VALUES (?, ?)",
+            (93099, 765_432),
+        )
+        conn.execute(
+            """
+            INSERT INTO financial_ledger
+                (rep_id, user_id, transaction_type, amount, balance_after,
+                 description, actor_id, actor_name)
+            VALUES (NULL, ?, 'credit', ?, ?, ?, ?, ?)
+            """,
+            (93099, 765_432, 765_432, "migration baseline", 9000, "test"),
+        )
+
+        for user_id, error, status in (
+            (93001, "BadRequest: Message thread not found", "pending"),
+            (93002, "BadRequest: invalid thread identifier", "pending"),
+            (93003, "network timeout while sending photo", "pending"),
+            (93004, "BadRequest: Message thread not found", "sent"),
+        ):
+            conn.execute(
+                """
+                UPDATE receipt_notification_outbox
+                SET status = ?, recipient_thread_id = 77, next_attempt_at = 987654321,
+                    lease_token = ?, lease_until = 987654999, last_error = ?, attempts = 4
+                WHERE receipt_id = ?
+                """,
+                (status, f"lease-{user_id}", error, receipts[user_id]["id"]),
+            )
+
+    with database.get_db() as conn:
+        wallets_before = [
+            tuple(row) for row in conn.execute(
+                "SELECT user_id, balance_toman FROM user_wallets ORDER BY user_id"
+            ).fetchall()
+        ]
+        ledger_before = [
+            tuple(row) for row in conn.execute(
+                "SELECT id, rep_id, user_id, transaction_type, amount, balance_after, description "
+                "FROM financial_ledger ORDER BY id"
+            ).fetchall()
+        ]
+        receipt_rows_before = conn.execute(
+            "SELECT COUNT(*) FROM payment_receipts"
+        ).fetchone()[0]
+
+    # Running init_db twice proves that the migration is safe to repeat.
+    database.init_db()
+    database.init_db()
+
+    with database.get_db() as conn:
+        recovered = conn.execute(
+            """
+            SELECT status, recipient_thread_id, next_attempt_at, lease_token, lease_until, attempts
+            FROM receipt_notification_outbox WHERE receipt_id = ?
+            """,
+            (receipts[93001]["id"],),
+        ).fetchone()
+        recovered_thread_variant = conn.execute(
+            """
+            SELECT status, recipient_thread_id, next_attempt_at, lease_token, lease_until, attempts
+            FROM receipt_notification_outbox WHERE receipt_id = ?
+            """,
+            (receipts[93002]["id"],),
+        ).fetchone()
+        unrelated = conn.execute(
+            """
+            SELECT status, recipient_thread_id, next_attempt_at, lease_token, lease_until, attempts
+            FROM receipt_notification_outbox WHERE receipt_id = ?
+            """,
+            (receipts[93003]["id"],),
+        ).fetchone()
+        terminal = conn.execute(
+            """
+            SELECT status, recipient_thread_id, next_attempt_at, lease_token, lease_until, attempts
+            FROM receipt_notification_outbox WHERE receipt_id = ?
+            """,
+            (receipts[93004]["id"],),
+        ).fetchone()
+        wallets_after = [
+            tuple(row) for row in conn.execute(
+                "SELECT user_id, balance_toman FROM user_wallets ORDER BY user_id"
+            ).fetchall()
+        ]
+        ledger_after = [
+            tuple(row) for row in conn.execute(
+                "SELECT id, rep_id, user_id, transaction_type, amount, balance_after, description "
+                "FROM financial_ledger ORDER BY id"
+            ).fetchall()
+        ]
+        receipts_after = conn.execute(
+            "SELECT COUNT(*) FROM payment_receipts"
+        ).fetchone()[0]
+
+    assert tuple(recovered) == ("pending", None, 0.0, None, None, 4)
+    assert tuple(recovered_thread_variant) == ("pending", None, 0.0, None, None, 4)
+    assert tuple(unrelated) == ("pending", 77, 987654321.0, "lease-93003", 987654999.0, 4)
+    assert tuple(terminal) == ("sent", 77, 987654321.0, "lease-93004", 987654999.0, 4)
+    assert wallets_after == wallets_before
+    assert ledger_after == ledger_before
+    assert receipts_after == receipt_rows_before

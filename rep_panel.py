@@ -429,7 +429,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer()
 
     # 5. Wallet & Financial View
-    elif action == "wallet":
+    elif action in ("wallet", "finance"):
         summary = database.get_rep_financial_summary(rep["id"])
         credit_limit = database.get_rep_credit_limit(rep["id"])
         limit_text = f"{credit_limit:,} تومان" if credit_limit > 0 else "نامحدود"

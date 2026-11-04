@@ -268,3 +268,124 @@ def test_amount_entry_fsm_rejects_role_changed_after_deposit_start(monkeypatch):
 
     assert message.replies and "نقش" in message.replies[0][0]
     assert context.user_data["fsm_state"] == rep_bot.finance_manager.STATE_AWAITING_RECEIPT_AMOUNT
+
+
+
+@pytest.mark.parametrize(
+    "callback,expected_text",
+    [
+        ("user:wallet", "کیف پول من"),
+        ("user:receipts", "سوابق پرداخت‌ها و فیش‌های واریزی"),
+    ],
+)
+def test_post_receipt_user_navigation_callbacks_open_their_pages(
+    monkeypatch, callback, expected_text
+):
+    update, query, _ = make_update(callback, role="end_user")
+    monkeypatch.setattr(user_portal.database, "is_user_blocked", lambda _uid: False)
+    monkeypatch.setattr(
+        user_portal.database, "get_user_role",
+        lambda *_args, **_kwargs: ("end_user", None),
+    )
+    monkeypatch.setattr(user_portal.database, "get_user_wallet_balance", lambda _uid: 42_000)
+    monkeypatch.setattr(user_portal.database, "get_card_info", lambda: {})
+    monkeypatch.setattr(user_portal.database, "get_user_receipts", lambda *_args, **_kwargs: [])
+
+    asyncio.run(user_portal.handle_user_callbacks(update, SimpleNamespace(user_data={})))
+
+    assert query.edits
+    assert expected_text in query.edits[0][0]
+
+
+@pytest.mark.parametrize(
+    "role,expected_callbacks",
+    [
+        ("rep", [["rep:finance"], ["rep:main"]]),
+        ("end_user", [["user:wallet", "user:receipts"], ["user:main"]]),
+    ],
+)
+def test_handle_photo_success_attaches_role_specific_navigation_keyboard(
+    monkeypatch, role, expected_callbacks
+):
+    user_id = 94001 if role == "rep" else 94002
+    rep = {"id": 94, "name": "Receipt Rep"} if role == "rep" else None
+    update, _query, message = make_update(
+        role=role,
+        user_id=user_id,
+        chat_type="supergroup" if role == "rep" else "private",
+    )
+    message.photo = [SimpleNamespace(file_id=f"photo-{user_id}")]
+    patch_role(monkeypatch, role, rep)
+    monkeypatch.setattr(
+        rep_bot.database, "get_setting",
+        lambda _key, default=0, cast_type=int: 0,
+    )
+    submissions = []
+    monkeypatch.setattr(
+        rep_bot.database, "submit_payment_receipt",
+        lambda **kwargs: (
+            submissions.append(kwargs)
+            or {
+                "id": 501,
+                "tracking_code": "RCP-NAV-TEST",
+                "amount_toman": 500_000,
+            }
+        ),
+    )
+
+    async def no_op_outbox(_bot, limit=10):
+        return {"attempted": 0, "sent": 0}
+
+    monkeypatch.setattr(rep_bot, "process_receipt_notification_outbox", no_op_outbox)
+    context = SimpleNamespace(bot=object(), user_data={
+        "fsm_state": "awaiting_receipt_photo",
+        "active_receipt_code": "RCP-NAV-TEST",
+        "deposit_amount": 500_000,
+        "deposit_role": role,
+    })
+
+    asyncio.run(rep_bot.handle_photo(update, context))
+
+    assert submissions and submissions[0]["role"] == role
+    assert message.replies
+    keyboard = message.replies[0][1]["reply_markup"]
+    callbacks = [
+        [button.callback_data for button in row]
+        for row in keyboard.inline_keyboard
+    ]
+    assert callbacks == expected_callbacks
+    assert "active_receipt_code" not in context.user_data
+    assert "deposit_amount" not in context.user_data
+
+
+@pytest.mark.parametrize(
+    "role,expected_callbacks",
+    [
+        ("rep", [["rep:finance"], ["rep:main"]]),
+        ("end_user", [["user:wallet", "user:receipts"], ["user:main"]]),
+    ],
+)
+def test_handle_photo_rejects_image_document_with_recoverable_role_navigation(
+    monkeypatch, role, expected_callbacks
+):
+    user_id = 94101 if role == "rep" else 94102
+    rep = {"id": 94, "name": "Receipt Rep"} if role == "rep" else None
+    update, _query, message = make_update(
+        role=role,
+        user_id=user_id,
+        chat_type="supergroup" if role == "rep" else "private",
+    )
+    message.photo = []
+    message.document = SimpleNamespace(mime_type="image/png", file_id=f"document-{user_id}")
+    patch_role(monkeypatch, role, rep)
+
+    asyncio.run(rep_bot.handle_photo(update, SimpleNamespace(user_data={})))
+
+    assert message.replies
+    assert "Photo" in message.replies[0][0]
+    keyboard = message.replies[0][1]["reply_markup"]
+    callbacks = [
+        [button.callback_data for button in row]
+        for row in keyboard.inline_keyboard
+    ]
+    assert callbacks == expected_callbacks

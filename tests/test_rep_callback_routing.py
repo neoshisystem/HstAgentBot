@@ -308,3 +308,33 @@ def test_rep_fsm_cannot_be_consumed_under_a_different_rep_context(monkeypatch):
     assert handled is True
     assert "rep_state" not in context.user_data
     assert "نمایندگی دیگری" in message.replies[0][0]
+
+
+
+def test_rep_finance_navigation_alias_opens_wallet_and_receipt_history(monkeypatch):
+    monkeypatch.setattr(
+        rep_panel.database,
+        "get_rep_financial_summary",
+        lambda _rep_id: {
+            "balance_toman": 125_000,
+            "total_debits": 500_000,
+            "total_credits": 375_000,
+            "tx_count": 3,
+        },
+    )
+    monkeypatch.setattr(rep_panel.database, "get_rep_credit_limit", lambda _rep_id: 1_000_000)
+    monkeypatch.setattr(rep_panel.database, "get_recent_ledger_entries", lambda **_kwargs: [])
+
+    update, query = make_callback("rep:finance")
+    asyncio.run(rep_panel.handle_rep_callbacks(update, SimpleNamespace(user_data={}), make_rep()))
+
+    text = query.edits[0][0]
+    keyboard = query.edits[0][1]["reply_markup"]
+    callbacks = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+    assert "کیف پول و تراز مالی" in text
+    assert "rep:receipts_history" in callbacks
+    assert "rep:main" in callbacks

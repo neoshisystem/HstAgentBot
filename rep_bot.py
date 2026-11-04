@@ -1279,8 +1279,28 @@ async def process_account_renewal(
 
 # --- Photo & Receipt Handler ---
 
+def build_receipt_navigation_keyboard(role: str) -> InlineKeyboardMarkup | None:
+    """Build role-scoped navigation buttons for receipt success and recoverable errors."""
+    if role == "rep":
+        buttons = [
+            [InlineKeyboardButton("💰 امور مالی و فیش‌ها", callback_data="rep:finance")],
+            [InlineKeyboardButton("🏠 بازگشت به پیشخوان نماینده", callback_data="rep:main")],
+        ]
+    elif role == "end_user":
+        buttons = [
+            [
+                InlineKeyboardButton("💳 کیف پول و شارژ", callback_data="user:wallet"),
+                InlineKeyboardButton("📜 سوابق فیش‌های من", callback_data="user:receipts"),
+            ],
+            [InlineKeyboardButton("🏠 بازگشت به پورتال", callback_data="user:main")],
+        ]
+    else:
+        return None
+    return InlineKeyboardMarkup(buttons)
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.photo:
+    if not update.message:
         return
 
     user = update.effective_user
@@ -1296,6 +1316,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ ارسال فیش فقط برای نقش کاربر نهایی یا نماینده مجاز است.")
         return
 
+    navigation_keyboard = build_receipt_navigation_keyboard(role)
+    if not update.message.photo:
+        await update.message.reply_text(
+            "⚠️ فرمت تصویر ارسالی برای ثبت فیش پشتیبانی نمی‌شود. لطفاً تصویر را به‌صورت Photo ارسال کنید، نه به‌شکل فایل/Document.",
+            reply_markup=navigation_keyboard,
+        )
+        return
+
     photo_id = update.message.photo[-1].file_id
     caption = (update.message.caption or "").strip()
     tr_code = context.user_data.get("active_receipt_code")
@@ -1303,7 +1331,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dep_role = context.user_data.get("deposit_role") or role
     if dep_role != role:
         await update.message.reply_text(
-            "⛔️ این فرایند ارسال فیش با نقش فعلی شما آغاز نشده است؛ از پنل همان نقش دوباره اقدام کنید."
+            "⛔️ این فرایند ارسال فیش با نقش فعلی شما آغاز نشده است؛ از پنل همان نقش دوباره اقدام کنید.",
+            reply_markup=navigation_keyboard,
         )
         return
     target_rep_id = rep["id"] if role == "rep" else None
@@ -1319,7 +1348,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if amount <= 0:
         await update.message.reply_text(
-            "⚠️ مبلغ فیش مشخص نیست. ابتدا از گزینه ثبت فیش یا دستور /deposit مبلغ را ثبت کنید."
+            "⚠️ مبلغ فیش مشخص نیست. ابتدا از گزینه ثبت فیش یا دستور /deposit مبلغ را ثبت کنید.",
+            reply_markup=navigation_keyboard,
         )
         return
 
@@ -1343,11 +1373,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tr_code = receipt["tracking_code"]
     except PermissionError:
         logger.warning("Rejected receipt submission with mismatched owner/role for user %s", user.id)
-        await update.message.reply_text("⛔️ فیش در انتظار ارسال برای این حساب یافت نشد یا دیگر قابل ویرایش نیست.")
+        await update.message.reply_text(
+            "⛔️ فیش در انتظار ارسال برای این حساب یافت نشد یا دیگر قابل ویرایش نیست.",
+            reply_markup=navigation_keyboard,
+        )
         return
     except Exception:
         logger.exception("Could not persist incoming payment receipt and notification outbox")
-        await update.message.reply_text("❌ ثبت فیش انجام نشد. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+        await update.message.reply_text(
+            "❌ ثبت فیش انجام نشد. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
+            reply_markup=navigation_keyboard,
+        )
         return
 
     for key in ("fsm_state", "active_receipt_code", "deposit_amount", "deposit_role"):
@@ -1359,7 +1395,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• کد پیگیری: `{receipt['tracking_code']}`\n"
         f"• مبلغ واریزی: {amount_disp}\n\n"
         "به محض بررسی و تایید توسط مدیریت، حساب شما شارژ یا تسویه خواهد شد.",
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=navigation_keyboard,
     )
 
     # The durable outbox already exists; this is only the first delivery attempt.
@@ -3012,7 +3049,7 @@ def main():
     app.add_handler(CommandHandler("resolvereservation", resolve_reservation_cmd))
     app.add_handler(CommandHandler("resolveadminrenewal", resolve_admin_renewal_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     

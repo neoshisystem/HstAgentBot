@@ -520,6 +520,18 @@ def init_db():
         if "cancelled_at" not in cols_receipts:
             cur.execute("ALTER TABLE payment_receipts ADD COLUMN cancelled_at TIMESTAMP")
 
+        # Release pending receipt notifications blocked by an invalid Telegram topic/thread.
+        # This migration changes delivery metadata only; it does not touch receipts or financial state.
+        cur.execute("""
+            UPDATE receipt_notification_outbox
+            SET recipient_thread_id = NULL,
+                next_attempt_at = 0,
+                lease_token = NULL,
+                lease_until = NULL
+            WHERE status = 'pending'
+              AND LOWER(COALESCE(last_error, '')) LIKE '%thread%'
+        """)
+
         led_info = cur.execute("PRAGMA table_info(financial_ledger)").fetchall()
         rep_col = next((c for c in led_info if c[1] == "rep_id"), None)
         if rep_col and rep_col[3] == 1:  # notnull is set
