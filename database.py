@@ -175,6 +175,8 @@ def init_db():
             total_gb REAL DEFAULT 0,
             expiry_time INTEGER DEFAULT 0,
             owner_tg_id INTEGER DEFAULT NULL,
+            first_connect_mode INTEGER DEFAULT 0,
+            rollover_enabled INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (rep_id) REFERENCES representatives(id) ON DELETE SET NULL
@@ -488,7 +490,17 @@ def init_db():
         cols_acc = [c[1] for c in cur.execute("PRAGMA table_info(accounts)").fetchall()]
         if "owner_tg_id" not in cols_acc:
             cur.execute("ALTER TABLE accounts ADD COLUMN owner_tg_id INTEGER DEFAULT NULL")
-            
+            cols_acc.append("owner_tg_id")
+        for column_name, column_definition in (
+            ("first_connect_mode", "INTEGER DEFAULT 0"),
+            ("rollover_enabled", "INTEGER DEFAULT 1"),
+        ):
+            if column_name not in cols_acc:
+                cur.execute(
+                    f"ALTER TABLE accounts ADD COLUMN {column_name} {column_definition}"
+                )
+                cols_acc.append(column_name)
+
         cols_rep = [c[1] for c in cur.execute("PRAGMA table_info(representatives)").fetchall()]
         if "balance_toman" not in cols_rep:
             cur.execute("ALTER TABLE representatives ADD COLUMN balance_toman INTEGER DEFAULT 0")
@@ -1449,6 +1461,87 @@ def set_user_first_connect_mode(user_id: int, enabled: bool) -> bool:
             ON CONFLICT(user_id) DO UPDATE SET first_connect_mode = excluded.first_connect_mode
         """, (int(user_id), value))
         return bool(value)
+
+
+def get_account_renewal_modes(
+    account_code: str, fallback_user_id: int | None = None
+) -> dict:
+    """Read renewal policy from the account row, with legacy per-user fallback."""
+    identifier = str(account_code or "").strip()
+    account = None
+    if identifier:
+        with get_db() as conn:
+            account = conn.execute(
+                """
+                SELECT first_connect_mode, rollover_enabled
+                FROM accounts
+                WHERE account_code = ?
+                LIMIT 1
+                """,
+                (identifier,),
+            ).fetchone()
+
+    if account is not None:
+        return {
+            "first_connect_mode": bool(account["first_connect_mode"]),
+            "rollover_enabled": bool(account["rollover_enabled"]),
+        }
+
+    legacy_first_connect = (
+        get_user_first_connect_mode(int(fallback_user_id))
+        if fallback_user_id is not None
+        else False
+    )
+    return {
+        "first_connect_mode": bool(legacy_first_connect),
+        "rollover_enabled": True,
+    }
+
+
+def set_account_first_connect_mode(
+    account_code: str, enabled: bool, actor_id: int | None = None
+) -> bool:
+    """Set the per-account first-connect mode and optionally sync the legacy user setting."""
+    identifier = str(account_code or "").strip()
+    if not identifier:
+        return False
+    value = 1 if bool(enabled) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE accounts
+            SET first_connect_mode = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE account_code = ?
+            """,
+            (value, identifier),
+        )
+        updated = cur.rowcount == 1
+
+    if not updated:
+        return False
+    if actor_id is not None:
+        set_user_first_connect_mode(int(actor_id), bool(value))
+    return True
+
+
+def set_account_rollover_mode(account_code: str, enabled: bool) -> bool:
+    """Set the per-account rollover policy without touching other accounts."""
+    identifier = str(account_code or "").strip()
+    if not identifier:
+        return False
+    value = 1 if bool(enabled) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE accounts
+            SET rollover_enabled = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE account_code = ?
+            """,
+            (value, identifier),
+        )
+        return cur.rowcount == 1
 
 
 def toggle_user_first_connect_mode(user_id: int) -> bool:
