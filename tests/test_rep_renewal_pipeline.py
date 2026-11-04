@@ -454,3 +454,19 @@ def test_rep_renewal_conflicting_xui_signals_are_ambiguous_not_refunded(renewal_
     assert "موفقیت یا شکست قطعی" in message
     assert rows[-1]["status"] == "needs_reconciliation"
     assert locks
+
+
+
+def test_rep_renewal_pipeline_uses_per_account_rollover_policy(renewal_env, monkeypatch):
+    database.set_account_rollover_mode("PIPE-001", False)
+    observed = {}
+
+    def renew_client(*args, **kwargs):
+        observed.update(kwargs)
+        return {"status": "success", "report": "renewed"}
+
+    monkeypatch.setattr(rep_bot, "xui_manager", SimpleNamespace(renew_client=renew_client))
+    ok, _message, _keyboard = run_renewal(renewal_env)
+
+    assert ok is True
+    assert observed["rollover"] is False

@@ -181,6 +181,10 @@ def patch_rep_card_preflight(monkeypatch):
     monkeypatch.setattr(rep_bot.database, "is_account_in_rep_scope", lambda *_: account)
     monkeypatch.setattr(rep_bot.database, "get_user_first_connect_mode", lambda _uid: False)
     monkeypatch.setattr(
+        rep_bot.database, "get_account_renewal_modes",
+        lambda *_: {"first_connect_mode": False, "rollover_enabled": True},
+    )
+    monkeypatch.setattr(
         rep_bot, "xui_manager",
         SimpleNamespace(inspect_client=lambda *_a, **_k: {
             "status": "ok",

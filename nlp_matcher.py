@@ -127,7 +127,7 @@ def detect_intent(text: str) -> tuple[str, dict]:
 
     return "unknown", {}
 
-def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_connect: bool = False, role: str = "rep", pending_res: dict = None) -> InlineKeyboardMarkup:
+def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_connect: bool = False, role: str = "rep", pending_res: dict = None, rollover_enabled: bool = True) -> InlineKeyboardMarkup:
     """
     Dynamic interactive account card:
     - Pending reservation status buttons (if any in queue)
@@ -136,7 +136,8 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
     """
     toggle_conn_text = "🛑 قطع موقت" if is_enabled else "✅ فعال‌سازی مجدد"
     toggle_conn_action = "suspend" if is_enabled else "activate"
-    mode_text = "⏱ شروع: با اولین اتصال" if on_first_connect else "⏱ شروع: استاندارد (رول‌اوور)"
+    mode_text = "⏱ شروع: با اولین اتصال" if on_first_connect else "⏱ شروع: از زمان تمدید"
+    rollover_text = "🔄 رول‌اوور: فعال" if rollover_enabled else "⏹ رول‌اوور: غیرفعال"
     
     keyboard = [
         [
@@ -199,17 +200,30 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
             InlineKeyboardButton(toggle_conn_text, callback_data=f"{toggle_conn_action}:{account_code}"),
             InlineKeyboardButton(mode_text, callback_data=f"set_mode:{account_code}:{0 if on_first_connect else 1}")
         ])
+        keyboard.append([
+            InlineKeyboardButton(
+                rollover_text,
+                callback_data=f"set_rollover:{account_code}:{0 if rollover_enabled else 1}"
+            )
+        ])
     
-    # Fixed Deliverables Row
+    # Two balanced deliverable actions. Legacy deliv_sub remains backend-compatible.
     keyboard.append([
-        InlineKeyboardButton("🔗 لینک ساب", callback_data=f"deliv_sub:{account_code}"),
-        InlineKeyboardButton("📱 QR ساب", callback_data=f"deliv_qr:{account_code}"),
-        InlineKeyboardButton("🔀 QR کانفیگ‌ها", callback_data=f"deliv_conf_qr:{account_code}")
+        InlineKeyboardButton("📱 سابسکریپشن + QR", callback_data=f"deliv_qr:{account_code}"),
+        InlineKeyboardButton("⚡ کانفیگ‌ها + QR", callback_data=f"deliv_cfg:{account_code}")
     ])
     keyboard.append([
         InlineKeyboardButton("🔄 بازنشانی لینک ساب (ابطال قبلی)", callback_data=f"reset_sub:{account_code}")
     ])
-    
+    if role == "super_admin":
+        keyboard.append([
+            InlineKeyboardButton("🏠 بازگشت به پنل مدیریت ادمین", callback_data="admin:main")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton("🏠 بازگشت به پیشخوان نماینده", callback_data="rep:main")
+        ])
+
     return InlineKeyboardMarkup(keyboard)
 
 def build_more_plans_keyboard(account_code: str) -> InlineKeyboardMarkup:
@@ -220,15 +234,14 @@ def build_more_plans_keyboard(account_code: str) -> InlineKeyboardMarkup:
     more_plans = [p for p in all_plans if not p.get("is_quick")]
     
     keyboard = []
-    row = []
     for p in more_plans:
-        row.append(InlineKeyboardButton(f"⚡️ {p['name']}", callback_data=f"qrenew:{account_code}:{p['plan_code']}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-        
+        keyboard.append([
+            InlineKeyboardButton(
+                f"⚡️ {p['name']}",
+                callback_data=f"qrenew:{account_code}:{p['plan_code']}"
+            )
+        ])
+
     keyboard.append([
         InlineKeyboardButton("↩️ بازگشت به منوی اصلی", callback_data=f"main_menu:{account_code}")
     ])

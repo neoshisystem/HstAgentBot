@@ -240,6 +240,10 @@ def test_rep_view_account_uses_canonical_locally_assigned_email(monkeypatch):
     inspected = []
     keyboards = []
     monkeypatch.setattr(rep_panel.database, "is_account_in_rep_scope", lambda *_: owned)
+    monkeypatch.setattr(
+        rep_panel.database, "get_account_renewal_modes",
+        lambda *_: {"first_connect_mode": False, "rollover_enabled": True},
+    )
     monkeypatch.setattr(rep_panel.database, "get_pending_reservation", lambda _code: None)
     monkeypatch.setattr(
         rep_panel, "xui_manager",

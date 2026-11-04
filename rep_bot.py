@@ -64,6 +64,31 @@ def _xui_operation_failed(result) -> bool:
     return classify_xui_result(result) == XUIResult.FAILURE
 
 
+def _build_account_keyboard(
+    account_code: str, *, user_id: int, is_enabled: bool = True,
+    role: str = "rep", pending_res: dict | None = None,
+):
+    """Build an account card using the persisted per-account renewal policies."""
+    modes = database.get_account_renewal_modes(account_code, user_id)
+    return nlp_matcher.build_account_keyboard(
+        account_code,
+        is_enabled=is_enabled,
+        on_first_connect=modes["first_connect_mode"],
+        rollover_enabled=modes["rollover_enabled"],
+        role=role,
+        pending_res=pending_res,
+    )
+
+
+def _can_manage_account_policy(role: str, rep: dict | None, account_code: str) -> bool:
+    """Require account ownership for representatives before changing renewal policy."""
+    if role == "super_admin":
+        return True
+    if role == "rep" and rep:
+        return bool(database.is_account_in_rep_scope(rep["id"], account_code))
+    return False
+
+
 async def safe_edit_message(
     query, text: str, reply_markup=None, parse_mode=ParseMode.MARKDOWN,
     delete_transient_photo: bool = False,
@@ -907,6 +932,9 @@ async def process_account_renewal(
 ):
     account_code = acc_record["account_code"]
     email = acc_record["email"]
+    modes = database.get_account_renewal_modes(account_code, user.id)
+    effective_first = bool(effective_first or modes["first_connect_mode"])
+    rollover_enabled = bool(modes["rollover_enabled"])
     is_super_admin = (role == "super_admin")
     scope_flt = "all" if is_super_admin else (rep["scope_filter"] if rep else "all")
     by_code_only = False if is_super_admin else True
@@ -914,10 +942,9 @@ async def process_account_renewal(
     # Validate the approved pricing snapshot before acquiring even the short anti-spam lock.
     # Invalid/free-form requests must not create operation state or reach X-UI.
     plan = database.get_plan(plan_code)
-    early_keyboard = nlp_matcher.build_account_keyboard(
-        account_code,
+    early_keyboard = _build_account_keyboard(
+        account_code, user_id=user.id,
         is_enabled=bool(client_info.get("enabled", True)),
-        on_first_connect=effective_first,
         role=role,
         pending_res=database.get_pending_reservation(account_code),
     )
@@ -952,7 +979,7 @@ async def process_account_renewal(
     # 1. Anti-spam / duplicate click lock
     if not database.acquire_renewal_lock(account_code, ttl_seconds=lock_ttl):
         pending_res = database.get_pending_reservation(account_code)
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=effective_first, role=role, pending_res=pending_res)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=True, role=role, pending_res=pending_res)
         return False, f"⚠️ **اکانت `{account_code}` چند لحظه پیش پردازش شد.**\nجهت جلوگیری از اعمال تکراری، لطفاً {lock_ttl} ثانیه صبر کنید.", keyboard
 
     # 2. Extract current state
@@ -976,7 +1003,7 @@ async def process_account_renewal(
         allowed, curr_debt, credit_limit = database.check_rep_credit_limit(target_rep_id, charge)
         if not allowed:
             pending_res = database.get_pending_reservation(account_code)
-            keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=effective_first, role=role, pending_res=pending_res)
+            keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=True, role=role, pending_res=pending_res)
             return False, (
                 f"⛔️ **سقف اعتبار مجاز نماینده تکمیل شده است.**\n\n"
                 f"• سقف مجاز: **{credit_limit:,} تومان**\n"
@@ -1017,16 +1044,16 @@ async def process_account_renewal(
                 )
             except ValueError as exc:
                 pending_res = database.get_pending_reservation(account_code)
-                keyboard = nlp_matcher.build_account_keyboard(
-                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                keyboard = _build_account_keyboard(
+                    account_code, user_id=user.id, is_enabled=is_enabled,
                     role=role, pending_res=pending_res
                 )
                 return False, f"⛔️ ثبت مالی تمدید انجام نشد: {exc}", keyboard
 
             if started.get("status") != "started":
                 pending_res = database.get_pending_reservation(account_code)
-                keyboard = nlp_matcher.build_account_keyboard(
-                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                keyboard = _build_account_keyboard(
+                    account_code, user_id=user.id, is_enabled=is_enabled,
                     role=role, pending_res=pending_res
                 )
                 return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
@@ -1053,15 +1080,15 @@ async def process_account_renewal(
                     )
                 except ValueError as exc:
                     pending_res = database.get_pending_reservation(account_code)
-                    keyboard = nlp_matcher.build_account_keyboard(
-                        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    keyboard = _build_account_keyboard(
+                        account_code, user_id=user.id, is_enabled=is_enabled,
                         role=role, pending_res=pending_res
                     )
                     return False, f"⛔️ تأیید تمدید مدیریت کل قابل ثبت نیست: {exc}", keyboard
                 if admin_started.get("status") != "started":
                     pending_res = database.get_pending_reservation(account_code)
-                    keyboard = nlp_matcher.build_account_keyboard(
-                        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    keyboard = _build_account_keyboard(
+                        account_code, user_id=user.id, is_enabled=is_enabled,
                         role=role, pending_res=pending_res
                     )
                     return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
@@ -1072,8 +1099,8 @@ async def process_account_renewal(
                 operation_lock_token = database.acquire_operation_lock(operation_lock_key, ttl_seconds=None)
                 if not operation_lock_token:
                     pending_res = database.get_pending_reservation(account_code)
-                    keyboard = nlp_matcher.build_account_keyboard(
-                        account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                    keyboard = _build_account_keyboard(
+                        account_code, user_id=user.id, is_enabled=is_enabled,
                         role=role, pending_res=pending_res
                     )
                     return False, "⏳ درخواست تمدید قبلی هنوز در حال پردازش یا نیازمند تطبیق است؛ از اجرای دوباره خودداری کنید.", keyboard
@@ -1081,7 +1108,7 @@ async def process_account_renewal(
         try:
             ren_res = await asyncio.to_thread(
                 xui_manager.renew_client,
-                email, gb, days, comment=curr_comment, rollover=True, countdown=countdown_param,
+                email, gb, days, comment=curr_comment, rollover=rollover_enabled, countdown=countdown_param,
                 scope=scope_flt, by_code_only=by_code_only
             )
         except Exception:
@@ -1104,8 +1131,8 @@ async def process_account_renewal(
                 except Exception:
                     logger.exception("Could not mark Super Admin renewal for reconciliation: %s", account_code)
             pending_res = database.get_pending_reservation(account_code)
-            keyboard = nlp_matcher.build_account_keyboard(
-                account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+            keyboard = _build_account_keyboard(
+                account_code, user_id=user.id, is_enabled=is_enabled,
                 role=role, pending_res=pending_res
             )
             return False, (
@@ -1131,8 +1158,8 @@ async def process_account_renewal(
                         except Exception:
                             logger.exception("Could not mark failed refund for reconciliation: %s", account_code)
                         pending_res = database.get_pending_reservation(account_code)
-                        keyboard = nlp_matcher.build_account_keyboard(
-                            account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                        keyboard = _build_account_keyboard(
+                            account_code, user_id=user.id, is_enabled=is_enabled,
                             role=role, pending_res=pending_res
                         )
                         return False, "⚠️ پنل تمدید را رد کرد اما استرداد اتمیک انجام نشد؛ قفل و پیش‌پرداخت برای تطبیق مدیریت حفظ شدند.", keyboard
@@ -1144,8 +1171,8 @@ async def process_account_renewal(
                 else:
                     database.release_operation_lock(operation_lock_key, operation_lock_token)
                 pending_res = database.get_pending_reservation(account_code)
-                keyboard = nlp_matcher.build_account_keyboard(
-                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                keyboard = _build_account_keyboard(
+                    account_code, user_id=user.id, is_enabled=is_enabled,
                     role=role, pending_res=pending_res
                 )
                 return False, (
@@ -1170,8 +1197,8 @@ async def process_account_renewal(
                 except Exception:
                     logger.exception("Could not mark ambiguous Super Admin renewal: %s", account_code)
             pending_res = database.get_pending_reservation(account_code)
-            keyboard = nlp_matcher.build_account_keyboard(
-                account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+            keyboard = _build_account_keyboard(
+                account_code, user_id=user.id, is_enabled=is_enabled,
                 role=role, pending_res=pending_res
             )
             return False, (
@@ -1194,8 +1221,8 @@ async def process_account_renewal(
                 except Exception:
                     logger.exception("Could not mark successful external renewal for reconciliation: %s", account_code)
                 pending_res = database.get_pending_reservation(account_code)
-                keyboard = nlp_matcher.build_account_keyboard(
-                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                keyboard = _build_account_keyboard(
+                    account_code, user_id=user.id, is_enabled=is_enabled,
                     role=role, pending_res=pending_res
                 )
                 return False, "⚠️ پنل تمدید را با موفقیت انجام داد، اما ثبت نهایی محلی کامل نشد؛ قفل برای تطبیق حفظ شد.", keyboard
@@ -1215,8 +1242,8 @@ async def process_account_renewal(
                 except Exception:
                     logger.exception("Could not mark successful Super Admin renewal for reconciliation: %s", account_code)
                 pending_res = database.get_pending_reservation(account_code)
-                keyboard = nlp_matcher.build_account_keyboard(
-                    account_code, is_enabled=is_enabled, on_first_connect=effective_first,
+                keyboard = _build_account_keyboard(
+                    account_code, user_id=user.id, is_enabled=is_enabled,
                     role=role, pending_res=pending_res
                 )
                 return False, "⚠️ پنل تمدید را با موفقیت انجام داد، اما ثبت نهایی محلی کامل نشد؛ قفل برای تطبیق حفظ شد.", keyboard
@@ -1243,7 +1270,7 @@ async def process_account_renewal(
             )
             report_text += f"\n\n💳 **فاکتور تمدید:** `{charge:,} تومان` | **مانده بدهی نماینده:** `{new_bal:,} تومان`"
 
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=effective_first, role=role, pending_res=None)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=True, role=role, pending_res=None)
 
         await asyncio.to_thread(
             send_admin_log,
@@ -1263,7 +1290,7 @@ async def process_account_renewal(
                 f"❌ ثبت رزرو دوم برای یک اکانت امکان‌پذیر نیست.\n"
                 f"می‌توانید با دکمه‌های زیر بسته فعلی را فعال فوری کرده یا آن را لغو و وجه را عودت دهید."
             )
-            keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=effective_first, role=role, pending_res=existing_res)
+            keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_enabled, role=role, pending_res=existing_res)
             return False, warn_text, keyboard
 
         res_rep_id = None if is_admin_exempt else target_rep_id
@@ -1277,7 +1304,7 @@ async def process_account_renewal(
             plan_name=plan_name,
             gb=gb,
             days=days,
-            on_first_connect=1 if effective_first else 0,
+            on_first_connect=effective_first,
             charge_amount=res_charge,
             actor_id=user.id,
             actor_name=user.full_name or user.username,
@@ -1294,7 +1321,7 @@ async def process_account_renewal(
             fin_info = f"• فاکتور رزرو: `{charge:,} تومان` | **مانده بدهی نماینده:** `{new_bal:,} تومان`"
 
         pending_dict = database.get_reservation_by_id(res_id)
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=effective_first, role=role, pending_res=pending_dict)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_enabled, role=role, pending_res=pending_dict)
 
         res_msg = (
             f"📦 **اکانت در حال حاضر فعال است و اعتبار دارد.**\n\n"
@@ -1679,7 +1706,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 deliv_text += f"\n\n💳 **فاکتور صدور:** `{charge:,} تومان` | **مانده بدهی:** `{new_bal:,} تومان`"
 
             database.release_operation_lock(lock_key, lock_token)
-            keyboard = nlp_matcher.build_account_keyboard(code, is_enabled=True, role=role)
+            keyboard = _build_account_keyboard(code, user_id=user.id, is_enabled=True, role=role)
             sub_url = alloc_res.get("sub_url")
             qr_file = None
             if sub_url:
@@ -1852,6 +1879,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             acc_record = database.is_account_in_rep_scope(rep["id"], email)
 
+    # Read persisted per-account policy for message-driven cards and renewals.
+    modes = database.get_account_renewal_modes(account_code, user.id)
+    on_first = modes["first_connect_mode"]
+
     # Customer Name Management (Rule 3)
     new_customer_name = nlp_matcher.clean_customer_name(msg_text) or nlp_matcher.clean_customer_name(reply_text)
     comment_updated = False
@@ -1882,8 +1913,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• **حجم باقیمانده:** **{rem_gb:.2f} گیگابایت** (محفوظ و دست‌نخورده)\n"
                 f"• **اعتبار زمانی باقیمانده:** **{exp_text}**"
             )
-            on_first = database.get_user_first_connect_mode(user.id)
-            keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=False, on_first_connect=on_first, role=role)
+            on_first = modes["first_connect_mode"]
+            keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=False, role=role)
             await update.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             database.log_audit(
                 rep_id=acc_record.get("rep_id"), account_code=account_code, email=email,
@@ -1908,8 +1939,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• **حجم باقیمانده:** **{rem_gb:.2f} گیگابایت**\n"
                 f"• **اعتبار زمانی باقیمانده:** **{exp_text}**"
             )
-            on_first = database.get_user_first_connect_mode(user.id)
-            keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=on_first, role=role)
+            on_first = modes["first_connect_mode"]
+            keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=True, role=role)
             await update.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             database.log_audit(
                 rep_id=acc_record["rep_id"], account_code=account_code, email=email,
@@ -1924,7 +1955,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gb = params.get("gb", 20.0)
         days = params.get("days", 30.0)
         first_connect_req = params.get("first_connect", False)
-        mode_first = database.get_user_first_connect_mode(user.id)
+        mode_first = modes["first_connect_mode"]
         effective_first = first_connect_req or mode_first
         plan_code = f"{int(gb)}gb_{int(days)}d"
 
@@ -1942,9 +1973,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qr_needed = params.get("qr", False)
         conf_qr = params.get("conf_qr", False)
         
-        on_first = database.get_user_first_connect_mode(user.id)
+        on_first = modes["first_connect_mode"]
         pending_res = database.get_pending_reservation(account_code)
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role, pending_res=pending_res)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_enabled, role=role, pending_res=pending_res)
         
         qr_file = None
         if qr_needed:
@@ -1981,8 +2012,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if comment_updated:
             status_text = f"👤 **نام مشتری روی اکانت ثبت شد:** `{curr_comment}`\n\n" + status_text
             
-        on_first = database.get_user_first_connect_mode(user.id)
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role, pending_res=pending_res)
+        on_first = modes["first_connect_mode"]
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_enabled, role=role, pending_res=pending_res)
         await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 # --- Interactive Callback Handler ---
@@ -2373,7 +2404,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Strict End-User Isolation in Callbacks
     if role == "end_user":
-        if action in ("suspend", "activate", "qrenew", "qrenew_confirm", "qrenew_execute", "force_res", "cancel_res", "toggle_mode", "set_mode", "more_plans"):
+        if action in ("suspend", "activate", "qrenew", "qrenew_confirm", "qrenew_execute", "force_res", "cancel_res", "toggle_mode", "set_mode", "set_rollover", "more_plans"):
             await query.answer("⛔️ این عملیات فقط برای نماینده و مدیریت مجاز است.", show_alert=True)
             return
 
@@ -2395,10 +2426,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2. Main Menu return
     if action == "main_menu":
-        on_first = database.get_user_first_connect_mode(user.id)
         acc_rec = database.is_account_in_rep_scope(rep["id"], account_code) if rep else None
         is_en = bool(acc_rec.get("enable", 1)) if acc_rec else True
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_en, on_first_connect=on_first, role=role)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_en, role=role)
         try:
             await query.edit_message_reply_markup(reply_markup=keyboard)
         except BadRequest:
@@ -2414,24 +2444,60 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 3. Explicit renewal mode: replaying this callback preserves the selected value.
+    # 3. Explicit first-connect mode: persist on the account and retain legacy actor sync.
     if action == "set_mode":
         desired_mode = parts[2] if len(parts) > 2 else ""
         if desired_mode not in ("0", "1"):
             await query.answer("⛔️ حالت درخواستی معتبر نیست؛ کارت اکانت را تازه کنید.", show_alert=True)
             return
-        new_mode = database.set_user_first_connect_mode(user.id, desired_mode == "1")
+        if not _can_manage_account_policy(role, rep, account_code):
+            await query.answer("⛔️ این اکانت در محدوده مجاز شما نیست.", show_alert=True)
+            return
+        updated = database.set_account_first_connect_mode(
+            account_code, desired_mode == "1", actor_id=user.id
+        )
+        if not updated:
+            await query.answer("❌ ذخیره حالت شروع برای این اکانت انجام نشد.", show_alert=True)
+            return
         acc_rec = database.is_account_in_rep_scope(rep["id"], account_code) if rep else None
         is_en = bool(acc_rec.get("enable", 1)) if acc_rec else True
-        keyboard = nlp_matcher.build_account_keyboard(
-            account_code, is_enabled=is_en, on_first_connect=new_mode, role=role
+        keyboard = _build_account_keyboard(
+            account_code, user_id=user.id, is_enabled=is_en, role=role
         )
         try:
             await query.edit_message_reply_markup(reply_markup=keyboard)
         except BadRequest:
             pass
-        mode_label = "شروع با اولین اتصال" if new_mode else "استاندارد (رول‌اوور)"
-        await query.answer(f"⚙️ حالت تمدید روی «{mode_label}» تنظیم شد.", show_alert=True)
+        mode_label = "شروع با اولین اتصال" if desired_mode == "1" else "شروع از زمان تمدید"
+        await query.answer(f"⚙️ حالت شروع اکانت روی «{mode_label}» تنظیم شد.", show_alert=True)
+        return
+
+    # 3.1 Independent per-account rollover toggle.
+    if action == "set_rollover":
+        desired_rollover = parts[2] if len(parts) > 2 else ""
+        if desired_rollover not in ("0", "1"):
+            await query.answer("⛔️ وضعیت رول‌اوور معتبر نیست؛ کارت اکانت را تازه کنید.", show_alert=True)
+            return
+        if not _can_manage_account_policy(role, rep, account_code):
+            await query.answer("⛔️ این اکانت در محدوده مجاز شما نیست.", show_alert=True)
+            return
+        updated = database.set_account_rollover_mode(
+            account_code, desired_rollover == "1"
+        )
+        if not updated:
+            await query.answer("❌ ذخیره وضعیت رول‌اوور انجام نشد.", show_alert=True)
+            return
+        acc_rec = database.is_account_in_rep_scope(rep["id"], account_code) if rep else None
+        is_en = bool(acc_rec.get("enable", 1)) if acc_rec else True
+        keyboard = _build_account_keyboard(
+            account_code, user_id=user.id, is_enabled=is_en, role=role
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+        except BadRequest:
+            pass
+        rollover_label = "فعال" if desired_rollover == "1" else "غیرفعال"
+        await query.answer(f"⚙️ رول‌اوور اکانت «{rollover_label}» شد.", show_alert=True)
         return
 
     # Account Verification
@@ -2467,7 +2533,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     account_code = email
     curr_comment = (raw_client.get("comment") or "").strip()
     is_enabled = bool(raw_client.get("enable", True))
-    on_first = database.get_user_first_connect_mode(user.id)
+    modes = database.get_account_renewal_modes(account_code, user.id)
+    on_first = modes["first_connect_mode"]
 
     if not acc_record:
         target_rep_id = rep["id"] if rep else (database.resolve_account_rep_id(email) if is_super_admin else None)
@@ -2494,7 +2561,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"*(فعال‌سازی خودکار پس از اتمام بسته فعلی)*"
             )
         status_text += f"\n\n🔄 *آخرین به‌روزرسانی لحظه‌ای:* `{now_time}`"
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role, pending_res=pending_res)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_enabled, role=role, pending_res=pending_res)
         await safe_edit_message(query, status_text, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("📊 وضعیت لحظه‌ای بروزرسانی شد.")
 
@@ -2517,7 +2584,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• **اعتبار زمانی باقیمانده:** **{exp_text}**"
             )
             pending_res = database.get_pending_reservation(account_code)
-            keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=False, on_first_connect=on_first, role=role, pending_res=pending_res)
+            keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=False, role=role, pending_res=pending_res)
             await safe_edit_message(query, text_out, reply_markup=keyboard, delete_transient_photo=True)
             database.log_audit(
                 rep_id=target_rep_id, account_code=account_code, email=email,
@@ -2546,7 +2613,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• **اعتبار زمانی باقیمانده:** **{exp_text}**"
             )
             pending_res = database.get_pending_reservation(account_code)
-            keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=on_first, role=role, pending_res=pending_res)
+            keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=True, role=role, pending_res=pending_res)
             await safe_edit_message(query, text_out, reply_markup=keyboard, delete_transient_photo=True)
             database.log_audit(
                 rep_id=target_rep_id, account_code=account_code, email=email,
@@ -2699,7 +2766,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         database.release_operation_lock(lock_key, lock_token)
         report_text = ren_res.get("report", "")
         report_text = f"🚀 **بسته رزرو به صورت فوری فعال شد (اعتبار قبلی صفر و دوره جدید آغاز گردید):**\n\n" + report_text
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=True, on_first_connect=on_first_res, role=role, pending_res=None)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=True, role=role, pending_res=None)
         await safe_edit_message(query, report_text, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("🚀 بسته رزرو با موفقیت فعال شد.")
         await asyncio.to_thread(
@@ -2735,7 +2802,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• مبلغ عودت‌داده‌شده: **{res_data['charge_amount']:,} تومان**\n"
             f"{fin_info}"
         )
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role, pending_res=None)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_enabled, role=role, pending_res=None)
         await safe_edit_message(query, msg_out, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("🗑 بسته رزرو لغو و وجه آن عودت داده شد.", show_alert=True)
         await asyncio.to_thread(
@@ -2746,12 +2813,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 8. Subscription Link Only
     elif action == "deliv_sub":
+        await query.answer()
         sub_id = client_info.get("sub_id", "")
         sub_url = xui_manager.get_sub_url(sub_id)
         msg_out = f"🔗 **لینک سابسکریپشن اکانت `{account_code}`:**\n\n`{sub_url}`"
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_enabled, role=role)
         await safe_edit_message(query, msg_out, reply_markup=keyboard, delete_transient_photo=True)
-        await query.answer("🔗 لینک سابسکریپشن واکشی شد.")
 
     # 9. Subscription QR Code
     elif action == "deliv_qr":
@@ -2764,7 +2831,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(xui_manager.generate_qr, sub_url, qr_file)
             except Exception as e:
                 logger.error(f"QR error: {e}")
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_enabled, role=role)
         if qr_file and os.path.exists(qr_file):
             with open(qr_file, "rb") as photo:
                 await chat.send_photo(
@@ -2780,7 +2847,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ خطا در ایجاد کد QR", show_alert=True)
 
     # 10. Configs QR Code
-    elif action == "deliv_conf_qr":
+    elif action in ("deliv_cfg", "deliv_conf_qr"):
         links = await asyncio.to_thread(xui_manager.get_client_links, email)
         if not links:
             await query.answer("❌ کانفیگی برای این اکانت یافت نشد.", show_alert=True)
@@ -2792,7 +2859,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(xui_manager.generate_qr, best_link, qr_file)
         except Exception as e:
             logger.error(f"QR error: {e}")
-        keyboard = nlp_matcher.build_account_keyboard(account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role)
+        keyboard = _build_account_keyboard(account_code, user_id=user.id, is_enabled=is_enabled, role=role)
         if qr_file and os.path.exists(qr_file):
             with open(qr_file, "rb") as photo:
                 await chat.send_photo(
@@ -2877,8 +2944,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ لینک قبلی باطل گردید.\\n\\n"
                 f"🔗 **لینک جدید سابسکریپشن:**\\n`{reset_result['new_sub_url']}`"
             )
-            keyboard = nlp_matcher.build_account_keyboard(
-                account_code, is_enabled=is_enabled, on_first_connect=on_first, role=role
+            keyboard = _build_account_keyboard(
+                account_code, user_id=user.id, is_enabled=is_enabled, role=role
             )
             await safe_edit_message(query, out_text, reply_markup=keyboard, delete_transient_photo=True)
             await query.answer("✅ لینک سابسکریپشن بازنشانی شد.")

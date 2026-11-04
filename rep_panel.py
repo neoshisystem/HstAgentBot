@@ -31,6 +31,17 @@ xui_manager = load_integration("xui_manager")
 logger = logging.getLogger("RepPanel")
 
 
+def _build_account_keyboard(account_code: str, user_id: int, **kwargs):
+    """Build representative account cards from persisted account renewal policies."""
+    modes = database.get_account_renewal_modes(account_code, user_id)
+    return nlp_matcher.build_account_keyboard(
+        account_code,
+        on_first_connect=modes["first_connect_mode"],
+        rollover_enabled=modes["rollover_enabled"],
+        **kwargs,
+    )
+
+
 def build_rep_main_keyboard() -> InlineKeyboardMarkup:
     """Builds the main interactive dashboard for a representative."""
     keyboard = [
@@ -136,17 +147,11 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             "پلن مورد نظر خود را جهت تخصیص انتخاب فرمایید:\n"
         ]
         extra_btns = []
-        row = []
         for p in plans:
-            row.append(InlineKeyboardButton(
+            extra_btns.append([InlineKeyboardButton(
                 f"{p['name']} ({p['rep_price']:,} ت)",
                 callback_data=f"rep:new_plan_chosen:{p['plan_code']}"
-            ))
-            if len(row) == 2:
-                extra_btns.append(row)
-                row = []
-        if row:
-            extra_btns.append(row)
+            )])
 
         keyboard = build_back_to_rep_keyboard(extra_btns)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
@@ -318,8 +323,8 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"\n\n🧾 **فاکتور:** \`{amount:,} تومان\`"
                 f" | **مانده بدهی جدید:** \`{new_bal:,} تومان\`"
             )
-            keyboard = nlp_matcher.build_account_keyboard(
-                code, is_enabled=True, on_first_connect=False, role="rep"
+            keyboard = _build_account_keyboard(
+                code, user.id, is_enabled=True, role="rep"
             )
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
@@ -424,7 +429,7 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             pending_res = database.get_pending_reservation(acc_code)
             if pending_res:
                 report_text += f"\n\n📦 **بسته رزرو:** **{pending_res['plan_name']}** ({pending_res['gb']}G / {pending_res['days']}D)"
-            keyboard = nlp_matcher.build_account_keyboard(acc_code, is_enabled=bool(client_info["raw"].get("enable", True)), role="rep", pending_res=pending_res)
+            keyboard = _build_account_keyboard(acc_code, user.id, is_enabled=bool(client_info["raw"].get("enable", True)), role="rep", pending_res=pending_res)
             await query.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             await query.answer()
         else:
@@ -829,7 +834,7 @@ async def _process_rep_text_input_impl(update: Update, context: ContextTypes.DEF
             acc_code = owned_account["account_code"]
             report_text = xui_manager.format_status_report(client_info, is_admin=False)
             pending_res = database.get_pending_reservation(acc_code)
-            keyboard = nlp_matcher.build_account_keyboard(acc_code, is_enabled=bool(client_info["raw"].get("enable", True)), role="rep", pending_res=pending_res)
+            keyboard = _build_account_keyboard(acc_code, update.effective_user.id, is_enabled=bool(client_info["raw"].get("enable", True)), role="rep", pending_res=pending_res)
             await update.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         else:
             return await _reply_fsm_validation_error(update,context,rep_state,f"اکانت {msg_text} در محدوده نمایندگی شما یافت نشد.")
