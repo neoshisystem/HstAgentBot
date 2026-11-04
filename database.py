@@ -4021,6 +4021,28 @@ def set_plan_quick_status(
         return value
 
 
+def set_plan_active_status(
+    plan_code: str, is_active: bool, actor_id: int = 0, actor_name: str = "Admin"
+) -> int:
+    """Set the active state explicitly; repeated callbacks preserve the same desired state."""
+    value = 1 if bool(is_active) else 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE pricing_plans SET is_active = ? WHERE plan_code = ?",
+            (value, str(plan_code)),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("Plan not found")
+        _insert_audit(
+            cur, None, "", "", "set_plan_active_status", int(actor_id),
+            str(actor_name or "Admin"),
+            {"plan_code": str(plan_code), "is_active": bool(value)},
+            "success",
+        )
+        return value
+
 
 def update_plan_specs(plan_code: str, name: str, gb: float, days: int, rep_price: int = None, user_price: int = None):
     name = str(name or "").strip()

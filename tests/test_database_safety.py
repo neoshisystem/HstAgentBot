@@ -402,3 +402,23 @@ def test_financial_ledger_pagination_preserves_user_and_rep_identity(isolated_db
     assert (rep_total, rep_pages) == (2, 2)
     assert rep_page[0]["rep_id"] == rep_id
     assert rep_page[0]["user_id"] is None
+
+
+
+def test_set_plan_active_status_is_explicit_idempotent_and_audited(isolated_db):
+    database.add_or_update_plan("active_toggle", "Active Toggle", 10, 30, 100, 150)
+
+    assert database.set_plan_active_status("active_toggle", False, actor_id=9000) == 0
+    assert database.get_plan("active_toggle")["is_active"] == 0
+    # Replaying the same desired value is safe and does not turn the plan back on.
+    assert database.set_plan_active_status("active_toggle", False, actor_id=9000) == 0
+    assert database.get_plan("active_toggle")["is_active"] == 0
+    assert database.set_plan_active_status("active_toggle", True, actor_id=9000) == 1
+    assert database.get_plan("active_toggle")["is_active"] == 1
+    assert scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='set_plan_active_status' AND actor_id=?",
+        (9000,),
+    ) == 3
+
+    with pytest.raises(ValueError, match="Plan not found"):
+        database.set_plan_active_status("missing-plan", False, actor_id=9000)

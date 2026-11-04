@@ -177,7 +177,7 @@ def test_reservation_execution_rejects_stale_account_binding(monkeypatch):
 def test_all_admin_prompt_callbacks_have_a_matching_text_fsm_consumer():
     import inspect
 
-    callback_source = inspect.getsource(admin_panel.handle_admin_callbacks)
+    callback_source = inspect.getsource(admin_panel._handle_admin_callbacks_impl)
     fsm_source = inspect.getsource(admin_panel.process_admin_text_input)
     prompt_to_state = {
         "prompt_card_settings": "edit_card_settings",
@@ -202,3 +202,163 @@ def test_all_admin_prompt_callbacks_have_a_matching_text_fsm_consumer():
         assert prompt in callback_source
         assert state in callback_source
         assert state in fsm_source
+
+
+
+def test_escape_markdown_escapes_classic_markdown_metacharacters():
+    actual = admin_panel.escape_markdown("A_B*[x]" + chr(96))
+    expected = (
+        "A" + chr(92) + "_B"
+        + chr(92) + "*"
+        + chr(92) + "[x]"
+        + chr(92) + chr(96)
+    )
+    assert actual == expected
+
+
+def test_admin_users_list_escapes_dynamic_full_name_before_markdown_rendering(monkeypatch):
+    update, query, _ = make_update("admin:users")
+    monkeypatch.setattr(admin_panel.database, "get_user_role", lambda *_args, **_kwargs: ("super_admin", None))
+    monkeypatch.setattr(admin_panel.database, "get_all_bot_users", lambda: [{
+        "telegram_id": 501,
+        "full_name": "Alice_Test",
+        "username": "alice",
+        "is_blocked": 0,
+        "linked_accounts_count": 1,
+    }])
+
+    asyncio.run(admin_panel.handle_admin_callbacks(update, SimpleNamespace(user_data={})))
+
+    assert query.edits
+    assert "Alice" + chr(92) + "_Test" in query.edits[0][0]
+
+
+def test_admin_callback_render_exception_answers_query_and_releases_spinner(monkeypatch):
+    update, query, _ = make_update("admin:users")
+    monkeypatch.setattr(admin_panel.database, "get_user_role", lambda *_args, **_kwargs: ("super_admin", None))
+    monkeypatch.setattr(
+        admin_panel.database, "get_all_bot_users",
+        lambda: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    asyncio.run(admin_panel.handle_admin_callbacks(update, SimpleNamespace(user_data={})))
+
+    assert query.answers
+    assert query.answers[-1][1] is True
+    assert "خطای غیرمنتظره" in query.answers[-1][0]
+
+
+def test_admin_back_keyboard_has_parent_and_root_rows_but_root_dashboard_has_no_back():
+    nested = admin_panel.build_back_to_admin_keyboard(parent_cb="admin:users:1")
+    callbacks = [
+        button.callback_data
+        for row in nested.inline_keyboard
+        for button in row
+    ]
+    assert callbacks == ["admin:users:1", "admin:main"]
+
+    submenu = admin_panel.build_back_to_admin_keyboard()
+    submenu_callbacks = [
+        button.callback_data
+        for row in submenu.inline_keyboard
+        for button in row
+    ]
+    assert submenu_callbacks == ["admin:main"]
+
+    root_callbacks = [
+        button.callback_data
+        for row in admin_panel.build_admin_main_keyboard().inline_keyboard
+        for button in row
+    ]
+    assert "admin:main" not in root_callbacks
+
+
+def test_set_plan_active_callback_updates_explicit_state_and_refreshes_plan_card(monkeypatch):
+    update, query, _ = make_update("admin:set_plan_active:plan_alpha:0")
+    monkeypatch.setattr(admin_panel.database, "get_user_role", lambda *_args, **_kwargs: ("super_admin", None))
+    calls = []
+    monkeypatch.setattr(
+        admin_panel.database, "set_plan_active_status",
+        lambda code, active, **kwargs: calls.append((code, active, kwargs)) or int(active),
+    )
+    monkeypatch.setattr(admin_panel.database, "get_plan", lambda _code: {
+        "plan_code": "plan_alpha",
+        "name": "Plan_Test",
+        "gb": 20,
+        "days": 30,
+        "rep_price": 100_000,
+        "user_price": 150_000,
+        "is_quick": 1,
+        "is_active": 0,
+    })
+
+    asyncio.run(admin_panel.handle_admin_callbacks(update, SimpleNamespace(user_data={})))
+
+    assert calls and calls[0][0:2] == ("plan_alpha", False)
+    assert "🔴 غیرفعال" in query.edits[0][0]
+    keyboard = query.edits[0][1]["reply_markup"]
+    callbacks = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+    assert "admin:set_plan_active:plan_alpha:1" in callbacks
+    assert callbacks[-2:] == ["admin:plans", "admin:main"]
+
+
+
+def test_admin_recent_tx_escapes_database_names_and_description(monkeypatch):
+    update, query, _ = make_update("admin:recent_tx:1")
+    monkeypatch.setattr(admin_panel.database, "get_user_role", lambda *_args, **_kwargs: ("super_admin", None))
+    monkeypatch.setattr(admin_panel.database, "get_financial_ledger_paginated", lambda **_kwargs: ([{
+        "transaction_type": "credit",
+        "rep_id": 8,
+        "rep_name": "Rep_Name",
+        "rep_code": "rep_code",
+        "user_id": None,
+        "actor_id": 9000,
+        "actor_name": "Admin",
+        "created_at": "2026-11-04 12:00:00",
+        "amount": 10_000,
+        "description": "memo_with_underscore",
+        "balance_after": 10_000,
+    }], 1, 1))
+
+    asyncio.run(admin_panel.handle_admin_callbacks(update, SimpleNamespace(user_data={})))
+
+    rendered = query.edits[0][0]
+    assert "Rep" + chr(92) + "_Name" in rendered
+    assert "memo" + chr(92) + "_with" + chr(92) + "_underscore" in rendered
+
+
+def test_backup_document_message_contains_admin_return_keyboard(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    update, query, _ = make_update("admin:backup")
+    monkeypatch.setattr(admin_panel.database, "get_user_role", lambda *_args, **_kwargs: ("super_admin", None))
+    archive = tmp_path / "db-backup.zip"
+    archive.write_bytes(b"backup")
+    monkeypatch.setitem(sys.modules, "backup", SimpleNamespace(
+        run_backup=lambda: {
+            "archive": str(archive),
+            "size_kb": 1,
+            "telegram_upload_status": "sent",
+        }
+    ))
+    sent = []
+
+    async def send_document(**kwargs):
+        sent.append(kwargs)
+
+    update.effective_chat.send_document = send_document
+    asyncio.run(admin_panel.handle_admin_callbacks(update, SimpleNamespace(user_data={})))
+
+    assert sent
+    keyboard = sent[0]["reply_markup"]
+    callbacks = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+    assert callbacks == ["admin:main"]
