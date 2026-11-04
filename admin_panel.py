@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import logging
+import re
 import asyncio
 from datetime import datetime
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -207,9 +208,20 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         return
 
     data = query.data or ""
-    parts = data.split(":")
-    action = parts[1] if len(parts) > 1 else "main"
-    sub_action = parts[2] if len(parts) > 2 else ""
+    parts=data.split(":")
+    action=parts[1] if len(parts)>1 else "main"
+    sub_action=parts[2] if len(parts)>2 else ""
+    if action=="cancel_form":
+        state=context.user_data.pop("admin_state",None) or {}
+        parent=state.get("return_callback") or "admin:main"
+        if not isinstance(parent,str) or not parent.startswith("admin:") or parent in ("admin:cancel_form","admin:retry_form"): parent="admin:main"
+        query.data=parent
+        await _handle_admin_callbacks_impl(update,context)
+        return
+    if action=="retry_form":
+        await query.answer("فرم فعال است؛ مقدار را دوباره ارسال کنید.")
+        return
+    context.user_data.pop("admin_state",None)
 
     # 1. Main Dashboard
     if action == "main":
@@ -1053,10 +1065,14 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
                 f"شماره کارت فعلی: `{card_info['card_number']}`\n"
                 f"صاحب حساب: `{card_info['card_holder']}`\n"
                 f"نام بانک: `{card_info['bank_name']}`\n\n"
-                "لطفاً اطلاعات جدید را به این فرمت بفرستید:\n"
-                "`<شماره_کارت> <نام_صاحب_حساب> <نام_بانک>`\n"
-                "مثال:\n"
-                "`6037991122334455 علی_حسینی سامان`\n\n"
+                "فرمت پیشنهادی با جداکننده پایپ:\n"
+                "6037-9911-2233-4455 | علی رضا محمدی | بانک سامان\n\n"
+                "یا سه خط جداگانه:\n"
+                "6037-9911-2233-4455\n"
+                "علی رضا محمدی\n"
+                "بانک سامان\n\n"
+                "فرمت فاصله‌ای هوشمند نیز پشتیبانی می‌شود:\n"
+                "6037991122334455 علی رضا محمدی بانک سامان\n\n"
                 "⏱ مهلت ارسال: ۶۰ ثانیه (یا بنویسید `cancel`)"
             )
             keyboard = build_back_to_admin_keyboard(parent_cb=prompt_parent_cb)
@@ -1284,6 +1300,14 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             )
             await query.answer()
 
+        _form_state_scope3=context.user_data.get("admin_state")
+        if _form_state_scope3:
+            _form_state_scope3.setdefault("return_callback",prompt_parent_cb)
+
+        _scope3_state=context.user_data.get("admin_state")
+        if _scope3_state:
+            _scope3_state.setdefault("return_callback",prompt_parent_cb)
+
     elif action == "confirm_del_user":
         target_user_id = int(sub_action)
         u_info = database.get_bot_user_by_tg_id(target_user_id)
@@ -1374,6 +1398,74 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("تاریخچه تراکنش‌ها")
 
+
+def parse_card_settings_input(raw_text: str) -> tuple[str, str, str]:
+    digits=str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩","01234567890123456789")
+    raw=(raw_text or "").translate(digits).strip()
+    pattern=re.compile(r"(?<!\d)(?:\d[\s-]*){15}\d(?!\d)")
+    match=pattern.search(raw)
+    if not match: raise ValueError("شماره کارت باید دقیقاً ۱۶ رقم داشته باشد.")
+    card=re.sub(r"[\s-]","",match.group(0))
+    if len(card)!=16 or not card.isdigit(): raise ValueError("شماره کارت معتبر نیست.")
+    def split_fields(value):
+        words=value.strip(" \t\r\n|,;:-").split()
+        if len(words)<2: raise ValueError("نام صاحب‌حساب و نام بانک را جداگانه وارد کنید.")
+        marker=max((i for i,w in enumerate(words) if w in ("بانک","بانك")),default=-1)
+        if 0<marker<len(words)-1: return " ".join(words[:marker])," ".join(words[marker:])
+        banks=("قرض الحسنه مهر ایران","قرض‌الحسنه مهر ایران","اقتصاد نوین","توسعه تعاون","صنعت و معدن","ایران زمین","رفاه کارگران","خاورمیانه","کارآفرین","گردشگری","پاسارگاد","پارسیان","صادرات","کشاورزی","پست بانک","مهر ایران","سرمایه","سامان","ملت","ملی","سپه","مسکن","تجارت","شهر","آینده","دی","سینا","قوامین","رسالت")
+        normalized=[w.replace("ي","ی").replace("ك","ک") for w in words]
+        for bank in sorted(banks,key=lambda x:len(x.split()),reverse=True):
+            suffix=[w.replace("ي","ی").replace("ك","ک") for w in bank.split()]
+            if len(words)>len(suffix) and normalized[-len(suffix):]==suffix:
+                return " ".join(words[:-len(suffix)])," ".join(words[-len(suffix):])
+        return " ".join(words[:-1]),words[-1]
+    if "|" in raw:
+        fields=[x.strip() for x in raw.split("|")]
+        if len(fields)!=3: raise ValueError("فرمت پایپ باید سه بخش شماره کارت، صاحب‌حساب و بانک داشته باشد.")
+        first=pattern.search(fields[0])
+        if not first or re.sub(r"[\s-]","",first.group(0))!=card: raise ValueError("شماره کارت باید در بخش اول باشد.")
+        holder,bank=fields[1],fields[2]
+    elif "\n" in raw or "\r" in raw:
+        lines=[x.strip() for x in raw.splitlines() if x.strip()]
+        pos=next((i for i,x in enumerate(lines) if pattern.search(x)),-1)
+        if pos<0: raise ValueError("شماره کارت در ورودی پیدا نشد.")
+        line=lines[pos]; m=pattern.search(line)
+        residue=(line[:m.start()]+" "+line[m.end():]).strip(" \t|,;:-")
+        rest=lines[:pos]+lines[pos+1:]
+        if residue and rest: holder,bank=residue," ".join(rest)
+        elif len(rest)>=2: holder,bank=rest[0]," ".join(rest[1:])
+        elif len(rest)==1: holder,bank=split_fields(rest[0])
+        else: holder,bank=split_fields(residue)
+    else:
+        holder,bank=split_fields((raw[:match.start()]+" "+raw[match.end():]).strip(" \t|,;:-"))
+    holder=re.sub(r"\s+"," ",holder).strip()
+    bank=re.sub(r"\s+"," ",bank).strip()
+    if not holder or not bank: raise ValueError("نام صاحب‌حساب و نام بانک نمی‌توانند خالی باشند.")
+    return card,holder,bank
+
+
+def build_fsm_validation_keyboard(role: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ تلاش مجدد",callback_data=f"{role}:retry_form"),
+        InlineKeyboardButton("❌ انصراف از فرم",callback_data=f"{role}:cancel_form"),
+    ]])
+
+
+async def _reply_fsm_validation_error(update,context,state,message: str) -> bool:
+    attempts=int(state.get("attempts",0))+1
+    state["attempts"]=attempts
+    state["ts"]=time.time()
+    if attempts>=3:
+        parent=state.get("return_callback") or "admin:main"
+        context.user_data.pop("admin_state",None)
+        await update.message.reply_text(f"❌ فرم پس از ۳ تلاش ناموفق بسته شد.\n{message}",
+            reply_markup=build_back_to_admin_keyboard(parent_cb=parent))
+    else:
+        await update.message.reply_text(f"⚠️ {message}\nتلاش {attempts} از ۳؛ فرم همچنان فعال است.",
+            reply_markup=build_fsm_validation_keyboard("admin"))
+    return True
+
+
 async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Handles step-by-step inputs initiated from Admin inline buttons.
@@ -1391,9 +1483,12 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
     now = time.time()
     created_ts = admin_state.get("ts", 0)
     # 60 seconds inactivity timeout
-    if now - created_ts > 60:
-        context.user_data.pop("admin_state", None)
-        return False
+    if now-created_ts>60:
+        parent=admin_state.get("return_callback") or "admin:main"
+        context.user_data.pop("admin_state",None)
+        await update.message.reply_text("⏱ مهلت زمانی تکمیل این فرم به پایان رسیده است. برای شروع دوباره، فرم را از منو باز کنید.",
+            reply_markup=build_back_to_admin_keyboard(parent_cb=parent))
+        return True
         
     text = (update.message.text or "").strip()
     
@@ -1403,9 +1498,10 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
         return False
 
     # Priority to cancellation
-    if text.lower() in ("cancel", "انصراف", "لغو"):
-        context.user_data.pop("admin_state", None)
-        await update.message.reply_text("❌ عملیات فرم لغو شد.", reply_markup=build_admin_main_keyboard())
+    if text.lower() in ("cancel","انصراف","لغو"):
+        parent=admin_state.get("return_callback") or "admin:main"
+        context.user_data.pop("admin_state",None)
+        await update.message.reply_text("❌ عملیات فرم لغو شد.",reply_markup=build_back_to_admin_keyboard(parent_cb=parent))
         return True
 
     # Active form input takes precedence over account/NLP routing. To exit,
@@ -1413,20 +1509,15 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
     action = admin_state.get("action")
 
     if action == "edit_card_settings":
-        parts = text.split(maxsplit=2)
-        if len(parts) < 3:
-            await update.message.reply_text("⚠️ فرمت نامعتبر است. فرمت صحیح: `<شماره کارت> <نام دارنده> <نام بانک>`", reply_markup=build_admin_main_keyboard())
-            context.user_data.pop("admin_state", None)
-            return True
-        c_num, c_holder, c_bank = parts
-        database.update_card_info(c_num, c_holder, c_bank)
+        try:
+            c_num,c_holder,c_bank=parse_card_settings_input(text)
+            database.update_card_info(c_num,c_holder,c_bank)
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,admin_state,f"اطلاعات کارت قابل ثبت نیست: {exc}")
+        context.user_data.pop("admin_state",None)
         await update.message.reply_text(
-            f"✅ **اطلاعات کارت بانکی با موفقیت ویرایش شد.**\n\n"
-            f"• شماره کارت: `{c_num}`\n• صاحب حساب: **{c_holder}**\n• بانک: **{c_bank}**",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=build_admin_main_keyboard()
-        )
-        context.user_data.pop("admin_state", None)
+            f"✅ اطلاعات کارت بانکی با موفقیت ویرایش شد.\nشماره کارت: {c_num}\nصاحب حساب: {c_holder}\nبانک: {c_bank}",
+            reply_markup=build_admin_main_keyboard())
         return True
 
     elif action == "charge_user":
@@ -1445,9 +1536,9 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=build_admin_main_keyboard()
             )
-        except ValueError:
-            await update.message.reply_text("❌ لطفاً یک عدد معتبر وارد کنید.", reply_markup=build_admin_main_keyboard())
-        context.user_data.pop("admin_state", None)
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,admin_state,f"مقدار باید عددی و معتبر باشد: {exc}")
+        context.user_data.pop("admin_state",None)
         return True
 
     elif action == "edit_credit_limit":
@@ -1461,17 +1552,20 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=build_admin_main_keyboard()
             )
-        except ValueError:
-            await update.message.reply_text("❌ لطفاً یک عدد معتبر وارد کنید.", reply_markup=build_admin_main_keyboard())
-        context.user_data.pop("admin_state", None)
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,admin_state,f"مقدار باید عددی و معتبر باشد: {exc}")
+        context.user_data.pop("admin_state",None)
         return True
 
     elif action == "edit_setting":
         setting_key = admin_state.get("key")
         label = admin_state.get("label", setting_key)
         new_val = text.strip()
-        database.set_setting(setting_key, new_val, actor_id=update.effective_user.id, actor_name=update.effective_user.full_name or "Admin")
-        context.user_data.pop("admin_state", None)
+        try:
+            database.set_setting(setting_key,new_val,actor_id=update.effective_user.id,actor_name=update.effective_user.full_name or "Admin")
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,admin_state,f"مقدار تنظیم معتبر نیست: {exc}")
+        context.user_data.pop("admin_state",None)
         await update.message.reply_text(
             f"✅ **تنظیمات با موفقیت بروزرسانی شد.**\n\n"
             f"• پارامتر: **{label}** (`{setting_key}`)\n"
@@ -1512,22 +1606,13 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
             )
             context.user_data.pop("admin_state", None)
             return True
-        except ValueError:
-            attempts = admin_state.get("attempts", 0) + 1
-            admin_state["attempts"] = attempts
-            if attempts >= 2:
-                context.user_data.pop("admin_state", None)
-                await update.message.reply_text("❌ به دلیل ورود متوالی مقادیر نامعتبر، عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
-            else:
-                await update.message.reply_text("⚠️ فرمت مبلغ نامعتبر است. لطفاً عدد وارد کنید یا بنویسید `cancel`:")
-            return True
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,admin_state,f"فرمت مبلغ نامعتبر است: {exc}")
 
     elif action == "add_rep":
         parts = text.split(maxsplit=5)
-        if len(parts) < 6:
-            context.user_data.pop("admin_state", None)
-            await update.message.reply_text("⚠️ فیلدهای نماینده ناقص بود و عملیات لغو شد. مجدداً اقدام فرمایید.", reply_markup=build_admin_main_keyboard())
-            return True
+        if len(parts)<6:
+            return await _reply_fsm_validation_error(update,context,admin_state,"فیلدهای نماینده ناقص است؛ شش بخش لازم را ارسال کنید.")
         r_code, r_name, r_tg, r_grp, r_top, r_scope = parts
         try:
             r_tg = int(r_tg)
@@ -1551,23 +1636,14 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
             )
             context.user_data.pop("admin_state", None)
             return True
-        except ValueError:
-            context.user_data.pop("admin_state", None)
-            await update.message.reply_text("⚠️ مقادیر شناسه‌ها باید عددی باشند. عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
-            return True
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,admin_state,f"مقادیر شناسه‌ها باید عددی و معتبر باشند: {exc}")
 
     elif action == "edit_plan":
         plan_code = admin_state.get("plan_code")
         parts = text.split()
-        if len(parts) < 2:
-            attempts = admin_state.get("attempts", 0) + 1
-            admin_state["attempts"] = attempts
-            if attempts >= 2:
-                context.user_data.pop("admin_state", None)
-                await update.message.reply_text("❌ به دلیل ورود متوالی مقادیر نامعتبر، عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
-            else:
-                await update.message.reply_text("⚠️ لطفاً هر دو قیمت را با فاصله بفرستید (مثال: `75000 130000`) یا بنویسید `cancel`:")
-            return True
+        if len(parts)<2:
+            return await _reply_fsm_validation_error(update,context,admin_state,"دو قیمت جدید نماینده و کاربر را به ترتیب ارسال کنید.")
         try:
             rep_p, user_p = int(parts[0]), int(parts[1])
             plan = database.update_plan_price(plan_code, rep_p, user_p)
@@ -1580,22 +1656,13 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
             )
             context.user_data.pop("admin_state", None)
             return True
-        except ValueError:
-            attempts = admin_state.get("attempts", 0) + 1
-            admin_state["attempts"] = attempts
-            if attempts >= 2:
-                context.user_data.pop("admin_state", None)
-                await update.message.reply_text("❌ به دلیل ورود متوالی مقادیر نامعتبر، عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
-            else:
-                await update.message.reply_text("⚠️ اعداد نامعتبر است. لطفاً دوباره وارد کنید یا بنویسید `cancel`:")
-            return True
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,admin_state,f"قیمت‌ها باید عددی و معتبر باشند: {exc}")
 
     elif action == "transfer":
         parts = text.split()
-        if len(parts) < 2:
-            context.user_data.pop("admin_state", None)
-            await update.message.reply_text("⚠️ فرمت نامعتبر بود و عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
-            return True
+        if len(parts)<2:
+            return await _reply_fsm_validation_error(update,context,admin_state,"فرمت انتقال باید کد اکانت و کد نماینده یا Chat ID مقصد باشد.")
         acc_code, target = parts[0], parts[1]
         
         # Check if target is rep or chat_id
@@ -1612,8 +1679,8 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
                 reply_markup=build_admin_main_keyboard()
             )
         else:
-            await update.message.reply_text(f"❌ خطا: {res.get('message')}")
-        context.user_data.pop("admin_state", None)
+            return await _reply_fsm_validation_error(update,context,admin_state,f"عملیات انجام نشد: {res.get('message') or 'ورودی معتبر نیست.'}")
+        context.user_data.pop("admin_state",None)
         return True
 
     elif action == "inspect":
@@ -1622,16 +1689,14 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
             status_text = xui_manager.format_status_report(insp["data"], is_admin=True)
             await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard())
         else:
-            await update.message.reply_text(f"❌ اکانتی با مشخصات `{text}` روی سرور یافت نشد.", reply_markup=build_admin_main_keyboard())
-        context.user_data.pop("admin_state", None)
+            return await _reply_fsm_validation_error(update,context,admin_state,f"اکانت {text} روی سرور پیدا نشد؛ شناسه را بررسی کنید.")
+        context.user_data.pop("admin_state",None)
         return True
 
     elif action == "add_plan":
         parts = text.split()
-        if len(parts) < 6:
-            context.user_data.pop("admin_state", None)
-            await update.message.reply_text("⚠️ فیلدها ناقص بود و عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
-            return True
+        if len(parts)<6:
+            return await _reply_fsm_validation_error(update,context,admin_state,"فیلدهای پلن ناقص است؛ کد، نام، حجم، روز و دو قیمت را وارد کنید.")
         p_code = parts[0]
         try:
             numeric = parts[-4:]
@@ -1653,30 +1718,26 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
             )
             context.user_data.pop("admin_state", None)
             return True
-        except ValueError:
-            context.user_data.pop("admin_state", None)
-            await update.message.reply_text("⚠️ مقادیر عددی اشتباه بود و عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
-            return True
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,admin_state,f"مقادیر پلن معتبر نیستند: {exc}")
 
     elif action == "link_user":
         parts = text.split()
-        if len(parts) < 2 or not parts[0].isdigit():
-            context.user_data.pop("admin_state", None)
-            await update.message.reply_text("⚠️ فرمت نامعتبر بود و عملیات لغو شد.", reply_markup=build_admin_main_keyboard())
-            return True
+        if len(parts)<2 or not parts[0].isdigit():
+            return await _reply_fsm_validation_error(update,context,admin_state,"فرمت اتصال باید Chat ID عددی و کد اکانت باشد.")
         chat_id, code = int(parts[0]), parts[1]
         res = database.link_user_to_account(code, chat_id, allow_reassign=True)
         if res.get("status") == "ok":
             await update.message.reply_text(f"✅ اکانت `{code}` به Chat ID `{chat_id}` متصل گردید.", reply_markup=build_admin_main_keyboard())
         else:
-            await update.message.reply_text(f"❌ خطا: {res.get('message')}")
-        context.user_data.pop("admin_state", None)
+            return await _reply_fsm_validation_error(update,context,admin_state,f"عملیات انجام نشد: {res.get('message') or 'ورودی معتبر نیست.'}")
+        context.user_data.pop("admin_state",None)
         return True
 
     elif action == "search_user":
         matches = database.search_bot_users(text)
         if not matches:
-            await update.message.reply_text("کاربری با این مشخصات پیدا نشد.", reply_markup=build_admin_main_keyboard())
+            return await _reply_fsm_validation_error(update,context,admin_state,"کاربری با این شناسه، نام یا یوزرنیم پیدا نشد.")
         else:
             rows = []
             for item in matches:
@@ -1704,8 +1765,8 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
                 parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard()
             )
         except ValueError as exc:
-            await update.message.reply_text(f"❌ تغییر شناسه انجام نشد: {exc}", reply_markup=build_admin_main_keyboard())
-        context.user_data.pop("admin_state", None)
+            return await _reply_fsm_validation_error(update,context,admin_state,f"تغییر شناسه انجام نشد: {exc}")
+        context.user_data.pop("admin_state",None)
         return True
 
     elif action == "link_user_account":
@@ -1721,59 +1782,48 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
             )
             response = f"✅ اکانت `{text}` به کاربر `{target_user_id}` متصل شد."
         else:
-            response = f"❌ اتصال انجام نشد: {linked.get('message')}"
-        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard())
-        context.user_data.pop("admin_state", None)
+            return await _reply_fsm_validation_error(update,context,admin_state,f"اتصال انجام نشد: {linked.get('message') or 'کد اکانت معتبر نیست.'}")
+        await update.message.reply_text(response,parse_mode=ParseMode.MARKDOWN,reply_markup=build_admin_main_keyboard())
+        context.user_data.pop("admin_state",None)
         return True
 
     elif action == "unlink_user_account":
         target_user_id = int(admin_state["target_user_id"])
         unlinked = database.unlink_account_owner(text, target_user_id)
-        await update.message.reply_text(
-            "✅ اتصال اکانت قطع شد." if unlinked else "❌ اکانت متعلق به این کاربر نیست یا یافت نشد.",
-            reply_markup=build_admin_main_keyboard()
-        )
-        context.user_data.pop("admin_state", None)
+        if not unlinked:
+            return await _reply_fsm_validation_error(update,context,admin_state,"اکانت متعلق به این کاربر نیست یا یافت نشد.")
+        context.user_data.pop("admin_state",None)
+        await update.message.reply_text("✅ اتصال اکانت قطع شد.",reply_markup=build_admin_main_keyboard())
         return True
 
     elif action == "edit_rep":
         target_rep_id = int(admin_state["target_rep_id"])
         parts = text.split(maxsplit=5)
-        if len(parts) != 6:
-            await update.message.reply_text(
-                "فرمت باید شش بخش داشته باشد: rep_code name telegram_id group_id topic_id scope_filter",
-                reply_markup=build_admin_main_keyboard()
-            )
-            context.user_data.pop("admin_state", None)
-            return True
+        if len(parts)!=6:
+            return await _reply_fsm_validation_error(update,context,admin_state,"شش فیلد کد نماینده، نام، Telegram ID، Group ID، Topic ID و Scope Filter را وارد کنید.")
         r_code, r_name, r_tg, r_group, r_topic, r_scope = parts
         try:
             database.update_rep_full(
                 target_rep_id, r_name, r_code, int(r_tg), int(r_group), int(r_topic), r_scope
             )
             await update.message.reply_text("✅ اطلاعات نماینده به‌روزرسانی شد.", reply_markup=build_admin_main_keyboard())
-        except ValueError:
-            await update.message.reply_text("❌ شناسه‌های تلگرام/گروه/تاپیک باید عددی باشند.", reply_markup=build_admin_main_keyboard())
-        context.user_data.pop("admin_state", None)
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,admin_state,f"شناسه‌ها باید عددی و معتبر باشند: {exc}")
+        context.user_data.pop("admin_state",None)
         return True
 
     elif action == "edit_plan_specs":
         parts = text.split(maxsplit=2)
-        if len(parts) != 3:
-            await update.message.reply_text(
-                "فرمت نامعتبر است. نمونه: `25 30 بسته ویژه ماهانه`",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard()
-            )
-            context.user_data.pop("admin_state", None)
-            return True
+        if len(parts)!=3:
+            return await _reply_fsm_validation_error(update,context,admin_state,"حجم، تعداد روز و نام جدید پلن را وارد کنید.")
         try:
             gb = float(parts[0].translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
             days = int(parts[1].translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
             database.update_plan_specs(admin_state["plan_code"], parts[2], gb, days)
             await update.message.reply_text("✅ حجم، زمان و نام پلن به‌روزرسانی شد.", reply_markup=build_admin_main_keyboard())
         except ValueError as exc:
-            await update.message.reply_text(f"❌ ویرایش پلن انجام نشد: {exc}", reply_markup=build_admin_main_keyboard())
-        context.user_data.pop("admin_state", None)
+            return await _reply_fsm_validation_error(update,context,admin_state,f"ویرایش پلن انجام نشد: {exc}")
+        context.user_data.pop("admin_state",None)
         return True
 
     return False

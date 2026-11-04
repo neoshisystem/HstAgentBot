@@ -105,7 +105,18 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     data = query.data or ""
     parts = data.split(":")
-    action = parts[1] if len(parts) > 1 else "main"
+    action = parts[1] if len(parts)>1 else "main"
+    if action=="cancel_form":
+        state=context.user_data.pop("rep_state",None) or {}
+        parent=state.get("return_callback") or "rep:main"
+        if not isinstance(parent,str) or not parent.startswith("rep:") or parent in ("rep:cancel_form","rep:retry_form"): parent="rep:main"
+        query.data=parent
+        await handle_rep_callbacks(update,context,rep)
+        return
+    if action=="retry_form":
+        await query.answer("فرم فعال است؛ مقدار را دوباره ارسال کنید.")
+        return
+    context.user_data.pop("rep_state",None)
 
     # 1. Main Dashboard
     if action == "main":
@@ -159,7 +170,8 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             "action": "awaiting_new_acc_name",
             "intent_id": intent_id,
             "rep_id": rep["id"],
-            "ts": time.time()
+            "ts": time.time(),
+            "return_callback": "rep:new_acc_plans",
         }
         extra_btns = [[InlineKeyboardButton(
             "⏩ بدون نام / رد کردن",
@@ -418,7 +430,8 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["rep_state"] = {
             "action": "awaiting_search_query",
             "rep_id": rep["id"],
-            "ts": time.time()
+            "ts": time.time(),
+            "return_callback": "rep:main",
         }
         keyboard = build_back_to_rep_keyboard()
         msg = (
@@ -684,6 +697,29 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("آمار کلی")
 
 
+
+def build_fsm_validation_keyboard(role: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ تلاش مجدد",callback_data=f"{role}:retry_form"),
+        InlineKeyboardButton("❌ انصراف از فرم",callback_data=f"{role}:cancel_form"),
+    ]])
+
+
+async def _reply_fsm_validation_error(update,context,state,message: str) -> bool:
+    attempts=int(state.get("attempts",0))+1
+    state["attempts"]=attempts
+    state["ts"]=time.time()
+    if attempts>=3:
+        parent=state.get("return_callback") or "rep:main"
+        context.user_data.pop("rep_state",None)
+        await update.message.reply_text(f"❌ فرم پس از ۳ تلاش ناموفق بسته شد.\n{message}",
+            reply_markup=build_back_to_rep_keyboard(back_callback=parent))
+    else:
+        await update.message.reply_text(f"⚠️ {message}\nتلاش {attempts} از ۳؛ فرم همچنان فعال است.",
+            reply_markup=build_fsm_validation_keyboard("rep"))
+    return True
+
+
 async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE, rep: dict) -> bool:
     """Processes FSM inputs initiated from representative dashboard."""
     rep_state = context.user_data.get("rep_state")
@@ -698,32 +734,37 @@ async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_T
         )
         return True
 
-    # Check timeout (90s)
-    if time.time() - rep_state.get("ts", 0) > 90:
-        context.user_data.pop("rep_state", None)
-        return False
+    if time.time()-rep_state.get("ts",0)>60:
+        parent=rep_state.get("return_callback") or "rep:main"
+        context.user_data.pop("rep_state",None)
+        await update.message.reply_text("⏱ مهلت زمانی تکمیل این فرم به پایان رسیده است. برای شروع دوباره، فرم را از منو باز کنید.",
+            reply_markup=build_back_to_rep_keyboard(back_callback=parent))
+        return True
 
     msg_text = update.message.text.strip()
     action = rep_state.get("action")
 
-    if msg_text.lower() in ("cancel", "انصراف", "لغو"):
-        context.user_data.pop("rep_state", None)
-        await update.message.reply_text("❌ عملیات لغو شد.", reply_markup=build_rep_main_keyboard())
+    if msg_text.lower() in ("cancel","انصراف","لغو"):
+        parent=rep_state.get("return_callback") or "rep:main"
+        context.user_data.pop("rep_state",None)
+        await update.message.reply_text("❌ عملیات لغو شد.",reply_markup=build_back_to_rep_keyboard(back_callback=parent))
         return True
 
     if action == "awaiting_new_acc_name":
+        if not msg_text:
+            return await _reply_fsm_validation_error(update,context,rep_state,"نام مشتری نمی‌تواند خالی باشد.")
         intent_id = rep_state.get("intent_id", "")
         intent = database.get_rep_action_intent(intent_id, rep["id"], update.effective_user.id)
         if not intent or intent.get("status") != "pending":
             context.user_data.pop("rep_state", None)
             await update.message.reply_text("❌ درخواست صدور منقضی شده یا دیگر معتبر نیست؛ از منوی صدور دوباره شروع کنید.")
             return True
-        if not database.set_rep_action_intent_customer_name(
-            intent_id, rep["id"], update.effective_user.id, msg_text
-        ):
-            context.user_data.pop("rep_state", None)
-            await update.message.reply_text("❌ ثبت نام مشتری برای این درخواست ممکن نشد؛ منوی صدور را دوباره باز کنید.")
-            return True
+        try:
+            saved=database.set_rep_action_intent_customer_name(intent_id,rep["id"],update.effective_user.id,msg_text)
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(update,context,rep_state,f"ثبت نام مشتری انجام نشد: {exc}")
+        if not saved:
+            return await _reply_fsm_validation_error(update,context,rep_state,"ثبت نام مشتری برای این درخواست ممکن نشد؛ ورودی را اصلاح کنید.")
         context.user_data.pop("rep_state", None)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
@@ -742,24 +783,20 @@ async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_T
         )
         return True
     elif action == "awaiting_search_query":
-        context.user_data.pop("rep_state", None)
-        insp = await asyncio.to_thread(xui_manager.inspect_client, msg_text, scope=rep.get("scope_filter", "all"), by_code_only=False)
+        insp = await asyncio.to_thread(xui_manager.inspect_client,msg_text,scope=rep.get("scope_filter","all"),by_code_only=False)
         if insp.get("status") == "ok":
             client_info = insp["data"]
             owned_account = database.is_account_in_rep_scope(rep["id"], client_info.get("email", ""))
             if not owned_account:
-                await update.message.reply_text(
-                    f"⚠️ اکانت {msg_text} در محدوده ثبت‌شده نمایندگی شما یافت نشد.",
-                    reply_markup=build_rep_main_keyboard(),
-                )
-                return True
+                return await _reply_fsm_validation_error(update,context,rep_state,f"اکانت {msg_text} در محدوده ثبت‌شده نمایندگی شما یافت نشد.")
+            context.user_data.pop("rep_state",None)
             acc_code = owned_account["account_code"]
             report_text = xui_manager.format_status_report(client_info, is_admin=False)
             pending_res = database.get_pending_reservation(acc_code)
             keyboard = nlp_matcher.build_account_keyboard(acc_code, is_enabled=bool(client_info["raw"].get("enable", True)), role="rep", pending_res=pending_res)
             await update.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         else:
-            await update.message.reply_text(f"⚠️ اکانت {msg_text} در محدوده نمایندگی شما یافت نشد.", reply_markup=build_rep_main_keyboard())
+            return await _reply_fsm_validation_error(update,context,rep_state,f"اکانت {msg_text} در محدوده نمایندگی شما یافت نشد.")
         return True
 
     return False
