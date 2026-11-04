@@ -18,7 +18,7 @@ async def _deliver_admin_receipt_notification(bot, item: dict) -> str:
         chat_id = database.get_setting(
             "admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int
         )
-    if not chat_id or int(chat_id) <= 0:
+    if not chat_id or int(chat_id) == 0:
         raise RuntimeError("Super Admin Telegram destination is not configured")
 
     chat_id = int(chat_id)
