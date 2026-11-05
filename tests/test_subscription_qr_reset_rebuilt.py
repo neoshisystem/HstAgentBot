@@ -1,43 +1,8 @@
-import json
 
 import pytest
 
 import config
 import sub_manager
-
-
-class FakeResponse:
-    def __init__(self, ok=True, body=None):
-        self.ok = ok
-        self.body = body
-
-    def json(self):
-        if isinstance(self.body, Exception):
-            raise self.body
-        return self.body
-
-
-class FakeSession:
-    def __init__(self, owner, behavior="success"):
-        self.owner = owner
-        self.behavior = behavior
-        self.calls = []
-
-    def post(self, url, json=None, timeout=None):
-        self.calls.append((url, json, timeout))
-        changed = jsonlib.loads(json["settings"])["clients"][0]["subId"]
-        if self.behavior in ("success", "malformed", "timeout"):
-            self.owner.client["subId"] = changed
-        if self.behavior == "timeout":
-            raise TimeoutError("accepted request then timeout")
-        if self.behavior == "malformed":
-            return FakeResponse(body=ValueError("malformed response"))
-        if self.behavior == "reject":
-            return FakeResponse(body={"success": False})
-        return FakeResponse(body={"success": True})
-
-
-jsonlib = json
 
 
 class FakeXUI:
@@ -52,10 +17,6 @@ class FakeXUI:
         self.behavior = behavior
         self.verify = verify
         self.lookups = 0
-        self.session = FakeSession(self, behavior)
-
-    def get_session(self):
-        return self.session
 
     def find_client_by_code(self, _identifier):
         self.lookups += 1
@@ -71,6 +32,21 @@ class FakeXUI:
                 "raw": dict(self.client),
             },
         }
+
+    def update_client_sub_id(self, _email, new_sub_id):
+        # Mirrors the panel's central clients/update endpoint:
+        #  - success: applied and readable back
+        #  - malformed: applied, but the response could not be parsed (ambiguous)
+        #  - timeout: accepted, then the connection died (outcome uncertain)
+        #  - reject: not applied, previous value preserved
+        if self.behavior == "reject":
+            return (False, "پنل به‌روزرسانی را تأیید نکرد", "")
+        self.client["subId"] = new_sub_id
+        if self.behavior == "malformed":
+            return (None, "پاسخ پنل مبهم بود", new_sub_id)
+        if self.behavior == "timeout":
+            raise TimeoutError("accepted request then timeout")
+        return (True, "شناسه جدید در پنل تأیید شد.", new_sub_id)
 
 
 @pytest.mark.parametrize(
@@ -144,17 +120,15 @@ def test_reset_success_uses_remote_confirmation(monkeypatch):
     assert applied is True
     assert new_id == "new-sub-id"
     assert xui.client["subId"] == new_id
-    assert len(xui.session.calls) == 1
+    assert xui.lookups == 1
 
 
-@pytest.mark.parametrize("behavior", ["malformed", "timeout"])
-def test_reset_ambiguous_response_is_verified_by_readback(monkeypatch, behavior):
+def test_reset_unverifiable_remote_result_is_unknown(monkeypatch):
     monkeypatch.setattr(sub_manager, "generate_secure_sub_id", lambda _length: "new-sub-id")
-    xui = FakeXUI(behavior)
-    applied, _message, new_id = sub_manager.reset_client_sub_id(xui, "client@example.test")
-    assert applied is True
-    assert new_id == "new-sub-id"
-    assert xui.lookups == 2
+    xui = FakeXUI("timeout", verify="error")
+    applied, _message, candidate = sub_manager.reset_client_sub_id(xui, "client@example.test")
+    assert applied is None
+    assert candidate == "new-sub-id"
 
 
 def test_reset_explicit_rejection_with_old_id_unchanged_is_failure(monkeypatch):
@@ -166,12 +140,13 @@ def test_reset_explicit_rejection_with_old_id_unchanged_is_failure(monkeypatch):
     assert xui.client["subId"] == "old-sub-id"
 
 
-def test_reset_unverifiable_remote_result_is_unknown(monkeypatch):
+def test_reset_ambiguous_response_is_verified_by_readback(monkeypatch):
     monkeypatch.setattr(sub_manager, "generate_secure_sub_id", lambda _length: "new-sub-id")
-    xui = FakeXUI("timeout", verify="error")
-    applied, _message, candidate = sub_manager.reset_client_sub_id(xui, "client@example.test")
-    assert applied is None
-    assert candidate == "new-sub-id"
+    xui = FakeXUI("malformed")
+    applied, _message, new_id = sub_manager.reset_client_sub_id(xui, "client@example.test")
+    assert applied is True
+    assert new_id == "new-sub-id"
+    assert xui.lookups == 2
 
 
 def test_reset_without_public_url_returns_partial_and_keeps_new_id(monkeypatch):

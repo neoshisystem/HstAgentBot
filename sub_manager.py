@@ -12,7 +12,6 @@ import string
 import uuid
 import sys
 import os
-import json
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -81,44 +80,41 @@ def reset_client_sub_id(xui_module, email: str, initial_search=None) -> tuple[bo
     if not email:
         return False, "شناسه اکانت مشخص نشده است.", ""
     new_sub = generate_secure_sub_id(16)
-    original_sub = None
-    try:
-        search = initial_search or xui_module.find_client_by_code(email)
-        if not isinstance(search, dict) or not search.get("found"):
-            return False, "اکانت موردنظر در پنل یافت نشد.", ""
-        data = search.get("data") or {}
-        client = data.get("raw")
-        if not isinstance(client, dict):
-            return False, "اطلاعات پایه اکانت از پنل کامل نیست.", ""
-        client_id = client.get("id") or client.get("uuid")
-        inbound_id = data.get("inbound_id")
-        original_sub = client.get("subId") or client.get("sub_id")
-        if not client_id or inbound_id is None:
-            return False, "شناسه داخلی اکانت در پنل کامل نیست.", ""
-        changed = dict(client)
-        changed["subId"] = new_sub
-        payload = {"id": inbound_id, "settings": json.dumps({"clients": [changed]})}
-        response = xui_module.get_session().post(
-            f"{xui_module.BASE_URL}/panel/api/inbounds/updateClient/{client_id}",
-            json=payload, timeout=10
-        )
+
+    # Confirm the client exists in the panel before rotating (pre-validation).
+    if initial_search is None:
         try:
-            body = response.json()
+            initial_search = xui_module.find_client_by_code(email)
         except Exception:
-            body = None
-        if response.ok and isinstance(body, dict) and body.get("success") is True:
-            return True, "لینک سابسکریپشن با موفقیت بازنشانی شد.", new_sub
-        reason = "پاسخ پنل موفقیت را تأیید نکرد"
+            logger.exception("Could not pre-verify client %s before reset", email)
+            initial_search = None
+    if isinstance(initial_search, dict) and not initial_search.get("found"):
+        return False, "اکانت موردنظر در پنل یافت نشد.", ""
+
+    # Central client endpoint: persists subId in the central client table and
+    # auto-syncs all inbounds (OpenAPI 3.x clients/update). Read-back is
+    # performed inside the method against GET clients/get/{email}.
+    updater = getattr(xui_module, "update_client_sub_id", None)
+    if not callable(updater):
+        logger.error("xui_manager does not expose update_client_sub_id; reset aborted for %s", email)
+        return None, "متد به‌روزرسانی متمرکز در پنل در دسترس نیست.", new_sub
+
+    try:
+        result: tuple[bool | None, str, str] = updater(email, new_sub)  # type: ignore[assignment]
+        applied, message, confirmed_sub = result
     except Exception as exc:
         logger.exception("Subscription reset outcome is uncertain for %s", email)
-        reason = f"نتیجه درخواست نامشخص است: {exc}"
+        return None, f"نتیجه درخواست نامشخص است: {exc}", new_sub
 
+    if applied is True:
+        return True, message, str(confirmed_sub or new_sub)
+    if applied is False:
+        return False, message, ""
+    # Unknown: fall back to a fresh read before giving up.
     remote_sub = _read_remote_sub_id(xui_module, email)
     if remote_sub == new_sub:
         return True, "شناسه جدید در پنل تأیید شد.", new_sub
-    if original_sub is not None and remote_sub == str(original_sub):
-        return False, f"پنل شناسه قبلی را حفظ کرده است؛ {reason}.", ""
-    return None, f"{reason} و وضعیت شناسه در پنل قابل تأیید نیست.", new_sub
+    return None, message, new_sub
 
 
 def generate_qr_code(payload: str):
