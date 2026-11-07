@@ -123,43 +123,47 @@ def load_database_module(product_root: str | Path, monkeypatch, tmp_path):
 
 @contextmanager
 def make_db(database, monkeypatch, tmp_path, *, filename: str = "v52-isolated.sqlite3", clock=None):
-    """Initialize a fresh temporary DB and restore database.DB_PATH on exit."""
+    """Initialize a fresh temporary DB and restore database.DB_PATH on exit.
+
+    An optional callable clock is injected only into this database module; it
+    does not replace or mutate the process-global time module.
+    """
     original_path = database.DB_PATH
     original_time = getattr(database, "time", None)
     isolated_path = (Path(tmp_path) / filename).resolve()
 
-    if clock is not None:
-        if not callable(clock):
-            raise TypeError("clock must be a zero-argument callable")
-        if original_time is None:
-            raise AttributeError("database module has no time module to inject")
-
-        class _InjectedTime:
-            def time(self):
-                return float(clock())
-
-            def __getattr__(self, name):
-                return getattr(original_time, name)
-
-        monkeypatch.setattr(database, "time", _InjectedTime())
+    if clock is not None and not callable(clock):
+        raise TypeError("clock must be a zero-argument callable")
+    if clock is not None and original_time is None:
+        raise AttributeError("database module has no time module to inject")
 
     try:
-        original_resolved = Path(str(original_path)).expanduser().resolve()
-    except (TypeError, OSError):
-        original_resolved = None
-    if original_resolved == isolated_path:
-        raise AssertionError("temporary DB path must differ from the original DB_PATH")
-    if isolated_path.exists():
-        raise FileExistsError(f"refusing to reuse an existing test DB: {isolated_path}")
+        if clock is not None:
+            class _InjectedTime:
+                def time(self):
+                    return float(clock())
 
-    monkeypatch.setattr(database, "DB_PATH", str(isolated_path))
-    try:
+                def __getattr__(self, name):
+                    return getattr(original_time, name)
+
+            monkeypatch.setattr(database, "time", _InjectedTime())
+
+        try:
+            original_resolved = Path(str(original_path)).expanduser().resolve()
+        except (TypeError, OSError):
+            original_resolved = None
+        if original_resolved == isolated_path:
+            raise AssertionError("temporary DB path must differ from the original DB_PATH")
+        if isolated_path.exists():
+            raise FileExistsError(f"refusing to reuse an existing test DB: {isolated_path}")
+
+        monkeypatch.setattr(database, "DB_PATH", str(isolated_path))
         database.init_db()
         if not isolated_path.is_file():
             raise AssertionError("database.init_db() did not create the temporary DB")
         yield isolated_path
     finally:
-        # Restore the exact pre-context values, including Path-vs-str identity.
+        # Restore exact prior objects/values even when initialization fails.
         monkeypatch.setattr(database, "DB_PATH", original_path)
         if clock is not None:
             monkeypatch.setattr(database, "time", original_time)
