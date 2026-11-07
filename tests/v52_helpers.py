@@ -15,6 +15,32 @@ import urllib.request
 from typing import Any
 
 
+class FakeClock:
+    """Deterministic callable clock for tests; time advances only when requested."""
+    def __init__(self, start: float = 0.0):
+        self._now = float(start)
+
+    def __call__(self) -> float:
+        return self._now
+
+    def time(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> float:
+        seconds = float(seconds)
+        if seconds < 0:
+            raise ValueError("FakeClock cannot move backwards")
+        self._now += seconds
+        return self._now
+
+    def set(self, timestamp: float) -> float:
+        timestamp = float(timestamp)
+        if timestamp < self._now:
+            raise ValueError("FakeClock cannot move backwards")
+        self._now = timestamp
+        return self._now
+
+
 class PanelSeed:
     __slots__ = ("panel_id", "name", "base_url", "api_secret", "marker")
 
@@ -96,10 +122,26 @@ def load_database_module(product_root: str | Path, monkeypatch, tmp_path):
 
 
 @contextmanager
-def make_db(database, monkeypatch, tmp_path, *, filename: str = "v52-isolated.sqlite3"):
+def make_db(database, monkeypatch, tmp_path, *, filename: str = "v52-isolated.sqlite3", clock=None):
     """Initialize a fresh temporary DB and restore database.DB_PATH on exit."""
     original_path = database.DB_PATH
+    original_time = getattr(database, "time", None)
     isolated_path = (Path(tmp_path) / filename).resolve()
+
+    if clock is not None:
+        if not callable(clock):
+            raise TypeError("clock must be a zero-argument callable")
+        if original_time is None:
+            raise AttributeError("database module has no time module to inject")
+
+        class _InjectedTime:
+            def time(self):
+                return float(clock())
+
+            def __getattr__(self, name):
+                return getattr(original_time, name)
+
+        monkeypatch.setattr(database, "time", _InjectedTime())
 
     try:
         original_resolved = Path(str(original_path)).expanduser().resolve()
@@ -117,8 +159,10 @@ def make_db(database, monkeypatch, tmp_path, *, filename: str = "v52-isolated.sq
             raise AssertionError("database.init_db() did not create the temporary DB")
         yield isolated_path
     finally:
-        # Restore the exact pre-context value, including Path-vs-str identity.
+        # Restore the exact pre-context values, including Path-vs-str identity.
         monkeypatch.setattr(database, "DB_PATH", original_path)
+        if clock is not None:
+            monkeypatch.setattr(database, "time", original_time)
 
 
 def seed_panel(
