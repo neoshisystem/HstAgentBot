@@ -286,7 +286,7 @@ def test_migration_003_accounts(tmp_path, monkeypatch):
             "FROM accounts WHERE id=?", (account["account_id"],)
         ).fetchone()
         assert preserved == (
-            303, 202, account["account_code"], account["email"], "V52 Legacy Customer",
+            303, 202, account["account_code"], account["email"], "V52 Synthetic Customer 303",
             account["sub_id"], 1, 10.0, 0, actor["actor_tg_id"], 0, 1, None,
             None, "root", 1, 1, 0, 0, None,
         )
