@@ -267,7 +267,9 @@ def test_migration_003_accounts(tmp_path, monkeypatch):
         rep_before = conn.execute(
             "SELECT id,rep_code,balance_toman FROM representatives WHERE id=202"
         ).fetchone()
-        migration_dir = root / "migrations"
+        migration_dir = _migration_subset(
+            root, tmp_path, ("001_policy", "002_panels", "003_accounts")
+        )
         assert apply_migrations(conn, migration_dir, now=1794110000) == [
             "001_policy", "002_panels", "003_accounts"
         ]
@@ -357,16 +359,23 @@ def test_migration_004_plans(tmp_path, monkeypatch):
         conn=sqlite3.connect(str(db_path)); conn.execute("PRAGMA foreign_keys=ON")
         prior_tables=[n for n in _snapshot_tables(conn) if n not in {"pricing_plans","schema_migrations"}]
         old_state=_snapshot_tables(conn,prior_tables)
+        plans_before=conn.execute(
+            "SELECT plan_code,name,gb,days,rep_price,user_price,is_quick,sort_order,is_active "
+            "FROM pricing_plans ORDER BY plan_code"
+        ).fetchall()
         migration_dir=_migration_subset(root,tmp_path,("001_policy","002_panels","003_accounts","004_plans"))
         assert apply_migrations(conn,migration_dir,now=1794203600)==["004_plans"]
         assert [r[1] for r in conn.execute("PRAGMA table_info(pricing_plans)")] == [
             "plan_code","name","gb","days","rep_price","user_price","is_quick","sort_order",
             "is_active","panel_scope","sale_status","first_purchase_only","revision"
         ]
-        assert conn.execute(
-            "SELECT plan_code,is_active,panel_scope,sale_status,first_purchase_only,revision "
-            "FROM pricing_plans ORDER BY plan_code"
-        ).fetchall()==[
+        plans_after=conn.execute(
+            "SELECT plan_code,name,gb,days,rep_price,user_price,is_quick,sort_order,is_active,"
+            "panel_scope,sale_status,first_purchase_only,revision FROM pricing_plans ORDER BY plan_code"
+        ).fetchall()
+        assert [row[:9] for row in plans_after] == plans_before
+        assert all(row[10] == ("active" if row[8] == 1 else "hidden") for row in plans_after)
+        assert [row[0:1]+row[8:13] for row in plans_after if row[0] in ("W02-PLAN-A","W02-PLAN-H")] == [
             ("W02-PLAN-A",1,"selected","active",0,1),
             ("W02-PLAN-H",0,"selected","hidden",0,1)
         ]
