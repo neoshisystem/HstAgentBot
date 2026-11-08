@@ -1030,6 +1030,7 @@ def test_migration_010_payments(tmp_path, monkeypatch):
             "'wallet_topup','card_to_card',2468,'awaiting_payment',1794233000,1794234800)"
         )
 
+        conn.commit()
         target_names = prior_names + ("010_payments",)
         target_dir = _migration_subset(root, tmp_path, target_names)
         assert apply_migrations(conn, target_dir, now=1794233300) == ["010_payments"]
@@ -1096,6 +1097,12 @@ def test_migration_010_payments(tmp_path, monkeypatch):
         )
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
+                "INSERT INTO payment_receipts "
+                "(tracking_code,user_id,role,amount_toman,payment_attempt_id) "
+                "VALUES ('W02-B04-DUPLICATE-ATTEMPT',102,'end_user',1000,'w02b04-attempt-1')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
                 "INSERT INTO bank_cards "
                 "(merchant_key,card_number_cipher,card_holder,bank_name,daily_limit_toman) "
                 "VALUES ('root','bad','Synthetic Holder','Synthetic Bank',-1)"
@@ -1108,11 +1115,6 @@ def test_migration_010_payments(tmp_path, monkeypatch):
                 "'root',0,'pending',1794233300)"
             )
 
-        conn.execute(
-            "INSERT INTO payment_receipts "
-            "(tracking_code,user_id,role,amount_toman,payment_attempt_id) "
-            "VALUES ('W02-B04-DUPLICATE-ATTEMPT',102,'end_user',1000,'w02b04-attempt-1')"
-        ) if False else None
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO payment_attempts "
@@ -1203,6 +1205,7 @@ def test_migration_011_operations(tmp_path, monkeypatch):
             "'vpn_renew','wallet',1000,'awaiting_payment',1794234000,1794235800)"
         )
 
+        conn.commit()
         target_names = prior_names + ("011_operations",)
         target_dir = _migration_subset(root, tmp_path, target_names)
         assert apply_migrations(conn, target_dir, now=1794234300) == ["011_operations"]
@@ -1339,6 +1342,7 @@ def test_migration_012_goods(tmp_path, monkeypatch):
             "VALUES (91212,202,'w02b04-goods','pending')"
         )
 
+        conn.commit()
         target_names = prior_names + ("012_goods",)
         target_dir = _migration_subset(root, tmp_path, target_names)
         assert apply_migrations(conn, target_dir, now=1794235300) == ["012_goods"]
