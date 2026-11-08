@@ -581,3 +581,392 @@ def test_migration_006_bots(tmp_path, monkeypatch):
                         conn.execute("SELECT * FROM merchant_wallets ORDER BY merchant_key,user_tg_id").fetchall())
         assert conn.execute("PRAGMA foreign_key_check").fetchall()==[]
         conn.close()
+
+
+def test_migration_007_access(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    helpers, database, sentinel = _helpers(root, tmp_path, monkeypatch)
+
+    with helpers.make_db(database, monkeypatch, tmp_path) as db_path:
+        assert Path(sentinel) != Path(db_path) and not Path(sentinel).exists()
+        actor, account = _seed_legacy(helpers, database)
+        prior_names = (
+            "001_policy", "002_panels", "003_accounts", "004_plans",
+            "005_tree", "006_bots",
+        )
+        prior_dir = _migration_subset(root, tmp_path, prior_names)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA foreign_keys=ON")
+        assert apply_migrations(conn, prior_dir, now=1794230000) == list(prior_names)
+
+        account_before = conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone()
+        ledger_before = conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall()
+        target_names = prior_names + ("007_access",)
+        target_dir = _migration_subset(root, tmp_path, target_names)
+        assert apply_migrations(conn, target_dir, now=1794230300) == ["007_access"]
+
+        bot_columns = {row[1]: row for row in conn.execute("PRAGMA table_info(bot_users)")}
+        settings_columns = {row[1]: row for row in conn.execute("PRAGMA table_info(user_settings)")}
+        assert "tier" in bot_columns and bot_columns["tier"][3] == 1
+        assert bot_columns["tier"][4] == "'normal'"
+        assert "active_persona" in settings_columns and settings_columns["active_persona"][3] == 1
+        assert settings_columns["active_persona"][4] == "'end_user'"
+        assert conn.execute(
+            "SELECT tier FROM bot_users WHERE telegram_id=?", (actor["actor_tg_id"],)
+        ).fetchone() == ("normal",)
+        conn.execute(
+            "INSERT INTO user_settings(user_id) VALUES (?)", (actor["actor_tg_id"],)
+        )
+        assert conn.execute(
+            "SELECT active_persona FROM user_settings WHERE user_id=?",
+            (actor["actor_tg_id"],),
+        ).fetchone() == ("end_user",)
+
+        assert [row[1] for row in conn.execute("PRAGMA table_info(account_access_grants)")] == [
+            "account_id", "grantee_tg_id", "access_level", "granted_by_tg_id",
+            "created_at", "revoked_at", "revision",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(daily_test_usage)")] == [
+            "actor_tg_id", "tehran_date", "used",
+        ]
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_grants_user'"
+        ).fetchone() == ("idx_grants_user",)
+
+        grant = (account["account_id"], 404, "viewer", actor["actor_tg_id"], 1794230300)
+        conn.execute(
+            "INSERT INTO account_access_grants "
+            "(account_id,grantee_tg_id,access_level,granted_by_tg_id,created_at) "
+            "VALUES (?,?,?,?,?)", grant
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO account_access_grants "
+                "(account_id,grantee_tg_id,access_level,granted_by_tg_id,created_at) "
+                "VALUES (?,?,?,?,?)",
+                (account["account_id"], 405, "owner", actor["actor_tg_id"], 1794230300),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO account_access_grants "
+                "(account_id,grantee_tg_id,access_level,granted_by_tg_id,created_at) "
+                "VALUES (?,?,?,?,?)", grant
+            )
+        conn.execute(
+            "INSERT INTO daily_test_usage(actor_tg_id,tehran_date) VALUES (?,?)",
+            (actor["actor_tg_id"], "2026-11-08"),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO daily_test_usage(actor_tg_id,tehran_date,used) VALUES (?,?,?)",
+                (actor["actor_tg_id"], "2026-11-09", -1),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO daily_test_usage(actor_tg_id,tehran_date) VALUES (?,?)",
+                (actor["actor_tg_id"], "2026-11-08"),
+            )
+
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone() == account_before
+        assert conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall() == ledger_before
+        conn.commit()
+        stable = (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM account_access_grants ORDER BY account_id,grantee_tg_id").fetchall(),
+            conn.execute("SELECT * FROM daily_test_usage ORDER BY actor_tg_id,tehran_date").fetchall(),
+        )
+        assert apply_migrations(conn, target_dir, now=1794230600) == []
+        assert stable == (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM account_access_grants ORDER BY account_id,grantee_tg_id").fetchall(),
+            conn.execute("SELECT * FROM daily_test_usage ORDER BY actor_tg_id,tehran_date").fetchall(),
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.close()
+
+
+def test_migration_008_orders(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    helpers, database, sentinel = _helpers(root, tmp_path, monkeypatch)
+
+    with helpers.make_db(database, monkeypatch, tmp_path) as db_path:
+        assert Path(sentinel) != Path(db_path) and not Path(sentinel).exists()
+        actor, account = _seed_legacy(helpers, database)
+        prior_names = (
+            "001_policy", "002_panels", "003_accounts", "004_plans",
+            "005_tree", "006_bots", "007_access",
+        )
+        prior_dir = _migration_subset(root, tmp_path, prior_names)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA foreign_keys=ON")
+        assert apply_migrations(conn, prior_dir, now=1794231000) == list(prior_names)
+
+        account_before = conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone()
+        ledger_before = conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall()
+        target_names = prior_names + ("008_orders",)
+        target_dir = _migration_subset(root, tmp_path, target_names)
+        assert apply_migrations(conn, target_dir, now=1794231300) == ["008_orders"]
+
+        assert [row[1] for row in conn.execute("PRAGMA table_info(quotes)")] == [
+            "quote_id", "actor_tg_id", "bot_id", "merchant_key", "purpose",
+            "account_id", "plan_code", "product_id", "panel_id", "amount_toman",
+            "spec_json", "price_edges_json", "policy_version", "created_at",
+            "expires_at", "fingerprint",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(payment_orders)")] == [
+            "order_id", "quote_id", "actor_tg_id", "bot_id", "merchant_key",
+            "purpose", "payment_rail", "amount_toman", "status", "received_toman",
+            "created_at", "expires_at", "revision",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(capacity_reservations)")] == [
+            "reservation_id", "order_id", "panel_id", "account_id", "state", "expires_at",
+        ]
+        conn.execute(
+            "INSERT INTO bot_registry(bot_id,rep_id,username,status) VALUES (90908,202,'w02b03','pending')"
+        )
+        conn.execute(
+            "INSERT INTO panels(id,panel_code,name,panel_type) VALUES (90908,'w02b03-panel','W02-B03','3x-ui')"
+        )
+
+        def add_quote(quote_id, created_at=1794231300, expires_at=None):
+            expires = created_at + 1800 if expires_at is None else expires_at
+            conn.execute(
+                "INSERT INTO quotes "
+                "(quote_id,actor_tg_id,bot_id,merchant_key,purpose,account_id,plan_code,"
+                "product_id,panel_id,amount_toman,spec_json,price_edges_json,policy_version,"
+                "created_at,expires_at,fingerprint) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    quote_id, actor["actor_tg_id"], 90908, "root", "vpn_buy",
+                    account["account_id"], "legacy-seed", None, 90908, 0,
+                    "{}", "[]", "v1.0", created_at, expires, "fp-" + quote_id,
+                ),
+            )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            add_quote("bad-expiry", expires_at=1794233099)
+        add_quote("quote-1")
+        add_quote("quote-2")
+
+        def add_order(order_id, quote_id, purpose="vpn_buy", rail="wallet",
+                      status="awaiting_payment", amount=0):
+            conn.execute(
+                "INSERT INTO payment_orders "
+                "(order_id,quote_id,actor_tg_id,bot_id,merchant_key,purpose,payment_rail,"
+                "amount_toman,status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    order_id, quote_id, actor["actor_tg_id"], 90908, "root",
+                    purpose, rail, amount, status, 1794231300, 1794233100,
+                ),
+            )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            add_order("bad-purpose", "quote-1", purpose="unknown")
+        with pytest.raises(sqlite3.IntegrityError):
+            add_order("bad-rail", "quote-1", rail="cash")
+        with pytest.raises(sqlite3.IntegrityError):
+            add_order("bad-status", "quote-1", status="paid")
+        with pytest.raises(sqlite3.IntegrityError):
+            add_order("bad-amount", "quote-1", amount=-1)
+        add_order("order-1", "quote-1")
+        with pytest.raises(sqlite3.IntegrityError):
+            add_order("duplicate-quote", "quote-1")
+        add_order("order-2", "quote-2")
+
+        conn.execute(
+            "INSERT INTO capacity_reservations(reservation_id,order_id,panel_id,state,expires_at) "
+            "VALUES ('reservation-1','order-1',90908,'active',1794233100)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO capacity_reservations(reservation_id,order_id,panel_id,state) "
+                "VALUES ('bad-reservation','order-2',90908,'unknown')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO capacity_reservations(reservation_id,order_id,panel_id,state) "
+                "VALUES ('duplicate-order-reservation','order-1',90908,'released')"
+            )
+
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone() == account_before
+        assert conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall() == ledger_before
+        conn.commit()
+        stable = (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM quotes ORDER BY quote_id").fetchall(),
+            conn.execute("SELECT * FROM payment_orders ORDER BY order_id").fetchall(),
+            conn.execute("SELECT * FROM capacity_reservations ORDER BY reservation_id").fetchall(),
+        )
+        assert apply_migrations(conn, target_dir, now=1794231600) == []
+        assert stable == (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM quotes ORDER BY quote_id").fetchall(),
+            conn.execute("SELECT * FROM payment_orders ORDER BY order_id").fetchall(),
+            conn.execute("SELECT * FROM capacity_reservations ORDER BY reservation_id").fetchall(),
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.close()
+
+
+def test_migration_009_finance(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    helpers, database, sentinel = _helpers(root, tmp_path, monkeypatch)
+
+    with helpers.make_db(database, monkeypatch, tmp_path) as db_path:
+        assert Path(sentinel) != Path(db_path) and not Path(sentinel).exists()
+        actor, account = _seed_legacy(helpers, database)
+        prior_names = (
+            "001_policy", "002_panels", "003_accounts", "004_plans",
+            "005_tree", "006_bots", "007_access", "008_orders",
+        )
+        prior_dir = _migration_subset(root, tmp_path, prior_names)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA foreign_keys=ON")
+        assert apply_migrations(conn, prior_dir, now=1794232000) == list(prior_names)
+
+        legacy_columns = (
+            "id,rep_id,user_id,account_code,email,plan_code,transaction_type,amount,"
+            "balance_after,description,actor_id,actor_name,created_at"
+        )
+        legacy_ledger_before = conn.execute(
+            f"SELECT {legacy_columns} FROM financial_ledger ORDER BY id"
+        ).fetchall()
+        legacy_count = conn.execute("SELECT COUNT(*) FROM financial_ledger").fetchone()[0]
+        target_names = prior_names + ("009_finance",)
+        target_dir = _migration_subset(root, tmp_path, target_names)
+        assert apply_migrations(conn, target_dir, now=1794232300) == ["009_finance"]
+
+        ledger_columns = {row[1]: row for row in conn.execute("PRAGMA table_info(financial_ledger)")}
+        for name in (
+            "business_key", "merchant_key", "ledger_scope", "edge_id", "order_id",
+            "operation_id", "reversal_of", "policy_version",
+        ):
+            assert name in ledger_columns
+        assert ledger_columns["merchant_key"][4] == "'root'"
+        assert ledger_columns["ledger_scope"][4] == "'legacy'"
+        assert conn.execute(
+            "SELECT merchant_key,ledger_scope,business_key,edge_id,order_id,operation_id,"
+            "reversal_of,policy_version FROM financial_ledger ORDER BY id LIMIT 1"
+        ).fetchone() == ("root", "legacy", None, None, None, None, None, None)
+        index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='ux_ledger_business_key'"
+        ).fetchone()
+        assert index is not None and "WHERE business_key IS NOT NULL" in index[0]
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_holds_source'"
+        ).fetchone() == ("idx_holds_source",)
+        assert [row[1] for row in conn.execute("PRAGMA table_info(financial_holds)")] == [
+            "hold_id", "order_id", "source_key", "amount_toman", "state",
+            "created_at", "expires_at", "captured_ledger_id",
+        ]
+
+        conn.execute(
+            "INSERT INTO bot_registry(bot_id,rep_id,username,status) VALUES (90909,202,'w02b03-finance','pending')"
+        )
+        conn.execute(
+            "INSERT INTO quotes "
+            "(quote_id,actor_tg_id,bot_id,merchant_key,purpose,amount_toman,spec_json,"
+            "price_edges_json,policy_version,created_at,expires_at,fingerprint) "
+            "VALUES ('finance-quote',101,90909,'root','wallet_topup',100,'{}','[]','v1.0',"
+            "1794232300,1794234100,'finance-fingerprint')"
+        )
+        conn.execute(
+            "INSERT INTO payment_orders "
+            "(order_id,quote_id,actor_tg_id,bot_id,merchant_key,purpose,payment_rail,"
+            "amount_toman,status,created_at,expires_at) "
+            "VALUES ('finance-order','finance-quote',101,90909,'root','wallet_topup','wallet',"
+            "100,'awaiting_payment',1794232300,1794234100)"
+        )
+        conn.execute(
+            "INSERT INTO financial_holds(hold_id,order_id,source_key,amount_toman,state,created_at) "
+            "VALUES ('hold-1','finance-order','wallet:root:101',50,'active',1794232300)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO financial_holds(hold_id,order_id,source_key,amount_toman,state,created_at) "
+                "VALUES ('bad-hold-amount','finance-order','wallet:root:102',0,'active',1794232300)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO financial_holds(hold_id,order_id,source_key,amount_toman,state,created_at) "
+                "VALUES ('bad-hold-state','finance-order','wallet:root:103',1,'unknown',1794232300)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO financial_holds(hold_id,order_id,source_key,amount_toman,state,created_at) "
+                "VALUES ('duplicate-hold','finance-order','wallet:root:101',50,'active',1794232300)"
+            )
+
+        conn.execute(
+            "INSERT INTO financial_ledger "
+            "(transaction_type,amount,balance_after,description,actor_id,business_key) "
+            "VALUES ('credit',1,1,'W02-B03 business key fixture',101,'w02-b03-key-1')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO financial_ledger "
+                "(transaction_type,amount,balance_after,description,actor_id,business_key) "
+                "VALUES ('credit',2,2,'duplicate business key fixture',101,'w02-b03-key-1')"
+            )
+        conn.execute(
+            "INSERT INTO financial_ledger "
+            "(transaction_type,amount,balance_after,description,actor_id) "
+            "VALUES ('credit',3,3,'NULL business key fixture A',101)"
+        )
+        conn.execute(
+            "INSERT INTO financial_ledger "
+            "(transaction_type,amount,balance_after,description,actor_id) "
+            "VALUES ('credit',4,4,'NULL business key fixture B',101)"
+        )
+
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("SELECT COUNT(*) FROM financial_ledger").fetchone()[0] >= legacy_count + 3
+        assert conn.execute(
+            f"SELECT {legacy_columns} FROM financial_ledger WHERE id IN "
+            "(SELECT id FROM financial_ledger ORDER BY id LIMIT ?) ORDER BY id",
+            (legacy_count,),
+        ).fetchall() == legacy_ledger_before
+        conn.commit()
+        replay_state = (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM financial_holds ORDER BY hold_id").fetchall(),
+            conn.execute("SELECT id,business_key,merchant_key,ledger_scope FROM financial_ledger ORDER BY id").fetchall(),
+        )
+        assert apply_migrations(conn, target_dir, now=1794232600) == []
+        assert replay_state == (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM financial_holds ORDER BY hold_id").fetchall(),
+            conn.execute("SELECT id,business_key,merchant_key,ledger_scope FROM financial_ledger ORDER BY id").fetchall(),
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.close()
