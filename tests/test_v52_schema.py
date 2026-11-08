@@ -334,3 +334,240 @@ def test_migration_003_accounts(tmp_path, monkeypatch):
         )
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.close()
+
+
+def test_migration_004_plans(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    helpers, database, sentinel = _helpers(root, tmp_path, monkeypatch)
+    with helpers.make_db(database, monkeypatch, tmp_path) as db_path:
+        assert Path(sentinel) != Path(db_path) and not Path(sentinel).exists()
+        actor, account = _seed_legacy(helpers, database)
+        previous = _migration_subset(root, tmp_path, ("001_policy","002_panels","003_accounts"))
+        assert apply_migrations(sqlite3.connect(str(db_path)), previous, now=1794200000) == [
+            "001_policy","002_panels","003_accounts"
+        ]
+        with database.get_db() as seed:
+            seed.executemany(
+                "INSERT INTO pricing_plans "
+                "(plan_code,name,gb,days,rep_price,user_price,is_quick,sort_order,is_active) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                [("W02-PLAN-A","Legacy active",10,30,10000,15000,0,1,1),
+                 ("W02-PLAN-H","Legacy hidden",20,60,18000,24000,1,2,0)]
+            )
+        conn=sqlite3.connect(str(db_path)); conn.execute("PRAGMA foreign_keys=ON")
+        prior_tables=[n for n in _snapshot_tables(conn) if n not in {"pricing_plans","schema_migrations"}]
+        old_state=_snapshot_tables(conn,prior_tables)
+        migration_dir=_migration_subset(root,tmp_path,("001_policy","002_panels","003_accounts","004_plans"))
+        assert apply_migrations(conn,migration_dir,now=1794203600)==["004_plans"]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(pricing_plans)")] == [
+            "plan_code","name","gb","days","rep_price","user_price","is_quick","sort_order",
+            "is_active","panel_scope","sale_status","first_purchase_only","revision"
+        ]
+        assert conn.execute(
+            "SELECT plan_code,is_active,panel_scope,sale_status,first_purchase_only,revision "
+            "FROM pricing_plans ORDER BY plan_code"
+        ).fetchall()==[
+            ("W02-PLAN-A",1,"selected","active",0,1),
+            ("W02-PLAN-H",0,"selected","hidden",0,1)
+        ]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(plan_panels)")] == ["plan_code","panel_id","allowed"]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(tier_policies)")] == [
+            "actor_type","tier_code","title_fa","rank","discount_bps","cashback_bps",
+            "daily_test_quota","default_credit_limit","min_monthly_sales_toman"
+        ]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(rep_custom_prices)")] == [
+            "seller_key","buyer_rep_id","plan_code","price_toman","revision"
+        ]
+        conn.execute("INSERT INTO panels(id,panel_code,name,panel_type) VALUES (71,'plans-panel','Plans','3x-ui')")
+        conn.execute("INSERT INTO plan_panels(plan_code,panel_id,allowed) VALUES ('W02-PLAN-A',71,1)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO plan_panels(plan_code,panel_id,allowed) VALUES ('W02-PLAN-A',71,2)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO plan_panels(plan_code,panel_id,allowed) VALUES ('W02-PLAN-A',999,1)")
+        conn.execute(
+            "INSERT INTO tier_policies(actor_type,tier_code,title_fa,rank,discount_bps,cashback_bps) "
+            "VALUES ('rep','silver','silver',2,1250,250)"
+        )
+        for actor_type in ("admin","representative"):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO tier_policies(actor_type,tier_code,title_fa,rank) VALUES (?,?,?,1)",
+                    (actor_type,"bad-"+actor_type,"invalid")
+                )
+        for col,val in (("discount_bps",-1),("discount_bps",10001),("cashback_bps",-1),("cashback_bps",10001)):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    f"INSERT INTO tier_policies(actor_type,tier_code,title_fa,rank,{col}) "
+                    "VALUES ('end_user',?,'invalid',1,?)",(f"bad-{col}-{val}",val)
+                )
+        conn.execute(
+            "INSERT INTO rep_custom_prices(seller_key,buyer_rep_id,plan_code,price_toman) "
+            "VALUES ('rep:202',202,'W02-PLAN-A',9000)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO rep_custom_prices(seller_key,buyer_rep_id,plan_code,price_toman) "
+                "VALUES ('rep:202',202,'W02-PLAN-H',-1)"
+            )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall()==[]
+        conn.commit()
+        assert _snapshot_tables(conn,prior_tables)==old_state
+        assert conn.execute("SELECT owner_tg_id FROM accounts WHERE id=?",(account["account_id"],)).fetchone()==(actor["actor_tg_id"],)
+        assert conn.execute(
+            "SELECT amount,description FROM financial_ledger WHERE account_code=?",(account["account_code"],)
+        ).fetchall()==[(13579,"W02 legacy fixture")]
+        stable=(conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+                conn.execute("SELECT * FROM pricing_plans ORDER BY plan_code").fetchall(),
+                conn.execute("SELECT * FROM plan_panels ORDER BY plan_code,panel_id").fetchall(),
+                conn.execute("SELECT * FROM tier_policies ORDER BY actor_type,tier_code").fetchall(),
+                conn.execute("SELECT * FROM rep_custom_prices ORDER BY seller_key,buyer_rep_id,plan_code").fetchall())
+        assert apply_migrations(conn,migration_dir,now=1794207200)==[]
+        assert stable==(conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+                        conn.execute("SELECT * FROM pricing_plans ORDER BY plan_code").fetchall(),
+                        conn.execute("SELECT * FROM plan_panels ORDER BY plan_code,panel_id").fetchall(),
+                        conn.execute("SELECT * FROM tier_policies ORDER BY actor_type,tier_code").fetchall(),
+                        conn.execute("SELECT * FROM rep_custom_prices ORDER BY seller_key,buyer_rep_id,plan_code").fetchall())
+        assert conn.execute("PRAGMA foreign_key_check").fetchall()==[]
+        conn.close()
+
+
+def test_migration_005_tree(tmp_path, monkeypatch):
+    root=Path(__file__).resolve().parents[1]
+    helpers,database,sentinel=_helpers(root,tmp_path,monkeypatch)
+    with helpers.make_db(database,monkeypatch,tmp_path) as db_path:
+        assert Path(sentinel)!=Path(db_path) and not Path(sentinel).exists()
+        actor,account=_seed_legacy(helpers,database)
+        previous=_migration_subset(root,tmp_path,("001_policy","002_panels","003_accounts","004_plans"))
+        conn=sqlite3.connect(str(db_path)); conn.execute("PRAGMA foreign_keys=ON")
+        assert apply_migrations(conn,previous,now=1794210000)==["001_policy","002_panels","003_accounts","004_plans"]
+        rep_before=conn.execute(
+            "SELECT id,rep_code,name,telegram_id,scope_filter,balance_toman,is_active,credit_limit_toman "
+            "FROM representatives WHERE id=202"
+        ).fetchone()
+        ledger_before=conn.execute(
+            "SELECT rep_id,account_code,email,plan_code,transaction_type,amount,balance_after,description,actor_id,actor_name "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall()
+        migration_dir=_migration_subset(root,tmp_path,("001_policy","002_panels","003_accounts","004_plans","005_tree"))
+        assert apply_migrations(conn,migration_dir,now=1794213600)==["005_tree"]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(representatives)")][-8:]==[
+            "parent_rep_id","tier","billing_mode","can_create_sub_reps","max_sub_reps","custom_prefix","markup_bps","deleted_at"
+        ]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(rep_edges)")] == [
+            "id","parent_key","child_rep_id","billing_mode","debt_toman","credit_limit_toman","active","started_at","ended_at"
+        ]
+        assert conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='ux_rep_active_edge'").fetchone()==("ux_rep_active_edge",)
+        assert conn.execute(
+            "SELECT tier,billing_mode,can_create_sub_reps,max_sub_reps,custom_prefix,markup_bps,parent_rep_id,deleted_at "
+            "FROM representatives WHERE id=202"
+        ).fetchone()==("normal","credit",0,0,"",0,None,None)
+        conn.execute(
+            "INSERT INTO representatives(id,rep_code,name,telegram_id,group_id,topic_id,scope_filter) "
+            "VALUES (404,'V52-PARENT-404','V52 Parent 404',404,0,0,'v52-parent')"
+        )
+        conn.execute("UPDATE representatives SET parent_rep_id=404 WHERE id=202")
+        with pytest.raises(sqlite3.IntegrityError): conn.execute("UPDATE representatives SET parent_rep_id=999 WHERE id=202")
+        with pytest.raises(sqlite3.IntegrityError): conn.execute("UPDATE representatives SET billing_mode='wire' WHERE id=202")
+        with pytest.raises(sqlite3.IntegrityError): conn.execute("UPDATE representatives SET max_sub_reps=-1 WHERE id=202")
+        with pytest.raises(sqlite3.IntegrityError): conn.execute("UPDATE representatives SET markup_bps=-1 WHERE id=202")
+        conn.execute("INSERT INTO rep_edges(id,parent_key,child_rep_id,billing_mode,started_at) VALUES (1,'root',202,'credit',1794213600)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO rep_edges(id,parent_key,child_rep_id,billing_mode,started_at) VALUES (2,'root',202,'prepaid_wallet',1794213601)")
+        conn.execute("INSERT INTO rep_edges(id,parent_key,child_rep_id,billing_mode,active,started_at) VALUES (3,'history',202,'prepaid_wallet',0,1794213602)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO rep_edges(id,parent_key,child_rep_id,billing_mode,started_at) VALUES (4,'root',202,'wallet',1794213603)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO rep_edges(id,parent_key,child_rep_id,billing_mode,credit_limit_toman,started_at) VALUES (5,'root',202,'credit',-1,1794213604)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO rep_edges(id,parent_key,child_rep_id,billing_mode,active,started_at) VALUES (6,'root',404,'credit',2,1794213605)")
+        assert conn.execute("PRAGMA foreign_key_check").fetchall()==[]
+        assert conn.execute(
+            "SELECT id,rep_code,name,telegram_id,scope_filter,balance_toman,is_active,credit_limit_toman "
+            "FROM representatives WHERE id=202"
+        ).fetchone()==rep_before
+        assert conn.execute("SELECT owner_tg_id FROM accounts WHERE id=?",(account["account_id"],)).fetchone()==(actor["actor_tg_id"],)
+        assert conn.execute(
+            "SELECT rep_id,account_code,email,plan_code,transaction_type,amount,balance_after,description,actor_id,actor_name "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall()==ledger_before
+        conn.commit()
+        stable=(conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+                conn.execute("SELECT * FROM rep_edges ORDER BY id").fetchall(),
+                conn.execute("SELECT * FROM representatives ORDER BY id").fetchall())
+        assert apply_migrations(conn,migration_dir,now=1794217200)==[]
+        assert stable==(conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+                        conn.execute("SELECT * FROM rep_edges ORDER BY id").fetchall(),
+                        conn.execute("SELECT * FROM representatives ORDER BY id").fetchall())
+        assert conn.execute("PRAGMA foreign_key_check").fetchall()==[]
+        conn.close()
+
+
+def test_migration_006_bots(tmp_path, monkeypatch):
+    root=Path(__file__).resolve().parents[1]
+    helpers,database,sentinel=_helpers(root,tmp_path,monkeypatch)
+    with helpers.make_db(database,monkeypatch,tmp_path) as db_path:
+        assert Path(sentinel)!=Path(db_path) and not Path(sentinel).exists()
+        actor,account=_seed_legacy(helpers,database)
+        previous=_migration_subset(root,tmp_path,("001_policy","002_panels","003_accounts","004_plans","005_tree"))
+        conn=sqlite3.connect(str(db_path)); conn.execute("PRAGMA foreign_keys=ON")
+        assert apply_migrations(conn,previous,now=1794220000)==[
+            "001_policy","002_panels","003_accounts","004_plans","005_tree"
+        ]
+        prior_tables=[n for n in _snapshot_tables(conn) if n!="schema_migrations"]
+        old_state=_snapshot_tables(conn,prior_tables)
+        rep_before=conn.execute("SELECT id,rep_code,balance_toman FROM representatives WHERE id=202").fetchone()
+        ledger_before=conn.execute(
+            "SELECT rep_id,account_code,email,plan_code,transaction_type,amount,balance_after,description,actor_id,actor_name "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall()
+        migration_dir=_migration_subset(root,tmp_path,("001_policy","002_panels","003_accounts","004_plans","005_tree","006_bots"))
+        assert apply_migrations(conn,migration_dir,now=1794223600)==["006_bots"]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(bot_registry)")] == [
+            "bot_id","rep_id","is_primary","token_cipher","username","status","verified_at","revision"
+        ]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(bot_customers)")] == ["bot_id","user_tg_id","started_at"]
+        assert [r[1] for r in conn.execute("PRAGMA table_info(merchant_wallets)")] == ["merchant_key","user_tg_id","balance_toman"]
+        indexes={r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('ux_primary_bot','ux_active_rep_bot')"
+        )}
+        assert indexes=={"ux_primary_bot","ux_active_rep_bot"}
+        conn.execute("INSERT INTO bot_registry(bot_id,rep_id,is_primary,username,status) VALUES (1,202,1,'primary','active')")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO bot_registry(bot_id,rep_id,is_primary,username,status) VALUES (2,404,1,'second-primary','pending')")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO bot_registry(bot_id,rep_id,is_primary,username,status) VALUES (3,202,0,'second-active','active')")
+        conn.execute("INSERT INTO bot_registry(bot_id,rep_id,username,status) VALUES (4,202,'pending','pending')")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO bot_registry(bot_id,rep_id,username,status) VALUES (5,404,'bad-status','unknown')")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO bot_registry(bot_id,rep_id,is_primary,username,status) VALUES (6,404,2,'bad-primary','disabled')")
+        conn.execute("INSERT INTO bot_customers(bot_id,user_tg_id,started_at) VALUES (1,101,1794223600)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO bot_customers(bot_id,user_tg_id,started_at) VALUES (999,102,1794223600)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO bot_customers(bot_id,user_tg_id,started_at) VALUES (1,101,1794223601)")
+        conn.execute("INSERT INTO merchant_wallets(merchant_key,user_tg_id,balance_toman) VALUES ('merchant:test',101,5000)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO merchant_wallets(merchant_key,user_tg_id,balance_toman) VALUES ('root',101,0)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO merchant_wallets(merchant_key,user_tg_id,balance_toman) VALUES ('merchant:test',102,-1)")
+        assert conn.execute("PRAGMA foreign_key_check").fetchall()==[]
+        assert _snapshot_tables(conn,prior_tables)==old_state
+        assert conn.execute("SELECT owner_tg_id FROM accounts WHERE id=?",(account["account_id"],)).fetchone()==(actor["actor_tg_id"],)
+        assert conn.execute("SELECT id,rep_code,balance_toman FROM representatives WHERE id=202").fetchone()==rep_before
+        assert conn.execute(
+            "SELECT rep_id,account_code,email,plan_code,transaction_type,amount,balance_after,description,actor_id,actor_name "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall()==ledger_before
+        conn.commit()
+        stable=(conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+                conn.execute("SELECT * FROM bot_registry ORDER BY bot_id").fetchall(),
+                conn.execute("SELECT * FROM bot_customers ORDER BY bot_id,user_tg_id").fetchall(),
+                conn.execute("SELECT * FROM merchant_wallets ORDER BY merchant_key,user_tg_id").fetchall())
+        assert apply_migrations(conn,migration_dir,now=1794227200)==[]
+        assert stable==(conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+                        conn.execute("SELECT * FROM bot_registry ORDER BY bot_id").fetchall(),
+                        conn.execute("SELECT * FROM bot_customers ORDER BY bot_id,user_tg_id").fetchall(),
+                        conn.execute("SELECT * FROM merchant_wallets ORDER BY merchant_key,user_tg_id").fetchall())
+        assert conn.execute("PRAGMA foreign_key_check").fetchall()==[]
+        conn.close()
