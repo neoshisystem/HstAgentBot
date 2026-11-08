@@ -387,6 +387,7 @@ def test_migration_004_plans(tmp_path, monkeypatch):
         assert [r[1] for r in conn.execute("PRAGMA table_info(rep_custom_prices)")] == [
             "seller_key","buyer_rep_id","plan_code","price_toman","revision"
         ]
+        assert _snapshot_tables(conn,prior_tables)==old_state
         conn.execute("INSERT INTO panels(id,panel_code,name,panel_type) VALUES (71,'plans-panel','Plans','3x-ui')")
         conn.execute("INSERT INTO plan_panels(plan_code,panel_id,allowed) VALUES ('W02-PLAN-A',71,1)")
         with pytest.raises(sqlite3.IntegrityError):
@@ -542,7 +543,7 @@ def test_migration_006_bots(tmp_path, monkeypatch):
         assert indexes=={"ux_primary_bot","ux_active_rep_bot"}
         conn.execute("INSERT INTO bot_registry(bot_id,rep_id,is_primary,username,status) VALUES (1,202,1,'primary','active')")
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute("INSERT INTO bot_registry(bot_id,rep_id,is_primary,username,status) VALUES (2,404,1,'second-primary','pending')")
+            conn.execute("INSERT INTO bot_registry(bot_id,rep_id,is_primary,username,status) VALUES (2,NULL,1,'second-primary','pending')")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("INSERT INTO bot_registry(bot_id,rep_id,is_primary,username,status) VALUES (3,202,0,'second-active','active')")
         conn.execute("INSERT INTO bot_registry(bot_id,rep_id,username,status) VALUES (4,202,'pending','pending')")
