@@ -970,3 +970,473 @@ def test_migration_009_finance(tmp_path, monkeypatch):
         )
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.close()
+
+
+def test_migration_010_payments(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    helpers, database, sentinel = _helpers(root, tmp_path, monkeypatch)
+
+    with helpers.make_db(database, monkeypatch, tmp_path) as db_path:
+        assert Path(sentinel) != Path(db_path) and not Path(sentinel).exists()
+        actor, account = _seed_legacy(helpers, database)
+        prior_names = (
+            "001_policy", "002_panels", "003_accounts", "004_plans",
+            "005_tree", "006_bots", "007_access", "008_orders", "009_finance",
+        )
+        prior_dir = _migration_subset(root, tmp_path, prior_names)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA foreign_keys=ON")
+        assert apply_migrations(conn, prior_dir, now=1794233000) == list(prior_names)
+
+        legacy_columns = (
+            "id,tracking_code,user_id,role,rep_id,amount_toman,receipt_photo_id,"
+            "receipt_note,status,rejection_reason,reviewed_by,reviewed_at,"
+            "cancelled_by,cancelled_at,created_at"
+        )
+        conn.execute(
+            "INSERT INTO payment_receipts "
+            "(tracking_code,user_id,role,amount_toman,receipt_note,status) "
+            "VALUES ('W02-B04-LEGACY-RECEIPT',101,'end_user',2468,'legacy-marker','pending')"
+        )
+        receipt_before = conn.execute(
+            f"SELECT {legacy_columns} FROM payment_receipts ORDER BY id"
+        ).fetchall()
+        account_before = conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone()
+        ledger_before = conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall()
+
+        conn.execute(
+            "INSERT INTO bot_registry(bot_id,rep_id,username,status) "
+            "VALUES (91010,202,'w02b04-payments','pending')"
+        )
+        conn.execute(
+            "INSERT INTO quotes "
+            "(quote_id,actor_tg_id,bot_id,merchant_key,purpose,amount_toman,spec_json,"
+            "price_edges_json,policy_version,created_at,expires_at,fingerprint) "
+            "VALUES ('w02b04-payment-quote',101,91010,'root','wallet_topup',2468,"
+            "'{}','[]','v1.0',1794233000,1794234800,'w02b04-payment-fingerprint')"
+        )
+        conn.execute(
+            "INSERT INTO payment_orders "
+            "(order_id,quote_id,actor_tg_id,bot_id,merchant_key,purpose,payment_rail,"
+            "amount_toman,status,created_at,expires_at) "
+            "VALUES ('w02b04-payment-order','w02b04-payment-quote',101,91010,'root',"
+            "'wallet_topup','card_to_card',2468,'awaiting_payment',1794233000,1794234800)"
+        )
+
+        target_names = prior_names + ("010_payments",)
+        target_dir = _migration_subset(root, tmp_path, target_names)
+        assert apply_migrations(conn, target_dir, now=1794233300) == ["010_payments"]
+
+        assert [row[1] for row in conn.execute("PRAGMA table_info(bank_cards)")] == [
+            "id", "merchant_key", "card_number_cipher", "sheba_cipher", "card_holder",
+            "bank_name", "target_scope", "priority", "daily_limit_toman", "is_active",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(payment_attempts)")] == [
+            "attempt_id", "order_id", "rail", "merchant_key", "assigned_card_id",
+            "amount_toman", "state", "external_payment_key", "evidence_cipher",
+            "created_at", "verified_at",
+        ]
+        receipt_columns = [row[1] for row in conn.execute("PRAGMA table_info(payment_receipts)")]
+        assert receipt_columns[-6:] == [
+            "order_id", "payment_attempt_id", "bot_id", "bank_card_id",
+            "merchant_key", "submitted_tehran_date",
+        ]
+        receipt_info = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(payment_receipts)")
+        }
+        assert receipt_info["merchant_key"][3] == 1
+        assert receipt_info["merchant_key"][4] == "'root'"
+        assert conn.execute(
+            "SELECT merchant_key,order_id,payment_attempt_id,bot_id,bank_card_id,submitted_tehran_date "
+            "FROM payment_receipts WHERE tracking_code='W02-B04-LEGACY-RECEIPT'"
+        ).fetchone() == ("root", None, None, None, None, None)
+
+        card_index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='ux_receipt_attempt'"
+        ).fetchone()
+        assert card_index is not None and "WHERE payment_attempt_id IS NOT NULL" in card_index[0]
+        daily_index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_receipt_daily_card'"
+        ).fetchone()
+        assert daily_index is not None and (
+            "bank_card_id,submitted_tehran_date,status" in daily_index[0]
+        )
+
+        conn.execute(
+            "INSERT INTO bank_cards "
+            "(id,merchant_key,card_number_cipher,card_holder,bank_name,daily_limit_toman) "
+            "VALUES (91010,'root','cipher-card','Synthetic Holder','Synthetic Bank',5000000)"
+        )
+        conn.execute(
+            "INSERT INTO payment_attempts "
+            "(attempt_id,order_id,rail,merchant_key,assigned_card_id,amount_toman,state,"
+            "external_payment_key,created_at) "
+            "VALUES ('w02b04-attempt-1','w02b04-payment-order','card_to_card','root',"
+            "91010,2468,'pending','w02b04-external-1',1794233300)"
+        )
+        conn.execute(
+            "UPDATE payment_receipts SET order_id='w02b04-payment-order',"
+            "payment_attempt_id='w02b04-attempt-1',bot_id=91010,bank_card_id=91010,"
+            "submitted_tehran_date='2026-11-08' "
+            "WHERE tracking_code='W02-B04-LEGACY-RECEIPT'"
+        )
+        assert conn.execute(
+            "SELECT order_id,payment_attempt_id,bot_id,bank_card_id,merchant_key,submitted_tehran_date "
+            "FROM payment_receipts WHERE tracking_code='W02-B04-LEGACY-RECEIPT'"
+        ).fetchone() == (
+            "w02b04-payment-order", "w02b04-attempt-1", 91010, 91010,
+            "root", "2026-11-08",
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO bank_cards "
+                "(merchant_key,card_number_cipher,card_holder,bank_name,daily_limit_toman) "
+                "VALUES ('root','bad','Synthetic Holder','Synthetic Bank',-1)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO payment_attempts "
+                "(attempt_id,order_id,rail,merchant_key,amount_toman,state,created_at) "
+                "VALUES ('w02b04-bad-attempt','w02b04-payment-order','card_to_card',"
+                "'root',0,'pending',1794233300)"
+            )
+
+        conn.execute(
+            "INSERT INTO payment_receipts "
+            "(tracking_code,user_id,role,amount_toman,payment_attempt_id) "
+            "VALUES ('W02-B04-DUPLICATE-ATTEMPT',102,'end_user',1000,'w02b04-attempt-1')"
+        ) if False else None
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO payment_attempts "
+                "(attempt_id,order_id,rail,merchant_key,amount_toman,state,"
+                "external_payment_key,created_at) "
+                "VALUES ('w02b04-attempt-duplicate-key','w02b04-payment-order',"
+                "'card_to_card','root',1000,'pending','w02b04-external-1',1794233301)"
+            )
+
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute(
+            f"SELECT {legacy_columns} FROM payment_receipts ORDER BY id"
+        ).fetchall() == receipt_before
+        assert conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone() == account_before
+        assert conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall() == ledger_before
+
+        conn.commit()
+        stable = (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM bank_cards ORDER BY id").fetchall(),
+            conn.execute("SELECT * FROM payment_attempts ORDER BY attempt_id").fetchall(),
+            conn.execute("SELECT * FROM payment_receipts ORDER BY id").fetchall(),
+        )
+        assert apply_migrations(conn, target_dir, now=1794233600) == []
+        assert stable == (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM bank_cards ORDER BY id").fetchall(),
+            conn.execute("SELECT * FROM payment_attempts ORDER BY attempt_id").fetchall(),
+            conn.execute("SELECT * FROM payment_receipts ORDER BY id").fetchall(),
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.close()
+
+
+def test_migration_011_operations(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    helpers, database, sentinel = _helpers(root, tmp_path, monkeypatch)
+
+    with helpers.make_db(database, monkeypatch, tmp_path) as db_path:
+        assert Path(sentinel) != Path(db_path) and not Path(sentinel).exists()
+        actor, account = _seed_legacy(helpers, database)
+        prior_names = (
+            "001_policy", "002_panels", "003_accounts", "004_plans",
+            "005_tree", "006_bots", "007_access", "008_orders", "009_finance",
+            "010_payments",
+        )
+        prior_dir = _migration_subset(root, tmp_path, prior_names)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA foreign_keys=ON")
+        assert apply_migrations(conn, prior_dir, now=1794234000) == list(prior_names)
+
+        account_before = conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone()
+        ledger_before = conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall()
+        conn.execute(
+            "INSERT INTO bot_registry(bot_id,rep_id,username,status) "
+            "VALUES (91111,202,'w02b04-operations','pending')"
+        )
+        conn.execute(
+            "INSERT INTO panels(id,panel_code,name,panel_type) "
+            "VALUES (91111,'w02b04-panel','W02-B04 Panel','3x-ui')"
+        )
+        conn.execute(
+            "INSERT INTO quotes "
+            "(quote_id,actor_tg_id,bot_id,merchant_key,purpose,account_id,amount_toman,"
+            "spec_json,price_edges_json,policy_version,created_at,expires_at,fingerprint) "
+            "VALUES ('w02b04-ops-quote',101,91111,'root','vpn_renew',303,1000,"
+            "'{}','[]','v1.0',1794234000,1794235800,'w02b04-ops-fingerprint')"
+        )
+        conn.execute(
+            "INSERT INTO payment_orders "
+            "(order_id,quote_id,actor_tg_id,bot_id,merchant_key,purpose,payment_rail,"
+            "amount_toman,status,created_at,expires_at) "
+            "VALUES ('w02b04-ops-order','w02b04-ops-quote',101,91111,'root',"
+            "'vpn_renew','wallet',1000,'awaiting_payment',1794234000,1794235800)"
+        )
+
+        target_names = prior_names + ("011_operations",)
+        target_dir = _migration_subset(root, tmp_path, target_names)
+        assert apply_migrations(conn, target_dir, now=1794234300) == ["011_operations"]
+
+        assert [row[1] for row in conn.execute("PRAGMA table_info(action_confirmations)")] == [
+            "nonce", "actor_tg_id", "bot_id", "action", "target_type", "target_id",
+            "expected_revision", "payload_json", "expires_at", "consumed_at", "operation_id",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(panel_operations)")] == [
+            "operation_id", "order_id", "actor_tg_id", "bot_id", "account_id", "panel_id",
+            "kind", "request_cipher", "expected_effect_json", "state", "lock_key",
+            "lock_token", "idempotency_key", "generation", "lease_until", "evidence_json",
+            "created_at", "updated_at",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(operation_attempts)")] == [
+            "id", "operation_id", "attempt_no", "started_at", "finished_at",
+            "outcome", "evidence_json",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(delivery_outbox)")] == [
+            "id", "event_key", "bot_id", "chat_id", "thread_id", "purpose", "resource_type",
+            "resource_id", "state", "attempts", "next_attempt_at", "lease_token",
+            "lease_until", "last_error_code", "message_id",
+        ]
+
+        conn.execute(
+            "INSERT INTO action_confirmations "
+            "(nonce,actor_tg_id,bot_id,action,target_type,target_id,expected_revision,"
+            "payload_json,expires_at) "
+            "VALUES ('w02b04-nonce',101,91111,'renew','account','303',1,'{}',1794234600)"
+        )
+        conn.execute(
+            "INSERT INTO panel_operations "
+            "(operation_id,order_id,actor_tg_id,bot_id,account_id,panel_id,kind,request_cipher,"
+            "expected_effect_json,state,lock_key,lock_token,idempotency_key,created_at,updated_at) "
+            "VALUES ('w02b04-operation','w02b04-ops-order',101,91111,303,91111,'renew',"
+            "'cipher-request','{}','prepared','account:303','lock-token-1',"
+            "'w02b04-idempotency-1',1794234300,1794234300)"
+        )
+        conn.execute(
+            "INSERT INTO operation_attempts(operation_id,attempt_no,started_at,outcome) "
+            "VALUES ('w02b04-operation',1,1794234300,'dispatching')"
+        )
+        conn.execute(
+            "INSERT INTO delivery_outbox(event_key,bot_id,chat_id,purpose,resource_type,resource_id) "
+            "VALUES ('w02b04-event-1',91111,101,'renewal_result','operation','w02b04-operation')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO panel_operations "
+                "(operation_id,actor_tg_id,bot_id,panel_id,kind,request_cipher,"
+                "expected_effect_json,state,lock_key,lock_token,idempotency_key,created_at,updated_at) "
+                "VALUES ('w02b04-invalid-state',101,91111,91111,'renew','cipher','{}',"
+                "'unknown','lock:invalid','token-invalid','w02b04-idempotency-invalid',"
+                "1794234301,1794234301)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO panel_operations "
+                "(operation_id,actor_tg_id,bot_id,panel_id,kind,request_cipher,"
+                "expected_effect_json,state,lock_key,lock_token,idempotency_key,created_at,updated_at) "
+                "VALUES ('w02b04-duplicate-idempotency',101,91111,91111,'renew','cipher','{}',"
+                "'prepared','lock:duplicate','token-duplicate','w02b04-idempotency-1',"
+                "1794234302,1794234302)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO operation_attempts(operation_id,attempt_no,started_at) "
+                "VALUES ('w02b04-operation',1,1794234301)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO delivery_outbox(event_key,bot_id,chat_id,purpose,resource_type,resource_id) "
+                "VALUES ('w02b04-event-1',91111,101,'renewal_result','operation','duplicate')"
+            )
+
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone() == account_before
+        assert conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall() == ledger_before
+        conn.commit()
+        stable = (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM action_confirmations ORDER BY nonce").fetchall(),
+            conn.execute("SELECT * FROM panel_operations ORDER BY operation_id").fetchall(),
+            conn.execute("SELECT * FROM operation_attempts ORDER BY id").fetchall(),
+            conn.execute("SELECT * FROM delivery_outbox ORDER BY id").fetchall(),
+        )
+        assert apply_migrations(conn, target_dir, now=1794234600) == []
+        assert stable == (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM action_confirmations ORDER BY nonce").fetchall(),
+            conn.execute("SELECT * FROM panel_operations ORDER BY operation_id").fetchall(),
+            conn.execute("SELECT * FROM operation_attempts ORDER BY id").fetchall(),
+            conn.execute("SELECT * FROM delivery_outbox ORDER BY id").fetchall(),
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.close()
+
+
+def test_migration_012_goods(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    helpers, database, sentinel = _helpers(root, tmp_path, monkeypatch)
+
+    with helpers.make_db(database, monkeypatch, tmp_path) as db_path:
+        assert Path(sentinel) != Path(db_path) and not Path(sentinel).exists()
+        actor, account = _seed_legacy(helpers, database)
+        prior_names = (
+            "001_policy", "002_panels", "003_accounts", "004_plans",
+            "005_tree", "006_bots", "007_access", "008_orders", "009_finance",
+            "010_payments", "011_operations",
+        )
+        prior_dir = _migration_subset(root, tmp_path, prior_names)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA foreign_keys=ON")
+        assert apply_migrations(conn, prior_dir, now=1794235000) == list(prior_names)
+
+        account_before = conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone()
+        ledger_before = conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall()
+        conn.execute(
+            "INSERT INTO bot_registry(bot_id,rep_id,username,status) "
+            "VALUES (91212,202,'w02b04-goods','pending')"
+        )
+
+        target_names = prior_names + ("012_goods",)
+        target_dir = _migration_subset(root, tmp_path, target_names)
+        assert apply_migrations(conn, target_dir, now=1794235300) == ["012_goods"]
+
+        assert [row[1] for row in conn.execute("PRAGMA table_info(digital_categories)")] == [
+            "id", "title", "parent_id", "description", "sort_order", "is_active",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(digital_products)")] == [
+            "id", "product_code", "category_id", "title", "description", "delivery_type",
+            "rep_price", "user_price", "file_telegram_id", "file_bot_id",
+            "stock_warning_threshold", "is_active", "sort_order",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(digital_inventory)")] == [
+            "id", "product_id", "secret_cipher", "notes", "status", "order_id",
+            "sold_to_tg_id", "reservation_until", "exposed_at", "sold_at", "created_at",
+        ]
+
+        conn.execute(
+            "INSERT INTO digital_categories(id,title) VALUES (91212,'W02-B04 root category')"
+        )
+        conn.execute(
+            "INSERT INTO digital_categories(id,title,parent_id) "
+            "VALUES (91213,'W02-B04 child category',91212)"
+        )
+        conn.execute(
+            "INSERT INTO digital_products "
+            "(id,product_code,category_id,title,delivery_type,rep_price,user_price,file_bot_id) "
+            "VALUES (91212,'W02B04-AUTO',91212,'Auto inventory','auto_inventory',100,150,NULL)"
+        )
+        conn.execute(
+            "INSERT INTO digital_products "
+            "(id,product_code,category_id,title,delivery_type,rep_price,user_price,"
+            "file_telegram_id,file_bot_id) "
+            "VALUES (91213,'W02B04-FILE',91213,'File document','file_document',200,250,"
+            "'synthetic-telegram-file-id',91212)"
+        )
+        conn.execute(
+            "INSERT INTO digital_products "
+            "(id,product_code,category_id,title,delivery_type,rep_price,user_price) "
+            "VALUES (91214,'W02B04-MANUAL',91213,'Manual fulfill','manual_fulfill',0,0)"
+        )
+        conn.execute(
+            "INSERT INTO digital_inventory(id,product_id,secret_cipher,status,created_at) "
+            "VALUES (91212,91212,'cipher-inventory-1','available',1794235300)"
+        )
+        conn.execute(
+            "INSERT INTO digital_inventory(id,product_id,secret_cipher,status,created_at) "
+            "VALUES (91213,91212,'cipher-inventory-2','reserved',1794235300)"
+        )
+        conn.execute(
+            "INSERT INTO digital_inventory(id,product_id,secret_cipher,status,created_at) "
+            "VALUES (91214,91212,'cipher-inventory-3','sold',1794235300)"
+        )
+        conn.execute(
+            "INSERT INTO digital_inventory(id,product_id,secret_cipher,status,created_at) "
+            "VALUES (91215,91212,'cipher-inventory-4','defective',1794235300)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO digital_products "
+                "(product_code,category_id,title,delivery_type,rep_price,user_price) "
+                "VALUES ('W02B04-BAD-DELIVERY',91212,'Bad','external',1,1)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO digital_products "
+                "(product_code,category_id,title,delivery_type,rep_price,user_price) "
+                "VALUES ('W02B04-BAD-PRICE',91212,'Bad','manual_fulfill',-1,1)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO digital_inventory(product_id,secret_cipher,status,created_at) "
+                "VALUES (91212,'cipher-invalid','in_transit',1794235300)"
+            )
+
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute(
+            "SELECT id,owner_tg_id,account_code,email,sub_id,total_gb,expiry_time "
+            "FROM accounts WHERE id=?", (account["account_id"],)
+        ).fetchone() == account_before
+        assert conn.execute(
+            "SELECT id,rep_id,user_id,account_code,email,plan_code,transaction_type,"
+            "amount,balance_after,description,actor_id,actor_name,created_at "
+            "FROM financial_ledger ORDER BY id"
+        ).fetchall() == ledger_before
+        conn.commit()
+        stable = (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM digital_categories ORDER BY id").fetchall(),
+            conn.execute("SELECT * FROM digital_products ORDER BY id").fetchall(),
+            conn.execute("SELECT * FROM digital_inventory ORDER BY id").fetchall(),
+        )
+        assert apply_migrations(conn, target_dir, now=1794235600) == []
+        assert stable == (
+            conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall(),
+            conn.execute("SELECT * FROM digital_categories ORDER BY id").fetchall(),
+            conn.execute("SELECT * FROM digital_products ORDER BY id").fetchall(),
+            conn.execute("SELECT * FROM digital_inventory ORDER BY id").fetchall(),
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.close()
