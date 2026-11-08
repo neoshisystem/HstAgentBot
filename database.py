@@ -626,6 +626,20 @@ def init_db():
             
         conn.commit()
 
+        # Versioned schema rollout is opt-in.  The legacy schema transaction
+        # must be fully committed before the migration runner starts.
+        if os.getenv("V52_MIGRATIONS_ENABLED", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }:
+            if conn.in_transaction:
+                raise RuntimeError("v5.2 migrations require a committed schema transaction")
+            from migrations_runner import apply_migrations
+
+            migration_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "migrations"
+            )
+            apply_migrations(conn, migration_dir, now=int(time.time()))
+
 # --- Dynamic System Settings Management ---
 
 def get_setting(key: str, default=None, cast_type=None):
