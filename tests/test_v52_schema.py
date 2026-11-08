@@ -1444,3 +1444,437 @@ def test_migration_012_goods(tmp_path, monkeypatch):
         )
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         conn.close()
+
+# W02-B05-FINAL — isolated acceptance coverage for migrations 013–018.
+from contextlib import contextmanager
+
+
+_W02_PREFIX_MIGRATIONS = (
+    "001_policy", "002_panels", "003_accounts", "004_plans",
+    "005_tree", "006_bots", "007_access", "008_orders", "009_finance",
+    "010_payments", "011_operations", "012_goods",
+)
+_W02_FINAL_MIGRATIONS = (
+    "013_profiles", "014_domains", "015_support",
+    "016_refunds_promos", "017_fulfillment_audit", "018_manual_pool",
+)
+_W02_FINAL_BOT_ID = 91300
+_W02_FINAL_PANEL_ID = 91300
+
+
+@contextmanager
+def _prepared_w02_final_database(root, tmp_path, monkeypatch):
+    helpers, database, sentinel = _helpers(root, tmp_path, monkeypatch)
+    with helpers.make_db(database, monkeypatch, tmp_path) as db_path:
+        assert Path(sentinel) != Path(db_path) and not Path(sentinel).exists()
+        _seed_legacy(helpers, database)
+
+        prefix_dir = _migration_subset(root, tmp_path, _W02_PREFIX_MIGRATIONS)
+        prefix_conn = sqlite3.connect(str(db_path))
+        prefix_conn.execute("PRAGMA foreign_keys=ON")
+        assert apply_migrations(prefix_conn, prefix_dir, now=1794235700) == list(
+            _W02_PREFIX_MIGRATIONS
+        )
+        prefix_conn.close()
+
+        # Seed all FK parents through the configured DB context; it commits on exit.
+        with database.get_db() as seed:
+            seed.execute(
+                "INSERT INTO bot_registry(bot_id,rep_id,username,status) "
+                "VALUES (?,?,?,'pending')",
+                (_W02_FINAL_BOT_ID, 202, "w02-final-fixture"),
+            )
+            seed.execute(
+                "INSERT INTO panels(id,panel_code,name,panel_type) VALUES (?,?,?,?)",
+                (_W02_FINAL_PANEL_ID, "W02-FINAL-PANEL", "W02 final fixture", "synthetic"),
+            )
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield helpers, database, sentinel, db_path, conn
+        finally:
+            conn.close()
+
+
+def _apply_w02_final_target(root, tmp_path, conn, target, now):
+    target_index = _W02_FINAL_MIGRATIONS.index(target)
+    names = _W02_PREFIX_MIGRATIONS + _W02_FINAL_MIGRATIONS[:target_index + 1]
+    migration_dir = _migration_subset(root, tmp_path, names)
+    assert not conn.in_transaction, "fixture DML must be committed before apply_migrations"
+    expected_new_migrations = _W02_FINAL_MIGRATIONS[:target_index + 1]
+    assert apply_migrations(conn, migration_dir, now=now) == list(expected_new_migrations)
+    return migration_dir
+
+
+def _seed_w02_quote_and_order(conn):
+    conn.execute(
+        "INSERT INTO quotes "
+        "(quote_id,actor_tg_id,bot_id,merchant_key,purpose,amount_toman,spec_json,"
+        "price_edges_json,policy_version,created_at,expires_at,fingerprint) "
+        "VALUES ('w02-final-quote',101,?,'root','wallet_topup',100,'{}','[]',"
+        "'v5.2',1000,2800,'w02-final-fingerprint')",
+        (_W02_FINAL_BOT_ID,),
+    )
+    conn.execute(
+        "INSERT INTO payment_orders "
+        "(order_id,quote_id,actor_tg_id,bot_id,merchant_key,purpose,payment_rail,"
+        "amount_toman,status,created_at,expires_at) "
+        "VALUES ('w02-final-order','w02-final-quote',101,?,'root','wallet_topup',"
+        "'card_to_card',100,'awaiting_payment',1000,2800)",
+        (_W02_FINAL_BOT_ID,),
+    )
+
+
+def test_migration_013_profiles(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    with _prepared_w02_final_database(root, tmp_path, monkeypatch) as (
+        helpers, database, sentinel, db_path, conn
+    ):
+        migration_dir = _apply_w02_final_target(
+            root, tmp_path, conn, "013_profiles", 1794236000
+        )
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(subscription_profiles)"
+        )] == [
+            "profile_id", "owner_tg_id", "name", "is_default", "enabled",
+            "brand_rep_id", "created_bot_id", "token_hash", "token_cipher",
+            "token_version", "revision", "deleted_at", "created_at",
+        ]
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(subscription_profile_accounts)"
+        )] == [
+            "profile_id", "account_id", "added_by_tg_id", "sort_order", "added_at",
+        ]
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='ux_default_profile'"
+        ).fetchone() == (1,)
+        conn.execute(
+            "INSERT INTO subscription_profiles "
+            "(profile_id,owner_tg_id,name,is_default,created_bot_id,token_hash,token_cipher,created_at) "
+            "VALUES (91300,101,'Default',1,?, 'w02-default-hash','cipher-default',1794236000)",
+            (_W02_FINAL_BOT_ID,),
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="default_profile_not_deletable"):
+            conn.execute("DELETE FROM subscription_profiles WHERE profile_id=91300")
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="default_profile_not_deletable"):
+            conn.execute(
+                "UPDATE subscription_profiles SET is_default=0 WHERE profile_id=91300"
+            )
+        conn.rollback()
+        assert conn.execute(
+            "SELECT is_default,deleted_at,owner_tg_id FROM subscription_profiles "
+            "WHERE profile_id=91300"
+        ).fetchone() == (1, None, 101)
+        conn.commit()
+        assert apply_migrations(conn, migration_dir, now=1794236100) == []
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migration_014_domains(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    with _prepared_w02_final_database(root, tmp_path, monkeypatch) as (
+        helpers, database, sentinel, db_path, conn
+    ):
+        migration_dir = _apply_w02_final_target(
+            root, tmp_path, conn, "014_domains", 1794236200
+        )
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(sub_domains)"
+        )] == [
+            "domain_id", "rep_id", "hostname", "challenge", "status",
+            "verified_at", "tls_checked_at", "created_at",
+        ]
+        indexes = {
+            row[1]: row[2] for row in conn.execute("PRAGMA index_list(sub_domains)")
+        }
+        assert indexes["ux_active_rep_domain"] == 1
+        conn.execute(
+            "INSERT INTO sub_domains(domain_id,rep_id,hostname,challenge,status,created_at) "
+            "VALUES (91300,202,'active-1.example.invalid','challenge-1','active',1794236200)"
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO sub_domains(domain_id,rep_id,hostname,challenge,status,created_at) "
+                "VALUES (91301,202,'active-2.example.invalid','challenge-2','active',1794236200)"
+            )
+        conn.rollback()
+        conn.execute(
+            "INSERT INTO sub_domains(domain_id,rep_id,hostname,challenge,status,created_at) "
+            "VALUES (91302,202,'pending.example.invalid','challenge-3','pending',1794236200)"
+        )
+        conn.commit()
+        assert apply_migrations(conn, migration_dir, now=1794236300) == []
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migration_015_support(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    with _prepared_w02_final_database(root, tmp_path, monkeypatch) as (
+        helpers, database, sentinel, db_path, conn
+    ):
+        migration_dir = _apply_w02_final_target(
+            root, tmp_path, conn, "015_support", 1794236400
+        )
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(support_tickets)"
+        )] == [
+            "ticket_id", "sender_tg_id", "bot_id", "account_id", "rep_id",
+            "ticket_type", "assigned_key", "status", "snapshot_cipher",
+            "created_at", "updated_at",
+        ]
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(support_messages)"
+        )] == [
+            "id", "ticket_id", "actor_tg_id", "visibility", "body_cipher",
+            "attachment_file_id", "attachment_bot_id", "created_at",
+        ]
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(forum_topics)"
+        )] == [
+            "id", "owner_key", "bot_id", "group_chat_id", "generation",
+            "topic_key", "title_fa", "thread_id", "state", "updated_at",
+        ]
+        conn.execute(
+            "INSERT INTO support_tickets "
+            "(ticket_id,sender_tg_id,bot_id,account_id,rep_id,ticket_type,assigned_key,"
+            "status,created_at,updated_at) "
+            "VALUES ('TKT-W02-FINAL-01',101,?,303,202,'general','root','open',1794236400,1794236400)",
+            (_W02_FINAL_BOT_ID,),
+        )
+        conn.execute(
+            "INSERT INTO support_messages "
+            "(ticket_id,actor_tg_id,visibility,body_cipher,created_at) "
+            "VALUES ('TKT-W02-FINAL-01',101,'customer','cipher-message',1794236400)"
+        )
+        conn.execute(
+            "INSERT INTO forum_topics "
+            "(owner_key,bot_id,group_chat_id,generation,topic_key,title_fa,state,updated_at) "
+            "VALUES ('rep:202',?, -10091300,1,'support','پشتیبانی','active',1794236400)",
+            (_W02_FINAL_BOT_ID,),
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO support_tickets "
+                "(ticket_id,sender_tg_id,bot_id,ticket_type,assigned_key,status,created_at,updated_at) "
+                "VALUES ('TKT-W02-FINAL-BAD',101,?,'unknown','root','open',1794236400,1794236400)",
+                (_W02_FINAL_BOT_ID,),
+            )
+        conn.rollback()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM support_tickets WHERE ticket_id='TKT-W02-FINAL-01'"
+        ).fetchone() == (1,)
+        conn.commit()
+        assert apply_migrations(conn, migration_dir, now=1794236500) == []
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migration_016_refunds_promos(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    with _prepared_w02_final_database(root, tmp_path, monkeypatch) as (
+        helpers, database, sentinel, db_path, conn
+    ):
+        migration_dir = _apply_w02_final_target(
+            root, tmp_path, conn, "016_refunds_promos", 1794236600
+        )
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(refund_requests)"
+        )] == [
+            "refund_id", "order_id", "merchant_key", "user_tg_id", "amount_toman",
+            "state", "wallet_hold_key", "bank_details_cipher", "evidence_cipher",
+            "reviewer_tg_id", "created_at", "settled_at",
+        ]
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(wallet_refund_holds)"
+        )] == [
+            "hold_key", "merchant_key", "user_tg_id", "amount_toman",
+            "state", "created_at",
+        ]
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(coupons)"
+        )] == [
+            "code", "issuer_key", "discount_toman", "budget_toman", "used_toman",
+            "max_uses", "expires_at", "is_active",
+        ]
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(coupon_uses)"
+        )] == ["code", "order_id", "amount_toman", "state"]
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_jobs)"
+        )] == [
+            "job_key", "kind", "due_at", "state", "lease_token",
+            "lease_until", "result_json",
+        ]
+        _seed_w02_quote_and_order(conn)
+        conn.execute(
+            "INSERT INTO refund_requests "
+            "(refund_id,merchant_key,user_tg_id,amount_toman,state,wallet_hold_key,"
+            "bank_details_cipher,created_at) "
+            "VALUES ('refund-w02-final','root',101,500,'requested','hold-refund-w02',"
+            "'cipher-bank-details',1794236600)"
+        )
+        conn.execute(
+            "INSERT INTO wallet_refund_holds "
+            "(hold_key,merchant_key,user_tg_id,amount_toman,state,created_at) "
+            "VALUES ('hold-refund-w02','root',101,500,'active',1794236600)"
+        )
+        conn.execute(
+            "INSERT INTO coupons(code,issuer_key,discount_toman,budget_toman,expires_at) "
+            "VALUES ('W02FINAL','root',100,0,1794323000)"
+        )
+        conn.execute(
+            "INSERT INTO coupon_uses(code,order_id,amount_toman,state) "
+            "VALUES ('W02FINAL','w02-final-order',100,'held')"
+        )
+        conn.execute(
+            "INSERT INTO scheduled_jobs(job_key,kind,due_at,state) "
+            "VALUES ('w02-final-job','refund_reconcile',1794236600,'pending')"
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO refund_requests "
+                "(refund_id,merchant_key,user_tg_id,amount_toman,state,wallet_hold_key,"
+                "bank_details_cipher,created_at) "
+                "VALUES ('refund-w02-zero','root',101,0,'requested','hold-zero',"
+                "'cipher',1794236600)"
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO coupons(code,issuer_key,discount_toman,budget_toman,expires_at) "
+                "VALUES ('W02BADZERO','root',0,0,1794323000)"
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO coupons(code,issuer_key,discount_toman,budget_toman,expires_at) "
+                "VALUES ('W02BADBUDGET','root',1,-1,1794323000)"
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO coupon_uses(code,order_id,amount_toman,state) "
+                "VALUES ('W02FINAL','w02-final-order','100','invalid')"
+            )
+        conn.rollback()
+        conn.commit()
+        assert apply_migrations(conn, migration_dir, now=1794236700) == []
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migration_017_fulfillment_audit(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    with _prepared_w02_final_database(root, tmp_path, monkeypatch) as (
+        helpers, database, sentinel, db_path, conn
+    ):
+        migration_dir = _apply_w02_final_target(
+            root, tmp_path, conn, "017_fulfillment_audit", 1794236800
+        )
+        assert "details_cipher" in {
+            row[1] for row in conn.execute("PRAGMA table_info(audit_logs)")
+        }
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(goods_fulfillments)"
+        )] == [
+            "order_id", "state", "inventory_id", "payload_cipher",
+            "claim_token", "lease_until", "exposed_at", "revision",
+        ]
+        _seed_w02_quote_and_order(conn)
+        conn.execute(
+            "INSERT INTO goods_fulfillments(order_id,state,payload_cipher) "
+            "VALUES ('w02-final-order','awaiting_manual','cipher-fulfillment')"
+        )
+        ledger_id = conn.execute(
+            "SELECT id FROM financial_ledger ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="ledger_append_only"):
+            conn.execute(
+                "UPDATE financial_ledger SET description=description WHERE id=?",
+                (ledger_id,),
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="ledger_append_only"):
+            conn.execute(
+                "DELETE FROM financial_ledger WHERE id=?", (ledger_id,)
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="quote_immutable"):
+            conn.execute(
+                "UPDATE quotes SET amount_toman=amount_toman WHERE quote_id='w02-final-quote'"
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="quote_immutable"):
+            conn.execute(
+                "DELETE FROM quotes WHERE quote_id='w02-final-quote'"
+            )
+        conn.rollback()
+        conn.commit()
+        assert apply_migrations(conn, migration_dir, now=1794236900) == []
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migration_018_manual_pool(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    with _prepared_w02_final_database(root, tmp_path, monkeypatch) as (
+        helpers, database, sentinel, db_path, conn
+    ):
+        migration_dir = _apply_w02_final_target(
+            root, tmp_path, conn, "018_manual_pool", 1794237000
+        )
+        assert [row[1] for row in conn.execute(
+            "PRAGMA table_info(manual_pool_clients)"
+        )] == [
+            "id", "panel_id", "external_identifier", "account_id", "status",
+            "config_cipher", "quota_mode", "quota_bytes", "used_bytes",
+            "time_mode", "expires_at", "enabled", "allocation_key", "revision",
+            "created_at",
+        ]
+        indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(manual_pool_clients)")
+        }
+        assert "idx_manual_pool_available" in indexes
+        conn.execute(
+            "INSERT INTO manual_pool_clients "
+            "(id,panel_id,external_identifier,config_cipher,quota_mode,quota_bytes,"
+            "used_bytes,time_mode,expires_at,created_at) "
+            "VALUES (91300,?,'manual-available-1','cipher-config','finite',1000,0,"
+            "'dated',1794323400,1794237000)",
+            (_W02_FINAL_PANEL_ID,),
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO manual_pool_clients "
+                "(id,panel_id,external_identifier,config_cipher,quota_mode,quota_bytes,"
+                "used_bytes,time_mode,created_at) "
+                "VALUES (91301,?,'manual-negative-quota','cipher','finite',-1,0,'dated',1794237000)",
+                (_W02_FINAL_PANEL_ID,),
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO manual_pool_clients "
+                "(id,panel_id,external_identifier,config_cipher,quota_mode,quota_bytes,"
+                "used_bytes,time_mode,created_at) "
+                "VALUES (91302,?,'manual-negative-used','cipher','finite',1000,-1,'dated',1794237000)",
+                (_W02_FINAL_PANEL_ID,),
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO manual_pool_clients "
+                "(id,panel_id,external_identifier,config_cipher,quota_mode,quota_bytes,"
+                "used_bytes,time_mode,created_at) "
+                "VALUES (91303,?,'manual-invalid-time','cipher','finite',1000,0,'forever',1794237000)",
+                (_W02_FINAL_PANEL_ID,),
+            )
+        conn.rollback()
+        conn.commit()
+        assert apply_migrations(conn, migration_dir, now=1794237100) == []
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
