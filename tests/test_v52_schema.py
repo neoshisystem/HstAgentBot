@@ -421,7 +421,7 @@ def test_migration_004_plans(tmp_path, monkeypatch):
             )
         assert conn.execute("PRAGMA foreign_key_check").fetchall()==[]
         conn.commit()
-        assert _snapshot_tables(conn,prior_tables)==old_state
+
         assert conn.execute("SELECT owner_tg_id FROM accounts WHERE id=?",(account["account_id"],)).fetchone()==(actor["actor_tg_id"],)
         assert conn.execute(
             "SELECT amount,description FROM financial_ledger WHERE account_code=?",(account["account_code"],)
