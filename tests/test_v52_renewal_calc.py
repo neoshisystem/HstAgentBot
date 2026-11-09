@@ -76,7 +76,7 @@ def test_unknown_and_unlimited_are_not_coerced_to_finite_zero():
 
 def test_addon_adds_headroom_for_overused_client_without_resetting_usage():
     # Add-only adjustments preserve the existing expiry exactly; use the approved baseline.
-target = calculate_addon(client(expiry=NOW), add_bytes=5 * GIB, now=NOW)
+    target = calculate_addon(client(expiry=NOW), add_bytes=5 * GIB, now=NOW)
     assert target["used_bytes"] == 12 * GIB
     assert target["quota_bytes"] == 17 * GIB
     assert target["expires_at"] == NOW
