@@ -245,7 +245,9 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             if (isinstance(up, int) and not isinstance(up, bool) and up >= 0
                     and isinstance(down, int) and not isinstance(down, bool) and down >= 0):
                 used = up + down
-        first = self._ms_to_seconds(wire.get("firstConnectedAt"))
+        # The published Client schema has no firstConnectedAt field. Do not
+        # turn undocumented keys or creation timestamps into a fake first-connect time.
+        first = None
         # 3X-UI exposes lastOnline under traffic; retain root fallback for
         # older/alternate responses without inventing a timestamp.
         last_raw = traffic.get("lastOnline") if isinstance(traffic, Mapping) else None
@@ -692,65 +694,151 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
 
 
     async def extend_client(self, email: str, renewal_result: Mapping[str, Any], operation_id: str) -> MutationResult:
-        """Apply a W06.4 renewal result with one full replacement write and read-back."""
+        """Apply an approved renewal target, resetting counters only when required.
+
+        A reset is independently read back before the replacement update. Any
+        interruption after either write remains UNKNOWN for explicit reconciliation.
+        """
         if not isinstance(operation_id, str) or not operation_id:
             return MutationResult("definite_failure", {"reason": "invalid_operation_id"})
         if not isinstance(email, str) or not email:
             return MutationResult("definite_failure", {"reason": "invalid_email"})
         if not isinstance(renewal_result, Mapping):
             return MutationResult("definite_failure", {"reason": "invalid_renewal_result"})
+
         state, wire, _ = await self._get_wire_client(email)
         if state != "found" or wire is None:
             return MutationResult("unknown", {"stage": "pre_read", "lookup": state})
         try:
             before = self._canonical(wire)
-            payload = self._editable_payload(wire)
+            if before.used_bytes is None:
+                return MutationResult("unknown", {"stage": "pre_read", "reason": "usage_unavailable"})
+
             quota_mode = renewal_result.get("quota_mode")
             quota_bytes = renewal_result.get("quota_bytes")
             if quota_mode == "unlimited":
-                payload["totalGB"] = 0
-            elif quota_mode == "finite" and isinstance(quota_bytes, int) and not isinstance(quota_bytes, bool) and quota_bytes >= 0:
-                payload["totalGB"] = quota_bytes
+                panel_quota = 0
+            elif (quota_mode == "finite" and isinstance(quota_bytes, int)
+                  and not isinstance(quota_bytes, bool) and quota_bytes > 0):
+                panel_quota = quota_bytes
             else:
-                raise ValueError("renewal result has no valid quota target")
+                return MutationResult("definite_failure", {"reason": "invalid_renewal_quota"})
             target_expiry = renewal_result.get("expires_at")
-            payload["expiryTime"] = expiry_seconds_to_panel_ms(target_expiry)
+            try:
+                panel_expiry = expiry_seconds_to_panel_ms(target_expiry)
+            except (TypeError, ValueError):
+                return MutationResult("definite_failure", {"reason": "invalid_renewal_expiry"})
+
+            target_used = renewal_result.get("used_bytes", before.used_bytes)
+            if (isinstance(target_used, bool) or not isinstance(target_used, int)
+                    or target_used < 0 or target_used not in {before.used_bytes, 0}):
+                return MutationResult("definite_failure", {"reason": "unsupported_usage_target"})
+            reset_needed = target_used != before.used_bytes
+            payload = self._editable_payload(wire)
+
+            expected_enabled = before.enabled
+            if reset_needed:
+                reset = await self._request(
+                    "POST", f"clients/resetTraffic/{quote(email, safe='')}"
+                )
+                if not self._api_ok(reset):
+                    return MutationResult("unknown", {
+                        "stage": "reset_write", "http_status": reset.status_code,
+                        "partial_application_possible": True,
+                    })
+
+                traffic_result = await self._request(
+                    "GET", f"clients/traffic/{quote(email, safe='')}"
+                )
+                traffic = self._obj(traffic_result)
+                if not isinstance(traffic, Mapping):
+                    return MutationResult("unknown", {"stage": "reset_readback_malformed"})
+                up, down = traffic.get("up"), traffic.get("down")
+                if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (up, down)):
+                    return MutationResult("unknown", {"stage": "reset_readback_invalid"})
+                if up + down != 0:
+                    return MutationResult("unknown", {
+                        "stage": "reset_readback", "counters_zero": False,
+                    })
+
+                reset_state, reset_wire, _ = await self._get_wire_client(email)
+                if reset_state != "found" or reset_wire is None:
+                    return MutationResult("unknown", {"stage": "post_reset_client_readback", "lookup": reset_state})
+                reset_client = self._canonical(reset_wire)
+                if (reset_client.quota_mode != before.quota_mode
+                        or reset_client.quota_bytes != before.quota_bytes
+                        or reset_client.time_mode != before.time_mode
+                        or reset_client.expires_at != before.expires_at
+                        or reset_client.subscription_id != before.subscription_id):
+                    return MutationResult("unknown", {
+                        "stage": "post_reset_client_readback",
+                        "unrelated_fields_preserved": False,
+                    })
+                if reset_client.enabled is None:
+                    return MutationResult("unknown", {
+                        "stage": "post_reset_client_readback", "enable_state_unavailable": True,
+                    })
+                # resetTraffic may re-enable a client depleted by quota. Preserve
+                # the state returned by the panel instead of writing the stale flag.
+                expected_enabled = reset_client.enabled
+                payload = self._editable_payload(reset_wire)
+
+            payload["totalGB"] = panel_quota
+            payload["expiryTime"] = panel_expiry
             sent = await self._post_full_client(email, payload)
             if not self._api_ok(sent):
                 return MutationResult(self._update_failure_state(sent), {
                     "stage": "write", "http_status": sent.status_code,
+                    "reset_already_applied": reset_needed,
                 })
+
             read_state, read_wire, read = await self._get_wire_client(email)
             if read_state != "found" or read_wire is None:
-                return MutationResult("unknown", {"stage": "readback", "lookup": read_state})
+                return MutationResult("unknown", {"stage": "client_readback", "lookup": read_state})
             after = self._canonical(read_wire)
-            expected_quota_mode, expected_quota = normalize_volume(payload["totalGB"], zero_is_unlimited=True)
-            expected_time_mode, expected_expiry = normalize_expiry(payload["expiryTime"], zero_is_unlimited=True)
+            traffic_result = await self._request(
+                "GET", f"clients/traffic/{quote(email, safe='')}"
+            )
+            traffic = self._obj(traffic_result)
+            if not isinstance(traffic, Mapping):
+                return MutationResult("unknown", {"stage": "usage_readback_malformed"})
+            up, down = traffic.get("up"), traffic.get("down")
+            if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (up, down)):
+                return MutationResult("unknown", {"stage": "usage_readback_invalid"})
+            actual_used = up + down
+
+            expected_quota_mode, expected_quota = normalize_volume(panel_quota, zero_is_unlimited=True)
+            expected_time_mode, expected_expiry = normalize_expiry(panel_expiry, zero_is_unlimited=True)
             matches = (
                 after.quota_mode == expected_quota_mode
                 and after.quota_bytes == expected_quota
                 and after.time_mode == expected_time_mode
                 and after.expires_at == expected_expiry
-                and after.enabled == before.enabled
-                and after.used_bytes == before.used_bytes
+                and after.enabled == expected_enabled
                 and after.subscription_id == before.subscription_id
+                and actual_used == target_used
             )
             return MutationResult(
                 "success" if matches else "unknown",
                 {"stage": "readback", "renewal_matches": matches,
-                 "usage_preserved": after.used_bytes == before.used_bytes,
-                 "unrelated_fields_preserved": (
-                     after.enabled == before.enabled
-                     and after.subscription_id == before.subscription_id
-                 ),
+                 "quota_matches": after.quota_mode == expected_quota_mode and after.quota_bytes == expected_quota,
+                 "expiry_matches": after.time_mode == expected_time_mode and after.expires_at == expected_expiry,
+                 "usage_matches": actual_used == target_used,
+                 "enable_preserved_or_panel_reset_effect": after.enabled == expected_enabled,
                  "http_status": read.status_code if read else None},
-                {"quota_bytes": expected_quota, "expires_at": expected_expiry},
+                {"quota_bytes": expected_quota, "expires_at": expected_expiry,
+                 "used_bytes": target_used,
+                 "may_reenable_if_depleted": bool(reset_needed and before.quota_mode == "finite"
+                                                   and before.quota_bytes is not None
+                                                   and before.used_bytes >= before.quota_bytes)},
             )
         except AdapterUnavailable:
-            return MutationResult("unknown", {"stage": "pre_read_or_write"})
+            return MutationResult("unknown", {"stage": "pre_read_reset_write_or_readback"})
         except (TypeError, ValueError):
             return MutationResult("definite_failure", {"reason": "invalid_renewal_target"})
-
+        except Exception:
+            return MutationResult("unknown", {"stage": "renewal_normalization"})
+        
     async def get_inbound_traffic(self, inbound_id: int) -> Mapping[str, Any]:
         """Return normalized traffic counters from the authoritative inbound GET."""
         if isinstance(inbound_id, bool) or not isinstance(inbound_id, int) or inbound_id <= 0:
@@ -774,7 +862,7 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         }
 
     async def add_traffic_and_days(self, email: str, add_bytes: int, add_days: int) -> MutationResult:
-        """Use the documented bulkAdjust operation, then reconcile by client read-back."""
+        """Add paid quota and days while preserving use; reconcile exact RFP targets."""
         if not isinstance(email, str) or not email:
             return MutationResult("definite_failure", {"reason": "invalid_email"})
         if isinstance(add_bytes, bool) or not isinstance(add_bytes, int) or add_bytes < 0:
@@ -788,8 +876,25 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             return MutationResult("unknown", {"stage": "pre_read", "lookup": state})
         try:
             before = self._canonical(wire)
-            sent = await self._request("POST", "clients/bulkAdjust",
-                                      json_body={"emails": [email], "addBytes": add_bytes, "addDays": add_days})
+            if before.time_mode == "on_hold" and add_days:
+                return MutationResult("definite_failure", {"reason": "on_hold_days_forbidden"})
+            quota_delta = 0
+            target_quota = before.quota_bytes
+            if before.quota_mode == "finite" and add_bytes:
+                if before.quota_bytes is None or before.used_bytes is None:
+                    return MutationResult("unknown", {"stage": "pre_read", "reason": "quota_or_usage_unavailable"})
+                # If a client is already over quota, add enough headroom to
+                # deliver V bytes beyond U. Otherwise this reduces to Q + V.
+                target_quota = max(before.quota_bytes, before.used_bytes) + add_bytes
+                quota_delta = target_quota - before.quota_bytes
+            expected_expiry = before.expires_at
+            if before.time_mode == "dated" and add_days:
+                expected_expiry = max(int(self._clock()), before.expires_at or 0) + add_days * 86400
+
+            sent = await self._request(
+                "POST", "clients/bulkAdjust",
+                json_body={"emails": [email], "addBytes": quota_delta, "addDays": add_days},
+            )
             if not self._api_ok(sent):
                 return MutationResult("unknown", {
                     "stage": "bulk_adjust", "http_status": sent.status_code,
@@ -799,68 +904,191 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             if read_state != "found" or read_wire is None:
                 return MutationResult("unknown", {"stage": "readback", "lookup": read_state})
             after = self._canonical(read_wire)
+            usage_ok = before.used_bytes is not None and after.used_bytes == before.used_bytes
             quota_ok = (
-                before.quota_mode == "unlimited" or
-                (before.quota_mode == "finite" and after.quota_bytes == before.quota_bytes + add_bytes)
+                before.quota_mode == "unlimited"
+                or (before.quota_mode == "finite" and after.quota_mode == "finite"
+                    and after.quota_bytes == target_quota)
             )
             expiry_ok = (
-                before.time_mode == "unlimited" or before.time_mode == "on_hold" or
-                (before.time_mode == "dated" and after.expires_at == max(int(self._clock()), before.expires_at or 0) + add_days * 86400)
+                after.time_mode == before.time_mode and after.expires_at == expected_expiry
             )
-            usage_ok = after.used_bytes == before.used_bytes
-            # Unlimited fields are explicitly skipped by bulkAdjust; they are not
-            # silently converted to finite values.
-            # bulkAdjust is the authoritative mutation result; read-back must at
-            # least prove the client remains readable and usage was not reset.
-            # Quota/expiry exactness is retained as evidence because panel versions
-            # may expose these fields with different normalization.
-            reconciled = usage_ok
+            reconciled = usage_ok and quota_ok and expiry_ok
             return MutationResult(
                 "success" if reconciled else "unknown",
                 {"stage": "readback", "quota_adjusted": quota_ok, "expiry_adjusted": expiry_ok,
                  "usage_preserved": usage_ok, "http_status": read.status_code if read else None},
-                {"add_bytes": add_bytes, "add_days": add_days},
+                {"add_bytes": add_bytes, "add_days": add_days,
+                 "quota_bytes": target_quota, "expires_at": expected_expiry},
             )
         except AdapterUnavailable:
             return MutationResult("unknown", {"stage": "transport_or_readback"})
+        except Exception:
+            return MutationResult("unknown", {"stage": "addon_normalization"})
 
-
+    
     async def create_client(self, spec: ClientCreateSpec) -> MutationResult:
+        """Create only a pre-identified client with durably sealed credentials and read-back."""
         if not isinstance(spec, Mapping):
             return MutationResult("definite_failure", {"reason": "invalid_client_spec"})
+        operation_id = spec.get("operation_id")
         email = spec.get("email")
         inbound_ids = spec.get("inbound_ids")
-        if not isinstance(email, str) or not email:
-            return MutationResult("definite_failure", {"reason": "invalid_email"})
-        if not isinstance(inbound_ids, (list, tuple)) or not inbound_ids:
-            return MutationResult("definite_failure", {"reason": "inbound_scope_required"})
-        if any(isinstance(i, bool) or not isinstance(i, int) or i <= 0 for i in inbound_ids):
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            return MutationResult("definite_failure", {"reason": "operation_id_required"})
+        if not isinstance(email, str) or not email.strip():
+            return MutationResult("definite_failure", {"reason": "stable_external_identifier_required"})
+        if (not isinstance(inbound_ids, (list, tuple)) or not inbound_ids
+                or any(isinstance(i, bool) or not isinstance(i, int) or i <= 0 for i in inbound_ids)
+                or len(set(inbound_ids)) != len(inbound_ids)):
             return MutationResult("definite_failure", {"reason": "invalid_inbound_scope"})
-        client = {
+        on_first_connect = spec.get("on_first_connect")
+        if not isinstance(on_first_connect, bool):
+            return MutationResult("definite_failure", {"reason": "on_first_connect_must_be_explicit"})
+        if on_first_connect:
+            # The published create schema has no documented first-connect timer.
+            return MutationResult("definite_failure", {
+                "reason": "first_connect_expiry_requires_evidence",
+                "network_call_made": False,
+            })
+        duration = spec.get("duration_seconds")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+            return MutationResult("definite_failure", {"reason": "invalid_duration_seconds"})
+        quota_mode = spec.get("quota_mode")
+        quota_bytes = spec.get("quota_bytes")
+        if quota_mode == "unlimited":
+            total_bytes = 0
+        elif (quota_mode == "finite" and isinstance(quota_bytes, int)
+              and not isinstance(quota_bytes, bool) and quota_bytes > 0):
+            total_bytes = quota_bytes
+        else:
+            return MutationResult("definite_failure", {"reason": "invalid_quota_target"})
+        comment = spec.get("comment")
+        if not isinstance(comment, str):
+            return MutationResult("definite_failure", {"reason": "invalid_comment"})
+        enabled = spec.get("enable", True)
+        if not isinstance(enabled, bool):
+            return MutationResult("definite_failure", {"reason": "invalid_enable_state"})
+        try:
+            candidate = self._normalize_credential_candidate(spec.get("candidate_credentials"))
+        except (TypeError, ValueError):
+            return MutationResult("definite_failure", {"reason": "invalid_candidate_credentials"})
+        if not candidate:
+            return MutationResult("definite_failure", {"reason": "candidate_credentials_required"})
+        if self._operation_preflight is None:
+            return MutationResult("definite_failure", {
+                "reason": "encrypted_candidate_preflight_not_configured",
+                "network_call_made": False,
+            })
+
+        # Never let 3X-UI's documented re-add behavior reuse another client's
+        # stored ID/passwords on the requested external identifier.
+        lookup, existing, _ = await self._get_wire_client(email)
+        if lookup == "found":
+            return MutationResult("definite_failure", {
+                "reason": "external_identifier_conflict",
+                "network_call_made": False,
+            })
+        if lookup != "not_found":
+            return MutationResult("unknown", {"stage": "collision_pre_read", "lookup": lookup})
+
+        stable_request = {
             "email": email,
-            "totalGB": 0 if spec.get("quota_mode") == "unlimited" else spec.get("quota_bytes"),
-            "expiryTime": expiry_seconds_to_panel_ms(spec.get("expires_at")) if spec.get("expires_at") else 0,
-            "tgId": int(spec.get("tg_id", 0)),
-            "limitIp": int(spec.get("limit_ip", 0)),
-            "limitHwid": int(spec.get("limit_hwid", 0)),
-            "enable": bool(spec.get("enable", True)),
-            "comment": str(spec.get("comment", "")),
+            "inbound_ids": list(inbound_ids),
+            "quota_mode": quota_mode,
+            "quota_bytes": total_bytes,
+            "duration_seconds": duration,
+            "comment": comment,
+            "credentials": candidate,
         }
         try:
-            sent = await self._request("POST", "clients/add", json_body={"client": client, "inboundIds": list(inbound_ids)})
-        except (AdapterUnavailable, TypeError, ValueError):
-            return MutationResult("unknown", {"stage": "create_write"})
+            prepared = bool(self._operation_preflight(operation_id, stable_request, "client_create"))
+        except Exception:
+            prepared = False
+        if not prepared:
+            return MutationResult("definite_failure", {
+                "reason": "encrypted_create_candidate_not_confirmed",
+                "network_call_made": False,
+            })
+
+        now_s = int(self._clock())
+        if now_s <= 0:
+            return MutationResult("definite_failure", {"reason": "invalid_clock"})
+        expiry_ms = (now_s + duration) * 1000
+        tg_id = spec.get("tg_id", 0)
+        limit_ip = spec.get("limit_ip", 0)
+        limit_hwid = spec.get("limit_hwid", 0)
+        for name, value in (("tg_id", tg_id), ("limit_ip", limit_ip), ("limit_hwid", limit_hwid)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return MutationResult("definite_failure", {"reason": "invalid_" + name})
+
+        client = {
+            "email": email,
+            "totalGB": total_bytes,
+            "expiryTime": expiry_ms,
+            "tgId": tg_id,
+            "limitIp": limit_ip,
+            "limitHwid": limit_hwid,
+            "enable": enabled,
+            "comment": comment,
+        }
+        client.update(candidate)
+        try:
+            sent = await self._request(
+                "POST", "clients/add",
+                json_body={"client": client, "inboundIds": list(inbound_ids)},
+            )
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "create_write", "external_identifier": email})
         if not self._api_ok(sent):
-            return MutationResult("unknown", {"stage": "create_write", "http_status": sent.status_code,
-                                              "partial_application_possible": True})
+            return MutationResult("unknown", {
+                "stage": "create_write", "http_status": sent.status_code,
+                "partial_application_possible": True,
+            })
+
         state, wire, read = await self._get_wire_client(email)
         if state != "found" or wire is None:
             return MutationResult("unknown", {"stage": "create_readback", "lookup": state})
+        try:
+            actual = self._canonical(wire)
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "create_readback_malformed"})
+        expected_quota_mode, expected_quota = normalize_volume(total_bytes, zero_is_unlimited=True)
+        expected_expiry_mode, expected_expiry = normalize_expiry(expiry_ms, zero_is_unlimited=True)
+        inbound_readback = wire.get("inboundIds")
+        inbounds_match = (
+            isinstance(inbound_readback, list)
+            and all(isinstance(i, int) and not isinstance(i, bool) for i in inbound_readback)
+            and set(inbound_readback) == set(inbound_ids)
+        )
+        credentials_match = all(
+            (wire.get("uuid") == value or wire.get("id") == value) if name == "id"
+            else wire.get(name) == value
+            for name, value in candidate.items()
+        )
+        inbound_credentials_match = await self._verify_inbound_credentials(
+            email, list(inbound_ids), candidate
+        )
+        matches = (
+            actual.ref[2] == email
+            and actual.enabled is enabled
+            and actual.quota_mode == expected_quota_mode
+            and actual.quota_bytes == expected_quota
+            and actual.time_mode == expected_expiry_mode
+            and actual.expires_at == expected_expiry
+            and wire.get("comment") == comment
+            and inbounds_match
+            and credentials_match
+            and inbound_credentials_match
+        )
         return MutationResult(
-            "success",
-            {"stage": "create_readback", "http_status": read.status_code if read else None,
-             "email": email, "inbound_scope": list(inbound_ids)},
-            {"client_created": True},
+            "success" if matches else "unknown",
+            {"stage": "create_readback", "client_matches": matches,
+             "inbounds_match": inbounds_match, "credentials_match": credentials_match,
+             "all_inbound_credentials_match": inbound_credentials_match,
+             "http_status": read.status_code if read else None,
+             "external_identifier": email},
+            {"client_created": matches, "inbound_ids": list(inbound_ids)},
         )
 
     async def set_client_enabled(self, identifier: str, enabled: bool, operation_id: str) -> MutationResult:
@@ -868,6 +1096,15 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             return MutationResult("definite_failure", {"reason": "invalid_enable_request"})
         if not isinstance(operation_id, str) or not operation_id:
             return MutationResult("definite_failure", {"reason": "invalid_operation_id"})
+        lookup, wire, _ = await self._get_wire_client(identifier)
+        if lookup == "not_found":
+            return MutationResult("definite_failure", {"reason": "exact_client_not_found", "network_call_made": False})
+        if lookup != "found" or wire is None:
+            return MutationResult("unknown", {"stage": "enable_pre_read", "lookup": lookup})
+        try:
+            before = self._canonical(wire)
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "enable_pre_read_mapping"})
         endpoint = "clients/bulkEnable" if enabled else "clients/bulkDisable"
         try:
             sent = await self._request("POST", endpoint, json_body={"emails": [identifier]})
@@ -879,13 +1116,16 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         state, wire, read = await self._get_wire_client(identifier)
         if state != "found" or wire is None:
             return MutationResult("unknown", {"stage": "enable_readback", "lookup": state})
-        actual = wire.get("enable")
-        matches = actual is enabled
+        try:
+            after = self._canonical(wire)
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "enable_readback_mapping"})
+        matches = after.ref == before.ref and after.enabled is enabled
         return MutationResult(
             "success" if matches else "unknown",
             {"stage": "enable_readback", "enable_matches": matches,
              "http_status": read.status_code if read else None},
-            {"enabled": enabled},
+            {"enabled": enabled, "exact_client_ref": before.ref},
         )
 
     async def delete_client(self, identifier: str, operation_id: str) -> MutationResult:
@@ -893,6 +1133,15 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             return MutationResult("definite_failure", {"reason": "invalid_email"})
         if not isinstance(operation_id, str) or not operation_id:
             return MutationResult("definite_failure", {"reason": "invalid_operation_id"})
+        lookup, wire, _ = await self._get_wire_client(identifier)
+        if lookup == "not_found":
+            return MutationResult("definite_failure", {"reason": "exact_client_not_found", "network_call_made": False})
+        if lookup != "found" or wire is None:
+            return MutationResult("unknown", {"stage": "delete_pre_read", "lookup": lookup})
+        try:
+            before = self._canonical(wire)
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "delete_pre_read_mapping"})
         try:
             sent = await self._request("POST", f"clients/del/{quote(identifier, safe='')}",
                                        params={"keepTraffic": 1})
@@ -901,14 +1150,27 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         if not self._api_ok(sent):
             return MutationResult("unknown", {"stage": "delete_write", "http_status": sent.status_code,
                                               "partial_application_possible": True})
-        state, _, _ = await self._get_wire_client(identifier)
-        return MutationResult(
-            "success" if state == "not_found" else "unknown",
-            {"stage": "delete_readback", "lookup": state},
-            {"client_deleted": state == "not_found"},
-        )
+        state, after_wire, read = await self._get_wire_client(identifier)
+        if state == "not_found":
+            return MutationResult("success", {
+                "stage": "delete_readback", "lookup": state,
+                "http_status": read.status_code if read else None,
+                "deleted_client_ref": before.ref,
+            }, {"client_deleted": True})
+        if state != "found" or after_wire is None:
+            return MutationResult("unknown", {"stage": "delete_readback", "lookup": state})
+        try:
+            after = self._canonical(after_wire)
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "delete_readback_mapping"})
+        return MutationResult("unknown", {
+            "stage": "delete_readback", "same_identifier_still_present": True,
+            "same_canonical_ref": after.ref == before.ref,
+        }, {"client_deleted": False})
 
     async def add_addon(self, identifier: str, target: dict, operation_id: str) -> MutationResult:
+        if not isinstance(operation_id, str) or not operation_id:
+            return MutationResult("definite_failure", {"reason": "invalid_operation_id"})
         if not isinstance(target, Mapping):
             return MutationResult("definite_failure", {"reason": "invalid_addon_target"})
         add_bytes = target.get("add_bytes", target.get("quota_bytes", 0))
