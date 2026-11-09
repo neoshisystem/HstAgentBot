@@ -25,7 +25,11 @@ class Session:
 
 def client(quota=1000, expiry=1_800_000_000_000, up=2, down=3, enabled=True):
     return {"email": "a@example.test", "enable": enabled, "subId": "sub",
-            "totalGB": quota, "expiryTime": expiry, "traffic": {"up": up, "down": down}, "inboundIds": [1]}
+            "totalGB": quota, "expiryTime": expiry, "traffic": {"up": up, "down": down},
+            "inboundIds": [1], "comment": "keep", "limitIp": 1, "reset": 0,
+            "resetDay": 0, "resetMax": 0, "resetWeekday": 0, "security": "auto",
+            "tgId": 123, "password": "pw", "flow": "", "auth": "", "id": "uuid-1",
+            "allowedIPs": [], "keepAlive": 0, "limitHwid": 2}
 
 def make(session):
     return XUIOpenAPIAdapter({"id": 3, "raw_url": "https://p.test/custom/panel/api-docs", "auth_cipher": "x"}, session,

@@ -25,7 +25,9 @@ class Session:
 
 def wire(sub="old"):
     return {"email": "a@example.test", "enable": True, "subId": sub, "totalGB": 1000,
-            "expiryTime": 1_800_000_000_000, "traffic": {"up": 2, "down": 3}, "inboundIds": [9]}
+            "expiryTime": 1_800_000_000_000, "traffic": {"up": 2, "down": 3}, "inboundIds": [9],
+            "comment": "keep", "limitIp": 1, "reset": 0, "resetDay": 0, "resetMax": 0,
+            "resetWeekday": 0, "security": "auto", "tgId": 1}
 
 def make(session):
     return XUIOpenAPIAdapter({"id": 9, "raw_url": "https://p.test/custom/panel/api-docs", "auth_cipher": "cipher"}, session,

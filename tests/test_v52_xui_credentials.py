@@ -28,7 +28,9 @@ class Session:
 def client(uuid="old-uuid"):
     return {"email": "u@example.test", "enable": True, "uuid": uuid, "subId": "s1",
             "totalGB": 1000, "expiryTime": 1_800_000_000_000, "traffic": {"up": 1, "down": 2},
-            "inboundIds": [11, 12]}
+            "inboundIds": [11, 12], "comment": "keep", "limitIp": 1, "reset": 0,
+            "resetDay": 0, "resetMax": 0, "resetWeekday": 0, "security": "auto",
+            "tgId": 1}
 
 def inbound(inbound_id, uuid):
     return {"id": inbound_id, "settings": json.dumps({"clients": [{"email": "u@example.test", "id": uuid}]})}

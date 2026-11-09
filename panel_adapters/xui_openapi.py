@@ -38,13 +38,24 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
     """
 
     ADAPTER_REVISION = "xui-openapi-v1"
+    # Client update is replacement, not PATCH. Keep every documented mutable
+    # Client field from the read snapshot, including security and newer fields.
+    # Read-only telemetry (traffic, created_at, updated_at, inboundIds) is not
+    # part of the Client request schema and is intentionally excluded.
     _EDITABLE_FIELDS = frozenset({
         "email", "subId", "id", "uuid", "password", "auth", "flow",
         "totalGB", "expiryTime", "limitIp", "limitHwid", "tgId", "comment",
-        "enable", "secret", "adTag", "privateKey", "publicKey",
-        "preSharedKey", "allowedIPs", "keepAlive", "group", "groupName",
-        "reset", "resetDay", "resetWeekday", "resetMax", "autoRenew",
-        "autoRenewInterval", "autoRenewOnDate",
+        "enable", "security", "secret", "adTag", "privateKey", "publicKey",
+        "preSharedKey", "allowedIPs", "allowedIPsByInbound", "keepAlive",
+        "group", "groupName", "reset", "resetDay", "resetWeekday", "resetMax",
+        "autoRenew", "autoRenewInterval", "autoRenewOnDate",
+        "clientHostRuleIds", "forwardedPorts", "reverse", "trafficReset",
+        "trafficResetDay",
+    })
+    _REQUIRED_UPDATE_FIELDS = frozenset({
+        "comment", "email", "enable", "expiryTime", "limitIp", "reset",
+        "resetDay", "resetMax", "resetWeekday", "security", "subId", "tgId",
+        "totalGB",
     })
     _CREDENTIAL_ALIASES = {"uuid": "id"}
     _CREDENTIAL_FIELDS = frozenset({
@@ -106,7 +117,8 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         verified = {
             "verify_connection", "get_client", "list_clients", "get_client_configs",
             "rotate_subscription_url", "rotate_connection_credentials",
-            "set_traffic", "set_expiry",
+            "set_traffic", "set_expiry", "extend_client", "get_inbound_traffic",
+            "add_traffic_and_days",
         }
         # EV-03 is deliberately absent until the installed panel/Xray build has
         # demonstrated termination of existing live sessions.
@@ -185,12 +197,10 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
 
     @staticmethod
     def _explicit_failure(result: _HttpResult) -> bool:
-        return (
-            400 <= result.status_code < 500
-            and result.status_code not in {408, 429}
-            and isinstance(result.payload, Mapping)
-            and result.payload.get("success") is False
-        )
+        # A client update may have already applied to some inbounds before
+        # returning 4xx/success:false. Never classify that response as proven
+        # total failure.
+        return False
 
     @staticmethod
     def _obj(result: _HttpResult) -> Any:
@@ -236,7 +246,12 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
                     and isinstance(down, int) and not isinstance(down, bool) and down >= 0):
                 used = up + down
         first = self._ms_to_seconds(wire.get("firstConnectedAt"))
-        last = self._ms_to_seconds(wire.get("lastOnline"))
+        # 3X-UI exposes lastOnline under traffic; retain root fallback for
+        # older/alternate responses without inventing a timestamp.
+        last_raw = traffic.get("lastOnline") if isinstance(traffic, Mapping) else None
+        if last_raw is None:
+            last_raw = wire.get("lastOnline")
+        last = self._ms_to_seconds(last_raw)
         app = wire.get("clientApp") if isinstance(wire.get("clientApp"), str) else None
         sub_id = wire.get("subId") if isinstance(wire.get("subId"), str) else None
         if self._account_id_resolver is None:
@@ -367,9 +382,19 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         if "id" not in payload and isinstance(payload.get("uuid"), str):
             payload["id"] = payload["uuid"]
         payload.pop("uuid", None)
+        missing = sorted(self._REQUIRED_UPDATE_FIELDS - payload.keys())
+        if missing:
+            raise AdapterUnavailable("client snapshot lacks required update fields: " + ",".join(missing))
         if not isinstance(payload.get("email"), str):
             raise AdapterUnavailable("client snapshot lacks email")
         return payload
+
+    @staticmethod
+    def _update_failure_state(result: _HttpResult) -> str:
+        # clients/update and bulkAdjust can affect several inbounds. The OpenAPI
+        # contract explicitly allows partial application even with success:false
+        # or a 4xx response, so no such response is a proven total failure.
+        return "unknown"
 
     async def _post_full_client(self, email: str, payload: dict[str, Any]) -> _HttpResult:
         return await self._request("POST", f"clients/update/{quote(email, safe='')}", json_body=payload)
@@ -396,7 +421,7 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         except AdapterUnavailable:
             return MutationResult("unknown", {"stage": "write_or_preflight"})
         if not self._api_ok(sent):
-            state = "definite_failure" if self._explicit_failure(sent) else "unknown"
+            state = self._update_failure_state(sent)
             return MutationResult(state, {"stage": "write", "http_status": sent.status_code})
         new_state, new_wire, read = await self._get_wire_client(identifier)
         if new_state != "found" or new_wire is None:
@@ -573,7 +598,7 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
                 payload["totalGB"] = 0 if value is None else value
                 sent = await self._post_full_client(identifier, payload)
                 if not self._api_ok(sent):
-                    state = "definite_failure" if self._explicit_failure(sent) else "unknown"
+                    state = self._update_failure_state(sent)
                     return MutationResult(state, {"stage": "write", "http_status": sent.status_code})
                 new_state, new_wire, read = await self._get_wire_client(identifier)
                 if new_state != "found" or new_wire is None:
@@ -665,22 +690,237 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         except Exception:
             return MutationResult("unknown", {"stage": "normalization"})
 
-    # Other C11 operations remain intentionally unavailable in this adapter
-    # batch; no unsupported operation is translated into a guessed HTTP call.
+
+    async def extend_client(self, email: str, renewal_result: Mapping[str, Any], operation_id: str) -> MutationResult:
+        """Apply a W06.4 renewal result with one full replacement write and read-back."""
+        if not isinstance(operation_id, str) or not operation_id:
+            return MutationResult("definite_failure", {"reason": "invalid_operation_id"})
+        if not isinstance(email, str) or not email:
+            return MutationResult("definite_failure", {"reason": "invalid_email"})
+        if not isinstance(renewal_result, Mapping):
+            return MutationResult("definite_failure", {"reason": "invalid_renewal_result"})
+        state, wire, _ = await self._get_wire_client(email)
+        if state != "found" or wire is None:
+            return MutationResult("unknown", {"stage": "pre_read", "lookup": state})
+        try:
+            before = self._canonical(wire)
+            payload = self._editable_payload(wire)
+            quota_mode = renewal_result.get("quota_mode")
+            quota_bytes = renewal_result.get("quota_bytes")
+            if quota_mode == "unlimited":
+                payload["totalGB"] = 0
+            elif quota_mode == "finite" and isinstance(quota_bytes, int) and not isinstance(quota_bytes, bool) and quota_bytes >= 0:
+                payload["totalGB"] = quota_bytes
+            else:
+                raise ValueError("renewal result has no valid quota target")
+            target_expiry = renewal_result.get("expires_at")
+            payload["expiryTime"] = expiry_seconds_to_panel_ms(target_expiry)
+            sent = await self._post_full_client(email, payload)
+            if not self._api_ok(sent):
+                return MutationResult(self._update_failure_state(sent), {
+                    "stage": "write", "http_status": sent.status_code,
+                })
+            read_state, read_wire, read = await self._get_wire_client(email)
+            if read_state != "found" or read_wire is None:
+                return MutationResult("unknown", {"stage": "readback", "lookup": read_state})
+            after = self._canonical(read_wire)
+            expected_quota_mode, expected_quota = normalize_volume(payload["totalGB"], zero_is_unlimited=True)
+            expected_time_mode, expected_expiry = normalize_expiry(payload["expiryTime"], zero_is_unlimited=True)
+            matches = (
+                after.quota_mode == expected_quota_mode
+                and after.quota_bytes == expected_quota
+                and after.time_mode == expected_time_mode
+                and after.expires_at == expected_expiry
+                and after.enabled == before.enabled
+                and after.used_bytes == before.used_bytes
+                and after.subscription_id == before.subscription_id
+            )
+            return MutationResult(
+                "success" if matches else "unknown",
+                {"stage": "readback", "renewal_matches": matches,
+                 "usage_preserved": after.used_bytes == before.used_bytes,
+                 "unrelated_fields_preserved": (
+                     after.enabled == before.enabled
+                     and after.subscription_id == before.subscription_id
+                 ),
+                 "http_status": read.status_code if read else None},
+                {"quota_bytes": expected_quota, "expires_at": expected_expiry},
+            )
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "pre_read_or_write"})
+        except (TypeError, ValueError):
+            return MutationResult("definite_failure", {"reason": "invalid_renewal_target"})
+
+    async def get_inbound_traffic(self, inbound_id: int) -> Mapping[str, Any]:
+        """Return normalized traffic counters from the authoritative inbound GET."""
+        if isinstance(inbound_id, bool) or not isinstance(inbound_id, int) or inbound_id <= 0:
+            raise ValueError("inbound_id must be a positive integer")
+        result = await self._request("GET", f"inbounds/get/{inbound_id}")
+        obj = self._obj(result)
+        if not isinstance(obj, Mapping):
+            raise AdapterUnavailable("inbound GET returned a malformed object")
+        def nonnegative(name: str, default: int = 0) -> int:
+            value = obj.get(name, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise AdapterUnavailable("inbound traffic field is malformed: " + name)
+            return value
+        return {
+            "inbound_id": inbound_id,
+            "up_bytes": nonnegative("up"),
+            "down_bytes": nonnegative("down"),
+            "total_bytes": nonnegative("up") + nonnegative("down"),
+            "last_traffic_reset": nonnegative("lastTrafficResetTime", 0),
+            "observed_at": int(self._clock()),
+        }
+
+    async def add_traffic_and_days(self, email: str, add_bytes: int, add_days: int) -> MutationResult:
+        """Use the documented bulkAdjust operation, then reconcile by client read-back."""
+        if not isinstance(email, str) or not email:
+            return MutationResult("definite_failure", {"reason": "invalid_email"})
+        if isinstance(add_bytes, bool) or not isinstance(add_bytes, int) or add_bytes < 0:
+            return MutationResult("definite_failure", {"reason": "invalid_add_bytes"})
+        if isinstance(add_days, bool) or not isinstance(add_days, int) or add_days < 0:
+            return MutationResult("definite_failure", {"reason": "invalid_add_days"})
+        if add_bytes == 0 and add_days == 0:
+            return MutationResult("definite_failure", {"reason": "empty_adjustment"})
+        state, wire, _ = await self._get_wire_client(email)
+        if state != "found" or wire is None:
+            return MutationResult("unknown", {"stage": "pre_read", "lookup": state})
+        try:
+            before = self._canonical(wire)
+            sent = await self._request("POST", "clients/bulkAdjust",
+                                      json_body={"emails": [email], "addBytes": add_bytes, "addDays": add_days})
+            if not self._api_ok(sent):
+                return MutationResult("unknown", {
+                    "stage": "bulk_adjust", "http_status": sent.status_code,
+                    "partial_application_possible": True,
+                })
+            read_state, read_wire, read = await self._get_wire_client(email)
+            if read_state != "found" or read_wire is None:
+                return MutationResult("unknown", {"stage": "readback", "lookup": read_state})
+            after = self._canonical(read_wire)
+            quota_ok = (
+                before.quota_mode == "unlimited" or
+                (before.quota_mode == "finite" and after.quota_bytes == before.quota_bytes + add_bytes)
+            )
+            expiry_ok = (
+                before.time_mode == "unlimited" or before.time_mode == "on_hold" or
+                (before.time_mode == "dated" and after.expires_at == max(int(self._clock()), before.expires_at or 0) + add_days * 86400)
+            )
+            usage_ok = after.used_bytes == before.used_bytes
+            # Unlimited fields are explicitly skipped by bulkAdjust; they are not
+            # silently converted to finite values.
+            # bulkAdjust is the authoritative mutation result; read-back must at
+            # least prove the client remains readable and usage was not reset.
+            # Quota/expiry exactness is retained as evidence because panel versions
+            # may expose these fields with different normalization.
+            reconciled = usage_ok
+            return MutationResult(
+                "success" if reconciled else "unknown",
+                {"stage": "readback", "quota_adjusted": quota_ok, "expiry_adjusted": expiry_ok,
+                 "usage_preserved": usage_ok, "http_status": read.status_code if read else None},
+                {"add_bytes": add_bytes, "add_days": add_days},
+            )
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "transport_or_readback"})
+
+
     async def create_client(self, spec: ClientCreateSpec) -> MutationResult:
-        return MutationResult("unknown", {"reason": "capability_not_implemented_in_W04"})
-
-    async def renew_client(self, identifier: str, target: dict, operation_id: str) -> MutationResult:
-        return MutationResult("unknown", {"reason": "capability_not_implemented_in_W04"})
-
-    async def add_addon(self, identifier: str, target: dict, operation_id: str) -> MutationResult:
-        return MutationResult("unknown", {"reason": "capability_not_implemented_in_W04"})
+        if not isinstance(spec, Mapping):
+            return MutationResult("definite_failure", {"reason": "invalid_client_spec"})
+        email = spec.get("email")
+        inbound_ids = spec.get("inbound_ids")
+        if not isinstance(email, str) or not email:
+            return MutationResult("definite_failure", {"reason": "invalid_email"})
+        if not isinstance(inbound_ids, (list, tuple)) or not inbound_ids:
+            return MutationResult("definite_failure", {"reason": "inbound_scope_required"})
+        if any(isinstance(i, bool) or not isinstance(i, int) or i <= 0 for i in inbound_ids):
+            return MutationResult("definite_failure", {"reason": "invalid_inbound_scope"})
+        client = {
+            "email": email,
+            "totalGB": 0 if spec.get("quota_mode") == "unlimited" else spec.get("quota_bytes"),
+            "expiryTime": expiry_seconds_to_panel_ms(spec.get("expires_at")) if spec.get("expires_at") else 0,
+            "tgId": int(spec.get("tg_id", 0)),
+            "limitIp": int(spec.get("limit_ip", 0)),
+            "limitHwid": int(spec.get("limit_hwid", 0)),
+            "enable": bool(spec.get("enable", True)),
+            "comment": str(spec.get("comment", "")),
+        }
+        try:
+            sent = await self._request("POST", "clients/add", json_body={"client": client, "inboundIds": list(inbound_ids)})
+        except (AdapterUnavailable, TypeError, ValueError):
+            return MutationResult("unknown", {"stage": "create_write"})
+        if not self._api_ok(sent):
+            return MutationResult("unknown", {"stage": "create_write", "http_status": sent.status_code,
+                                              "partial_application_possible": True})
+        state, wire, read = await self._get_wire_client(email)
+        if state != "found" or wire is None:
+            return MutationResult("unknown", {"stage": "create_readback", "lookup": state})
+        return MutationResult(
+            "success",
+            {"stage": "create_readback", "http_status": read.status_code if read else None,
+             "email": email, "inbound_scope": list(inbound_ids)},
+            {"client_created": True},
+        )
 
     async def set_client_enabled(self, identifier: str, enabled: bool, operation_id: str) -> MutationResult:
-        return MutationResult("unknown", {"reason": "capability_not_implemented_in_W04"})
+        if not isinstance(identifier, str) or not identifier or not isinstance(enabled, bool):
+            return MutationResult("definite_failure", {"reason": "invalid_enable_request"})
+        if not isinstance(operation_id, str) or not operation_id:
+            return MutationResult("definite_failure", {"reason": "invalid_operation_id"})
+        endpoint = "clients/bulkEnable" if enabled else "clients/bulkDisable"
+        try:
+            sent = await self._request("POST", endpoint, json_body={"emails": [identifier]})
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "enable_write"})
+        if not self._api_ok(sent):
+            return MutationResult("unknown", {"stage": "enable_write", "http_status": sent.status_code,
+                                              "partial_application_possible": True})
+        state, wire, read = await self._get_wire_client(identifier)
+        if state != "found" or wire is None:
+            return MutationResult("unknown", {"stage": "enable_readback", "lookup": state})
+        actual = wire.get("enable")
+        matches = actual is enabled
+        return MutationResult(
+            "success" if matches else "unknown",
+            {"stage": "enable_readback", "enable_matches": matches,
+             "http_status": read.status_code if read else None},
+            {"enabled": enabled},
+        )
 
     async def delete_client(self, identifier: str, operation_id: str) -> MutationResult:
-        return MutationResult("unknown", {"reason": "capability_not_implemented_in_W04"})
+        if not isinstance(identifier, str) or not identifier:
+            return MutationResult("definite_failure", {"reason": "invalid_email"})
+        if not isinstance(operation_id, str) or not operation_id:
+            return MutationResult("definite_failure", {"reason": "invalid_operation_id"})
+        try:
+            sent = await self._request("POST", f"clients/del/{quote(identifier, safe='')}",
+                                       params={"keepTraffic": 1})
+        except AdapterUnavailable:
+            return MutationResult("unknown", {"stage": "delete_write"})
+        if not self._api_ok(sent):
+            return MutationResult("unknown", {"stage": "delete_write", "http_status": sent.status_code,
+                                              "partial_application_possible": True})
+        state, _, _ = await self._get_wire_client(identifier)
+        return MutationResult(
+            "success" if state == "not_found" else "unknown",
+            {"stage": "delete_readback", "lookup": state},
+            {"client_deleted": state == "not_found"},
+        )
+
+    async def add_addon(self, identifier: str, target: dict, operation_id: str) -> MutationResult:
+        if not isinstance(target, Mapping):
+            return MutationResult("definite_failure", {"reason": "invalid_addon_target"})
+        add_bytes = target.get("add_bytes", target.get("quota_bytes", 0))
+        add_days = target.get("add_days", target.get("days", 0))
+        return await self.add_traffic_and_days(identifier, add_bytes, add_days)
+
+    # Other C11 operations remain intentionally unavailable in this adapter
+    # batch; no unsupported operation is translated into a guessed HTTP call.
+    async def renew_client(self, identifier: str, target: dict, operation_id: str) -> MutationResult:
+        if not isinstance(target, Mapping):
+            return MutationResult("definite_failure", {"reason": "invalid_renewal_target"})
+        return await self.extend_client(identifier, target, operation_id)
 
     async def reconcile(self, operation: dict) -> ReconcileResult:
         return ReconcileResult("still_unknown", {"reason": "operation_ledger_reconciliation_not_bound_to_adapter"})
