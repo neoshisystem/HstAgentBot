@@ -41,10 +41,20 @@ def test_addon_preserves_period_and_usage():
     s = S(
         R(200, {"success": True, "obj": wire()}),
         R(200, {"success": True, "obj": {"adjusted": 1}}),
-        R(200, {"success": True, "obj": wire(q=15, e=1_800_000_000_000 + 3 * 86400)}),
+        R(200, {"success": True, "obj": wire(q=15, e=1_800_000_000_000 + 3 * 86400 * 1000)}),
     )
     result = asyncio.run(adapter(s).add_addon("a@example.test", {"add_bytes": 5, "add_days": 3}, "op"))
-    assert result.state == "success" and result.expected_effect["add_bytes"] == 5
+    assert result.state == "success"
+    assert result.expected_effect == {
+        "add_bytes": 5,
+        "add_days": 3,
+        "quota_bytes": 15,
+        "expires_at": 1_800_259_200,
+    }
+    assert result.evidence["quota_adjusted"] is True
+    assert result.evidence["expiry_adjusted"] is True
+    assert result.evidence["usage_preserved"] is True
+    assert s.calls[1][2]["json"] == {"emails": ["a@example.test"], "addBytes": 5, "addDays": 3}
 
 
 def test_overquota_addon_supplies_purchased_headroom_without_resetting_usage():
