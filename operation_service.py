@@ -315,3 +315,265 @@ __all__ = [
     "OperationError", "OperationUnauthorized", "OperationConflict", "OperationBusy",
     "prepare_operation",
 ]
+
+
+def _finalization_evidence(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OperationError("finalization evidence must be a mapping")
+    result: dict[str, Any] = {}
+    forbidden = ("secret", "password", "token", "cipher", "authorization",
+                 "credential", "private_key", "api_key", "sub_id", "session")
+    for key, item in value.items():
+        if not isinstance(key, str) or not key or any(part in key.casefold() for part in forbidden):
+            raise OperationError("finalization evidence contains a forbidden field")
+        if isinstance(item, Mapping):
+            result[key] = _finalization_evidence(item)
+        elif isinstance(item, (list, tuple)):
+            result[key] = list(item)
+        elif item is None or isinstance(item, (str, int, bool)):
+            result[key] = item
+        else:
+            raise OperationError("finalization evidence must contain JSON-safe values")
+    return result
+
+
+def _same_effect(expected: Mapping[str, Any], observed: Mapping[str, Any]) -> bool:
+    """Compare every expected target field; extra live fields are harmless."""
+    return all(key in observed and observed[key] == value for key, value in expected.items())
+
+
+def _insert_operation_notice(
+    conn: sqlite3.Connection, *, operation_id: str, bot_id: int,
+    recipient_tg_id: int, outcome: str,
+) -> None:
+    event_key = f"panel-operation:{operation_id}:{outcome}"
+    resource_cipher = encrypt_secret(operation_id, "hstagent/columns/v1")
+    conn.execute(
+        "INSERT INTO delivery_outbox(event_key,bot_id,chat_id,thread_id,purpose,"
+        "resource_type,resource_id,state,next_attempt_at) "
+        "VALUES(?,?,?,NULL,'panel_operation_result','operation',?,'pending',0) "
+        "ON CONFLICT(event_key,bot_id,chat_id,purpose) DO NOTHING",
+        (event_key, bot_id, recipient_tg_id, resource_cipher),
+    )
+    row = conn.execute(
+        "SELECT resource_type,resource_id,chat_id,thread_id FROM delivery_outbox "
+        "WHERE event_key=? AND bot_id=? AND purpose='panel_operation_result'",
+        (event_key, bot_id),
+    ).fetchone()
+    try:
+        stored_resource = decrypt_secret(str(row[1]), "hstagent/columns/v1") if row is not None else ""
+    except Exception as exc:
+        raise OperationConflict("stored operation notification reference failed authentication") from exc
+    if row is None or (str(row[0]), stored_resource, int(row[2]), row[3]) != (
+        "operation", operation_id, recipient_tg_id, None
+    ):
+        raise OperationConflict("operation notification idempotency key conflicts")
+
+
+def finalize_success(
+    conn: sqlite3.Connection, *, operation_id: str, generation: int,
+    evidence: Mapping[str, Any], now: int,
+    account_mapping: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically map the account, capture holds, complete the order and enqueue delivery.
+
+    The caller must supply evidence from the same dispatch generation or a
+    reconciliation that positively matched the stored expected effect.  This
+    function performs no network I/O.
+    """
+    now = _now(now)
+    operation_id = str(operation_id or "").strip()
+    if not operation_id or len(operation_id) > 200:
+        raise OperationError("operation_id is required")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise OperationError("generation must be a positive integer")
+    safe_evidence = _finalization_evidence(evidence)
+    replay_state = None
+    with _atomic(conn):
+        row = conn.execute(
+            "SELECT operation_id,order_id,actor_tg_id,bot_id,account_id,panel_id,state,"
+            "generation,lock_token,expected_effect_json,evidence_json "
+            "FROM panel_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise OperationError("panel operation does not exist")
+        state, current_generation = str(row["state"]), int(row["generation"])
+        if state == "succeeded":
+            if current_generation != generation:
+                raise OperationConflict("success replay belongs to another generation")
+            prior = json.loads(str(row["evidence_json"] or "{}"))
+            return {"operation_id": operation_id, "state": "succeeded", "replayed": True,
+                    "evidence": prior}
+        if state not in {"dispatching", "needs_reconciliation"} or current_generation != generation:
+            raise OperationConflict("operation state or generation is not finalizable")
+        if not str(row["lock_token"] or ""):
+            raise OperationConflict("operation lock ownership token is missing")
+        outcome = str(safe_evidence.get("outcome", ""))
+        reconciled = safe_evidence.get("reconciliation_state") == "applied"
+        if outcome != "success" and not reconciled:
+            raise OperationConflict("success requires positive applied evidence")
+        expected = json.loads(str(row["expected_effect_json"] or "{}"))
+        expected_target = expected.get("target", {}) if isinstance(expected, dict) else {}
+        observed = safe_evidence.get("expected_effect", safe_evidence.get("actual_effect", {}))
+        if not isinstance(observed, Mapping):
+            raise OperationConflict("observed expected_effect must be an object")
+        if isinstance(observed.get("target"), Mapping):
+            observed = observed["target"]
+        if expected_target and not _same_effect(expected_target, observed):
+            raise OperationConflict("observed panel effect does not match the stored target")
+
+        allowed = {"email", "customer_name", "enable", "total_gb", "expiry_time", "sub_id"}
+        mapping = account_mapping if account_mapping is not None else {
+            key: value for key, value in observed.items() if key in allowed
+        }
+        if mapping is not None:
+            if not isinstance(mapping, Mapping):
+                raise OperationError("account_mapping must be a mapping")
+            allowed = {"email", "customer_name", "enable", "total_gb", "expiry_time", "sub_id"}
+            unknown = set(mapping) - allowed
+            if unknown:
+                raise OperationError("account_mapping contains unsupported fields")
+            assignments: list[str] = []
+            values: list[Any] = []
+            for key in ("email", "customer_name", "enable", "total_gb", "expiry_time"):
+                if key in mapping:
+                    value = mapping[key]
+                    if key == "enable" and value not in (0, 1, False, True):
+                        raise OperationError("account enable must be boolean")
+                    if key in {"total_gb", "expiry_time"} and (
+                        isinstance(value, bool) or not isinstance(value, (int, float))
+                    ):
+                        raise OperationError(f"account {key} must be numeric")
+                    if key in {"email", "customer_name"} and not isinstance(value, str):
+                        raise OperationError(f"account {key} must be text")
+                    assignments.append(f"{key}=?")
+                    values.append(int(value) if key == "enable" else value)
+            if "sub_id" in mapping:
+                raw_sub_id = mapping["sub_id"]
+                if not isinstance(raw_sub_id, str) or not raw_sub_id:
+                    raise OperationError("sub_id must be non-empty text")
+                assignments.extend(["sub_id=NULL", "sub_id_cipher=?"])
+                values.append(encrypt_secret(raw_sub_id, "hstagent/columns/v1"))
+            if assignments:
+                values.extend([int(row["account_id"]), int(row["panel_id"])])
+                changed = conn.execute(
+                    "UPDATE accounts SET " + ",".join(assignments) +
+                    " WHERE id=? AND panel_id=? AND deleted_at IS NULL",
+                    tuple(values),
+                )
+                if changed.rowcount != 1:
+                    raise OperationConflict("account mapping target is missing or moved to another panel")
+
+        order_id = str(row["order_id"] or "")
+        if order_id:
+            order = conn.execute(
+                "SELECT status FROM payment_orders WHERE order_id=?", (order_id,)
+            ).fetchone()
+            if order is None:
+                raise OperationConflict("operation payment order is missing")
+            order_state = str(order[0])
+            if order_state == "accepted":
+                hold_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM financial_holds WHERE order_id=? "
+                    "AND state IN ('active','captured')", (order_id,)
+                ).fetchone()[0])
+                if hold_count:
+                    from financial_service import capture_holds
+                    capture_holds(conn, order_id=order_id, actor_id=int(row["actor_tg_id"]), now=now)
+                else:
+                    conn.execute(
+                        "UPDATE payment_orders SET status='completed',revision=revision+1 "
+                        "WHERE order_id=? AND status='accepted'", (order_id,)
+                    )
+            elif order_state != "completed":
+                raise OperationConflict("payment order is not capturable")
+        _insert_operation_notice(
+            conn, operation_id=operation_id, bot_id=int(row["bot_id"]),
+            recipient_tg_id=int(row["actor_tg_id"]), outcome="succeeded",
+        )
+        evidence_json = _canonical(safe_evidence)
+        changed = conn.execute(
+            "UPDATE panel_operations SET state='succeeded',evidence_json=?,lease_until=NULL,"
+            "updated_at=? WHERE operation_id=? AND generation=? "
+            "AND lock_token=? AND state IN ('dispatching','needs_reconciliation')",
+            (evidence_json, now, operation_id, generation, str(row["lock_token"])),
+        )
+        if changed.rowcount != 1:
+            raise OperationConflict("operation generation or lock ownership changed")
+        replay_state = {"operation_id": operation_id, "state": "succeeded",
+                        "replayed": False, "evidence": safe_evidence}
+    return replay_state
+
+
+def finalize_failure(
+    conn: sqlite3.Connection, *, operation_id: str, generation: int,
+    evidence: Mapping[str, Any], now: int,
+) -> dict[str, Any]:
+    """Finalize only a proven non-application; UNKNOWN never releases funds or locks."""
+    now = _now(now)
+    operation_id = str(operation_id or "").strip()
+    if not operation_id or isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise OperationError("operation identity and generation are required")
+    safe_evidence = _finalization_evidence(evidence)
+    if safe_evidence.get("not_applied_proven") is not True or not str(safe_evidence.get("proof") or "").strip():
+        raise OperationConflict("definite failure requires explicit not_applied_proven evidence")
+    result: dict[str, Any]
+    with _atomic(conn):
+        row = conn.execute(
+            "SELECT order_id,actor_tg_id,bot_id,state,generation,lock_token "
+            "FROM panel_operations WHERE operation_id=?", (operation_id,)
+        ).fetchone()
+        if row is None:
+            raise OperationError("panel operation does not exist")
+        state = str(row["state"])
+        if state == "definite_failure":
+            if int(row["generation"]) != generation:
+                raise OperationConflict("failure replay belongs to another generation")
+            return {"operation_id": operation_id, "state": state, "replayed": True}
+        if state not in {"dispatching", "needs_reconciliation"} or int(row["generation"]) != generation:
+            raise OperationConflict("operation state or generation is not finalizable")
+        if not str(row["lock_token"] or ""):
+            raise OperationConflict("operation lock ownership token is missing")
+        order_id = str(row["order_id"] or "")
+        if order_id:
+            order = conn.execute(
+                "SELECT status FROM payment_orders WHERE order_id=?", (order_id,)
+            ).fetchone()
+            if order is None:
+                raise OperationConflict("operation payment order is missing")
+            order_state = str(order[0])
+            if order_state == "accepted":
+                from financial_service import release_holds
+                release_holds(conn, order_id=order_id)
+                conn.execute(
+                    "UPDATE payment_orders SET status='cancelled',revision=revision+1 "
+                    "WHERE order_id=? AND status='accepted'", (order_id,)
+                )
+            elif order_state == "completed":
+                from financial_service import reverse_order
+                reversed_result = reverse_order(
+                    conn, order_id=order_id, actor_id=int(row["actor_tg_id"]), now=now
+                )
+                if reversed_result.get("status") not in {"refunded", "operator_exception", "replayed"}:
+                    raise OperationConflict("completed payment order could not be reversed")
+            elif order_state not in {"cancelled", "closed_refunded", "exception"}:
+                raise OperationConflict("payment order is not eligible for definite failure")
+        _insert_operation_notice(
+            conn, operation_id=operation_id, bot_id=int(row["bot_id"]),
+            recipient_tg_id=int(row["actor_tg_id"]), outcome="failed",
+        )
+        evidence_json = _canonical(safe_evidence)
+        changed = conn.execute(
+            "UPDATE panel_operations SET state='definite_failure',evidence_json=?,lease_until=NULL,"
+            "updated_at=? WHERE operation_id=? AND generation=? AND lock_token=? "
+            "AND state IN ('dispatching','needs_reconciliation')",
+            (evidence_json, now, operation_id, generation, str(row["lock_token"])),
+        )
+        if changed.rowcount != 1:
+            raise OperationConflict("operation generation or lock ownership changed")
+        result = {"operation_id": operation_id, "state": "definite_failure", "replayed": False}
+    return result
+
+
+__all__ = list(__all__) + ["finalize_success", "finalize_failure"]
