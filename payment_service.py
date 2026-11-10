@@ -788,3 +788,171 @@ __all__ = [
     "create_card_attempt", "submit_receipt",
     "approve_order_receipt", "reject_order_receipt",
 ]
+
+
+def _additional_root_admin_id() -> int:
+    import config
+    value = getattr(config, "ADMIN_TELEGRAM_ID", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ReviewerNotAuthorized("configured root administrator identity is unavailable")
+    return value
+
+
+def handle_additional_received_payment(
+    conn: sqlite3.Connection,
+    *,
+    order_id: str,
+    reviewer_tg_id: int,
+    bot_id: int,
+    nonce: str,
+    external_payment_key: str,
+    destination: str,
+    amount_toman: int,
+    evidence_note: str,
+    now: int,
+) -> dict:
+    """Root-certify a second real receipt, credit its tenant wallet, and never dispatch again.
+
+    A Telegram file_id/photo is deliberately not accepted as payment proof. The
+    confirmation must carry a bank reference, exact snapshotted destination and amount.
+    """
+    reviewer_tg_id = _positive(reviewer_tg_id, "reviewer_tg_id")
+    bot_id = _positive(bot_id, "bot_id")
+    now = _timestamp(now)
+    if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24}", nonce):
+        raise PaymentError("a valid 24-character one-use confirmation nonce is required")
+    reference = str(external_payment_key or "").strip()
+    target = str(destination or "").strip()
+    note = str(evidence_note or "").strip()
+    if not reference or len(reference) > 256 or not target or len(note) < 8:
+        raise PaymentError("bank reference, destination and root evidence note are required")
+    if isinstance(amount_toman, bool) or not isinstance(amount_toman, int) or amount_toman <= 0:
+        raise PaymentError("additional payment amount must be a positive integer")
+    if reviewer_tg_id != _additional_root_admin_id():
+        raise ReviewerNotAuthorized("additional payment review is root-only")
+
+    from crypto_store import decrypt_secret, encrypt_secret
+    from financial_service import _sync_projection_cache, _wallet_balance, post_entry
+
+    with _atomic(conn):
+        order = conn.execute(
+            "SELECT actor_tg_id,bot_id,merchant_key,status,amount_toman,received_toman,revision "
+            "FROM payment_orders WHERE order_id=?",
+            (order_id,),
+        ).fetchone()
+        if order is None or int(order[1]) != bot_id:
+            raise ReviewConflict("payment order is missing or belongs to another bot")
+        if str(order[3]) not in {"accepted", "completed"}:
+            raise ReviewConflict("additional receipts are only valid after the original order was accepted")
+        merchant_key = str(order[2])
+        duplicate = conn.execute(
+            "SELECT attempt_id,order_id,amount_toman FROM payment_attempts WHERE external_payment_key=?",
+            (reference,),
+        ).fetchone()
+        if duplicate is not None:
+            if str(duplicate[1]) == order_id and int(duplicate[2]) == amount_toman:
+                return {
+                    "status": "duplicate", "credited": False, "replayed": True,
+                    "payment_attempt_id": str(duplicate[0]), "order_id": order_id,
+                }
+            raise ReviewConflict("external payment reference is already bound to another payment")
+        original = conn.execute(
+            "SELECT attempt_id,rail,assigned_card_id,evidence_cipher FROM payment_attempts "
+            "WHERE order_id=? AND merchant_key=? AND state='succeeded' "
+            "AND assigned_card_id IS NOT NULL AND evidence_cipher IS NOT NULL "
+            "ORDER BY verified_at DESC,created_at DESC LIMIT 1",
+            (order_id, merchant_key),
+        ).fetchone()
+        if original is None:
+            raise ReviewConflict("original successful card attempt and immutable card snapshot are required")
+        try:
+            snapshot = json.loads(decrypt_secret(str(original[3]), "hstagent/columns/v1"))
+        except Exception as exc:
+            raise ReviewConflict("original card snapshot failed authentication") from exc
+        accepted_destinations = {
+            str(snapshot.get("card_number") or "").strip(),
+            str(snapshot.get("sheba") or "").strip(),
+        } - {""}
+        if target not in accepted_destinations:
+            raise ReviewConflict("confirmed destination does not match the immutable attempt card snapshot")
+
+        confirmation = conn.execute(
+            "SELECT action,target_type,target_id,expected_revision,expires_at,consumed_at,bot_id,actor_tg_id "
+            "FROM action_confirmations WHERE nonce=?",
+            (nonce,),
+        ).fetchone()
+        if (
+            confirmation is None or str(confirmation[0]) != "payment.additional_received"
+            or str(confirmation[1]) != "payment_order" or str(confirmation[2]) != order_id
+            or int(confirmation[3]) != int(order[6]) or int(confirmation[4]) <= now
+            or confirmation[5] is not None or int(confirmation[6]) != bot_id
+            or int(confirmation[7]) != reviewer_tg_id
+        ):
+            raise ReviewConflict("root confirmation is invalid, stale, expired or already consumed")
+
+        attempt_id = str(uuid.uuid4())
+        evidence = {
+            "order_id": order_id, "external_payment_key": reference,
+            "destination": target, "amount_toman": amount_toman,
+            "reviewer_tg_id": reviewer_tg_id, "note": note,
+        }
+        evidence_cipher = encrypt_secret(
+            json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            "hstagent/columns/v1",
+        )
+        operation_id = f"additional-payment:{attempt_id}"
+        consumed = conn.execute(
+            "UPDATE action_confirmations SET consumed_at=?,operation_id=? "
+            "WHERE nonce=? AND actor_tg_id=? AND bot_id=? AND expected_revision=? "
+            "AND consumed_at IS NULL AND expires_at>?",
+            (now, operation_id, nonce, reviewer_tg_id, bot_id, int(order[6]), now),
+        )
+        if consumed.rowcount != 1:
+            raise ReviewConflict("additional-payment confirmation was consumed concurrently")
+        conn.execute(
+            "INSERT INTO payment_attempts(attempt_id,order_id,rail,merchant_key,assigned_card_id,"
+            "amount_toman,state,external_payment_key,evidence_cipher,created_at,verified_at) "
+            "VALUES(?,?,?,?,?,?,'succeeded',?,?,?,?)",
+            (attempt_id, order_id, str(original[1]), merchant_key, int(original[2]),
+             amount_toman, reference, str(original[3]), now, now),
+        )
+        moved = conn.execute(
+            "UPDATE payment_orders SET received_toman=received_toman+?,revision=revision+1 "
+            "WHERE order_id=? AND status IN ('accepted','completed') AND revision=?",
+            (amount_toman, order_id, int(order[6])),
+        )
+        if moved.rowcount != 1:
+            raise ReviewConflict("order revision changed before additional payment was recorded")
+
+        user_id = int(order[0])
+        rep_id = int(merchant_key.split(":", 1)[1]) if merchant_key.startswith("rep:") else None
+        balance = _wallet_balance(conn, merchant_key, user_id)
+        ledger_id = post_entry(
+            conn, rep_id=rep_id, user_id=user_id, transaction_type="credit",
+            amount=amount_toman, balance_after=balance + amount_toman,
+            description=f"Additional received payment for completed order {order_id}",
+            actor_id=reviewer_tg_id,
+            business_key=f"payment:{reference}:additional-wallet-credit",
+            merchant_key=merchant_key, ledger_scope="wallet", order_id=order_id,
+            operation_id=operation_id,
+        )
+        _sync_projection_cache(conn, ledger_scope="wallet", merchant_key=merchant_key, user_id=user_id)
+        safe_details = json.dumps(
+            {"order_id": order_id, "amount_toman": amount_toman, "status": "wallet_credited"},
+            sort_keys=True, separators=(",", ":"),
+        )
+        conn.execute(
+            "INSERT INTO audit_logs(rep_id,account_code,email,action,actor_id,actor_name,"
+            "details_json,result_status,details_cipher) VALUES(NULL,'','',? ,?,'root-admin',?,'recorded',?)",
+            ("payment.additional_received", reviewer_tg_id, safe_details, evidence_cipher),
+        )
+        return {
+            "status": "wallet_credited", "credited": True, "replayed": False,
+            "order_id": order_id, "payment_attempt_id": attempt_id,
+            "ledger_id": ledger_id, "wallet_credit_toman": amount_toman,
+            "order_received_toman": int(order[5]) + amount_toman,
+            "dispatch_created": False,
+        }
+
+
+__all__.append("handle_additional_received_payment")
