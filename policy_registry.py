@@ -92,3 +92,66 @@ def seed_approved_policies(conn: Any) -> None:
         conn.execute("ROLLBACK TO SAVEPOINT seed_approved_policies")
         conn.execute("RELEASE SAVEPOINT seed_approved_policies")
         raise
+
+
+# Operational default seed data is separate from the immutable PA/OPT registry.
+_TIER_DEFAULTS: tuple[tuple[str, str, str, int], ...] = (
+    ("rep", "normal", "عادی", 0),
+    ("rep", "vip", "ویژه", 1),
+    ("rep", "vvip", "فوق ویژه", 2),
+    ("end_user", "normal", "عادی", 0),
+    ("end_user", "silver", "نقره‌ای", 1),
+    ("end_user", "gold", "طلایی", 2),
+    ("end_user", "vip", "ویژه", 3),
+)
+_FEATURE_DEFAULTS = ("crypto", "gateway")
+_SYSTEM_SETTING_DEFAULTS = (
+    ("rollover_max_gb", "2.0"),
+    ("rollover_max_days", "2.0"),
+    ("sub_profile_limit", "5"),
+)
+
+
+def seed_tier_defaults(conn: Any) -> None:
+    """Insert seven approved tier rows and documented setting defaults once."""
+    conn.execute("SAVEPOINT seed_tier_defaults")
+    try:
+        for actor_type, tier_code, title_fa, rank in _TIER_DEFAULTS:
+            conn.execute(
+                """
+                INSERT INTO tier_policies(
+                    actor_type,tier_code,title_fa,rank,discount_bps,cashback_bps,
+                    daily_test_quota,default_credit_limit,min_monthly_sales_toman
+                ) VALUES(?,?,?,?,0,0,1,0,0)
+                ON CONFLICT(actor_type,tier_code) DO NOTHING
+                """,
+                (actor_type, tier_code, title_fa, rank),
+            )
+        for key, value in _SYSTEM_SETTING_DEFAULTS:
+            conn.execute(
+                "INSERT INTO system_settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (key, value),
+            )
+        conn.execute("RELEASE SAVEPOINT seed_tier_defaults")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT seed_tier_defaults")
+        conn.execute("RELEASE SAVEPOINT seed_tier_defaults")
+        raise
+
+
+def seed_feature_defaults(conn: Any) -> None:
+    """Keep verifier-dependent payment rails disabled unless explicitly enabled."""
+    conn.execute("SAVEPOINT seed_feature_defaults")
+    try:
+        for name in _FEATURE_DEFAULTS:
+            conn.execute(
+                "INSERT INTO feature_flags(name,enabled) VALUES(?,0) "
+                "ON CONFLICT(name) DO NOTHING",
+                (name,),
+            )
+        conn.execute("RELEASE SAVEPOINT seed_feature_defaults")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT seed_feature_defaults")
+        conn.execute("RELEASE SAVEPOINT seed_feature_defaults")
+        raise
