@@ -1,6 +1,9 @@
 import os
 import sys
 import sqlite3
+import asyncio
+import inspect
+from concurrent.futures import ThreadPoolExecutor
 import json
 import secrets
 import time
@@ -19,9 +22,9 @@ from config import (
 )
 MY_PROJECT_GROUP_ID = int(MAIN_GROUP_ID)
 
-# Add scripts directory to path to access xui_manager
 from server_integrations import load_integration
 xui_manager = load_integration("xui_manager")
+
 
 DEFAULT_PLANS = [
     ("20gb_30d", "۲۰ گیگ ۱ ماهه", 20.0, 30, 300000, 450000, 1, 1),
@@ -1715,173 +1718,384 @@ get_user_linked_accounts = get_user_accounts
 
 # --- Account Scoping & Syncing ---
 
-def sync_rep_accounts(rep_code=None):
-    with get_db() as conn:
-        cur = conn.cursor()
-        if rep_code:
-            rep = cur.execute("SELECT id, scope_filter FROM representatives WHERE rep_code = ?", (rep_code,)).fetchone()
-            target_reps = [rep] if rep else []
-        else:
-            target_reps = cur.execute("SELECT id, scope_filter FROM representatives WHERE is_active = 1").fetchall()
 
-        if not target_reps:
-            return 0
-
-        s = xui_manager.get_session()
-        r = s.get(f"{xui_manager.BASE_URL}/panel/api/clients/list")
-        if not r.ok:
-            return 0
-        all_clients = r.json().get("obj", [])
-
-        count = 0
-        for rep in target_reps:
-            rep_id = rep["id"]
-            scope = (rep["scope_filter"] or "").strip().lower()
-
-            if scope == "all":
-                scoped_clients = all_clients
-            else:
-                tokens = [t.strip() for t in scope.split(",") if t.strip()]
-                scoped_clients = [
-                    c for c in all_clients
-                    if any(tok in str(c.get("email", "")).lower() or tok in str(c.get("comment", "")).lower() for tok in tokens)
-                ]
-
-            for c in scoped_clients:
-                email = c.get("email", "")
-                code = xui_manager.extract_account_identifier(email) or email
-                comment = c.get("comment", "")
-                sub_id = c.get("subId", "")
-                enable = 1 if c.get("enable", True) else 0
-                total_gb = round(c.get("totalGB", 0) / (1024**3), 2)
-                exp_time = c.get("expiryTime", 0)
-                tg_id = c.get("tgId") or None
-
-                cur.execute("""
-                INSERT INTO accounts (rep_id, account_code, email, customer_name, sub_id, enable, total_gb, expiry_time, owner_tg_id, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(email) DO UPDATE SET
-                    rep_id = excluded.rep_id,
-                    account_code = excluded.account_code,
-                    customer_name = excluded.customer_name,
-                    sub_id = excluded.sub_id,
-                    enable = excluded.enable,
-                    total_gb = excluded.total_gb,
-                    expiry_time = excluded.expiry_time,
-                    owner_tg_id = CASE WHEN excluded.owner_tg_id IS NOT NULL THEN excluded.owner_tg_id ELSE accounts.owner_tg_id END,
-                    updated_at = CURRENT_TIMESTAMP
-                """, (rep_id, str(code), email, comment, sub_id, enable, total_gb, exp_time, tg_id))
-                count += 1
-
-        conn.commit()
-        return count
-
-def sync_all_active_reps_detailed() -> dict:
-    """Reconcile panel accounts against active representative scopes without arbitrary reassignment."""
-    reps = get_all_active_reps()
-    if not reps:
-        return {"status": "success", "count": 0, "ambiguous": 0, "unmatched": 0, "message": "No active representatives"}
-
+def _run_panel_adapter_call(value):
+    """Resolve one adapter read without ever running it under a DB write transaction."""
+    if not inspect.isawaitable(value):
+        return value
     try:
-        session = xui_manager.get_session()
-        response = session.get(f"{xui_manager.BASE_URL}/panel/api/clients/list", timeout=20)
-        if not response.ok:
-            return {
-                "status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
-                "message": f"3X-UI returned HTTP {response.status_code}"
-            }
-        payload = response.json()
-        if not isinstance(payload, dict) or not isinstance(payload.get("obj"), list):
-            return {
-                "status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
-                "message": "3X-UI response did not contain a client list"
-            }
-        clients = [c for c in payload["obj"] if isinstance(c, dict) and c.get("email")]
-    except Exception as exc:
-        return {
-            "status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
-            "message": f"Failed to read 3X-UI clients: {exc}"
-        }
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(value)
+    # Some legacy callers invoke this synchronous API from an asyncio handler.
+    # Run the coroutine on a dedicated thread rather than nesting asyncio.run().
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, value).result()
+
+
+def _panel_account_id(panel_id, email):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM accounts WHERE panel_id=? AND LOWER(email)=LOWER(?) "
+            "AND deleted_at IS NULL ORDER BY id LIMIT 1",
+            (int(panel_id), str(email)),
+        ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
+def _get_panel_adapter(panel_id):
+    """Build the canonical adapter bound to exactly one persisted panel."""
+    from panel_adapters.factory import PanelAdapterFactory
+    from panel_adapters.manual_pool import ManualPoolRepository
+    from crypto_store import decrypt_secret
+    import requests
+
+    def load_panel(selected_id):
+        with get_db() as conn:
+            row = conn.execute("SELECT * FROM panels WHERE id=?", (int(selected_id),)).fetchone()
+            return dict(row) if row is not None else None
+
+    def load_account(account_id):
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT id,panel_id,deleted_at FROM accounts WHERE id=?",
+                (int(account_id),),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    factory = PanelAdapterFactory(
+        panel_loader=load_panel,
+        account_loader=load_account,
+        session_factory=lambda _panel: requests.Session(),
+        manual_repository=ManualPoolRepository(DB_PATH),
+        decryptor=decrypt_secret,
+        manual_decryptor=lambda cipher: decrypt_secret(cipher, "hstagent/columns/v1"),
+        # All DB reads above are complete before adapter I/O begins. The adapter
+        # still rejects a caller that supplies a transaction-aware probe reporting True.
+        transaction_probe=lambda: False,
+        account_id_resolver=_panel_account_id,
+    )
+    return factory.get_adapter(int(panel_id))
+
+
+def get_account_panel_binding(*, account_id=None, email=None, account_code=None):
+    """Resolve one canonical account/panel pair; never fall back to the default panel."""
+    with get_db() as conn:
+        if account_id is not None:
+            rows = conn.execute(
+                "SELECT a.id,a.panel_id,a.email,a.account_code,a.rep_id,a.owner_tg_id,"
+                "a.seller_key,a.is_personal_use,a.revision,p.lifecycle "
+                "FROM accounts a LEFT JOIN panels p ON p.id=a.panel_id "
+                "WHERE a.id=? AND a.deleted_at IS NULL",
+                (int(account_id),),
+            ).fetchall()
+        else:
+            key_email = str(email or "").strip().lower()
+            key_code = str(account_code or "").strip().lower()
+            if not key_email and not key_code:
+                return None
+            rows = conn.execute(
+                "SELECT a.id,a.panel_id,a.email,a.account_code,a.rep_id,a.owner_tg_id,"
+                "a.seller_key,a.is_personal_use,a.revision,p.lifecycle "
+                "FROM accounts a LEFT JOIN panels p ON p.id=a.panel_id "
+                "WHERE a.deleted_at IS NULL AND "
+                "(LOWER(a.email)=? OR LOWER(a.account_code)=?) ORDER BY a.id",
+                (key_email, key_code),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        return dict(rows[0])
+
+
+def get_panel_adapter_for_account(account_id):
+    """Return the adapter bound to the account's immutable panel_id."""
+    binding = get_account_panel_binding(account_id=account_id)
+    if binding is None or binding.get("panel_id") is None:
+        raise ValueError("account has no unique canonical panel binding")
+    return _get_panel_adapter(int(binding["panel_id"]))
+
+
+def _sync_client_value(client, name, default=None):
+    if isinstance(client, dict):
+        return client.get(name, default)
+    return getattr(client, name, default)
+
+
+def _sync_client_identity(client, expected_panel_id):
+    ref = _sync_client_value(client, "ref")
+    if not isinstance(ref, (tuple, list)) or len(ref) < 3:
+        raise ValueError("panel adapter returned a client without canonical (account,panel,email) identity")
+    account_id, panel_id, email = ref[0], ref[1], ref[2]
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+        raise ValueError("panel adapter returned a client without canonical account_id")
+    if isinstance(panel_id, bool) or int(panel_id) != int(expected_panel_id):
+        raise ValueError("panel adapter returned a client from another panel")
+    if not isinstance(email, str) or not email.strip():
+        raise ValueError("panel adapter returned an invalid client email")
+    return int(account_id), int(panel_id), email.strip()
+
+
+def _sync_panel_rows(target_reps):
+    """Read every panel through its own adapter, then persist in one short DB transaction."""
+    if not target_reps:
+        return {"status": "success", "count": 0, "ambiguous": 0, "unmatched": 0,
+                "message": "No active representatives"}
+
+    with get_db() as conn:
+        panel_ids = [
+            int(row["id"]) for row in conn.execute("SELECT id FROM panels ORDER BY id").fetchall()
+        ]
+
+    if not panel_ids:
+        return {"status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+                "message": "No registered panels are available for adapter sync"}
+
+    panel_clients = {}
+    for panel_id in panel_ids:
+        try:
+            adapter = _get_panel_adapter(panel_id)
+            clients = _run_panel_adapter_call(adapter.list_clients())
+            if not isinstance(clients, list):
+                raise TypeError("panel adapter list_clients must return a list")
+            panel_clients[panel_id] = clients
+        except Exception as exc:
+            return {"status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+                    "message": f"Panel {panel_id} adapter read failed ({type(exc).__name__})"}
 
     rep_scopes = []
-    for rep in reps:
+    for rep in target_reps:
         scope = str(rep.get("scope_filter") or "").strip().lower()
         tokens = [token.strip() for token in scope.split(",") if token.strip()]
         rep_scopes.append((rep, scope, tokens))
 
     count = ambiguous = unmatched = 0
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        existing_rows = cur.execute("SELECT email, rep_id, owner_tg_id FROM accounts").fetchall()
-        existing = {str(row["email"]).lower(): dict(row) for row in existing_rows}
-
-        for client in clients:
-            email = str(client["email"]).strip()
-            email_l = email.lower()
-            comment = str(client.get("comment") or "")
-            candidates = []
-            for rep, scope, tokens in rep_scopes:
-                if scope == "all" or any(
-                    token in email_l or token in comment.lower() for token in tokens
-                ):
-                    candidates.append(rep)
-
-            previous = existing.get(email_l)
-            previous_rep_id = previous.get("rep_id") if previous else None
-            selected_rep_id = None
-
-            if len(candidates) == 1:
-                selected_rep_id = candidates[0]["id"]
-            elif len(candidates) > 1:
-                candidate_ids = {item["id"] for item in candidates}
-                if previous_rep_id in candidate_ids:
-                    selected_rep_id = previous_rep_id
-                else:
-                    ambiguous += 1
+        # Network reads have completed. No panel request is allowed below BEGIN IMMEDIATE.
+        conn.execute("BEGIN IMMEDIATE")
+        for panel_id, clients in panel_clients.items():
+            for client in clients:
+                try:
+                    account_id, client_panel_id, email = _sync_client_identity(client, panel_id)
+                except (TypeError, ValueError):
                     continue
+                email_l = email.casefold()
+                prior_row = conn.execute(
+                    "SELECT id,rep_id,account_code,customer_name,sub_id,enable,total_gb,"
+                    "expiry_time,owner_tg_id,seller_key,is_personal_use "
+                    "FROM accounts WHERE panel_id=? AND LOWER(email)=LOWER(?) "
+                    "AND deleted_at IS NULL ORDER BY id",
+                    (panel_id, email),
+                ).fetchone()
+                prior = dict(prior_row) if prior_row is not None else None
+
+                candidates = []
+                for rep_item, scope, tokens in rep_scopes:
+                    if scope == "all" or any(token in email_l for token in tokens):
+                        candidates.append(rep_item)
+
+                previous_rep_id = prior.get("rep_id") if prior else None
+                if len(candidates) == 1:
+                    selected_rep_id = int(candidates[0]["id"])
+                elif len(candidates) > 1:
+                    candidate_ids = {int(item["id"]) for item in candidates}
+                    if previous_rep_id in candidate_ids:
+                        selected_rep_id = previous_rep_id
+                    else:
+                        ambiguous += 1
+                        continue
+                else:
+                    unmatched += 1
+                    selected_rep_id = previous_rep_id
+
+                quota_mode = _sync_client_value(client, "quota_mode", "unknown")
+                quota_bytes = _sync_client_value(client, "quota_bytes")
+                if quota_mode == "finite" and isinstance(quota_bytes, int) and not isinstance(quota_bytes, bool):
+                    total_gb = round(max(0, quota_bytes) / (1024 ** 3), 2)
+                elif quota_mode == "unlimited":
+                    total_gb = 0.0
+                else:
+                    total_gb = float(prior.get("total_gb") or 0) if prior else 0.0
+
+                enabled_raw = _sync_client_value(client, "enabled")
+                enabled = int(bool(enabled_raw)) if enabled_raw is not None else int(prior.get("enable", 1) if prior else 1)
+                time_mode = _sync_client_value(client, "time_mode", "unknown")
+                expires_at = _sync_client_value(client, "expires_at")
+                if time_mode == "dated" and isinstance(expires_at, int) and not isinstance(expires_at, bool):
+                    expiry_time = max(0, expires_at) * 1000
+                elif time_mode == "unlimited":
+                    expiry_time = 0
+                elif time_mode == "on_hold":
+                    expiry_time = -1
+                else:
+                    expiry_time = int(prior.get("expiry_time") or 0) if prior else 0
+
+                sub_id = _sync_client_value(client, "subscription_id")
+                if not isinstance(sub_id, str) or not sub_id:
+                    sub_id = str(prior.get("sub_id") or "") if prior else ""
+                account_code = str(prior.get("account_code") or email) if prior else email
+                customer_name = str(prior.get("customer_name") or "") if prior else ""
+                owner_tg_id = prior.get("owner_tg_id") if prior else None
+
+                conn.execute(
+                    "INSERT INTO accounts(id,rep_id,account_code,email,customer_name,sub_id,enable,"
+                    "total_gb,expiry_time,owner_tg_id,panel_id,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(panel_id,email COLLATE NOCASE) DO UPDATE SET "
+                    "rep_id=excluded.rep_id, "
+                    "account_code=CASE WHEN accounts.account_code='' THEN excluded.account_code ELSE accounts.account_code END, "
+                    "customer_name=CASE WHEN excluded.customer_name<>'' THEN excluded.customer_name ELSE accounts.customer_name END, "
+                    "sub_id=CASE WHEN excluded.sub_id<>'' THEN excluded.sub_id ELSE accounts.sub_id END, "
+                    "enable=excluded.enable,total_gb=excluded.total_gb,expiry_time=excluded.expiry_time, "
+                    "owner_tg_id=CASE WHEN excluded.owner_tg_id IS NOT NULL THEN excluded.owner_tg_id ELSE accounts.owner_tg_id END, "
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (account_id, selected_rep_id, account_code, email, customer_name, sub_id,
+                     enabled, total_gb, expiry_time, owner_tg_id, panel_id),
+                )
+                count += 1
+
+    return {"status": "success", "count": count, "ambiguous": ambiguous,
+            "unmatched": unmatched,
+            "message": "Reconciliation completed through panel-scoped adapters without network in a DB transaction"}
+
+
+
+class _LegacyPanelListAdapter:
+    """Read-only adapter for pre-panel-registry databases during staged migration."""
+    def __init__(self, integration):
+        self._integration = integration
+
+    def list_clients(self):
+        session_factory = getattr(self._integration, "get_session", None)
+        base_url = getattr(self._integration, "BASE_URL", None)
+        if not callable(session_factory) or not isinstance(base_url, str) or not base_url:
+            raise RuntimeError("legacy panel read adapter is unavailable")
+        response = session_factory().get(
+            f"{base_url.rstrip('/')}/panel/api/clients/list", timeout=20
+        )
+        if not getattr(response, "ok", False):
+            raise RuntimeError("legacy panel returned a non-success status")
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("obj"), list):
+            raise RuntimeError("legacy panel response has no client list")
+        return [item for item in payload["obj"] if isinstance(item, dict) and item.get("email")]
+
+    def account_code(self, email):
+        parser = getattr(self._integration, "extract_account_identifier", None)
+        return parser(email) if callable(parser) else email
+
+
+def _has_panel_registry():
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='panels'"
+        ).fetchone() is not None
+
+
+def _sync_legacy_schema(target_reps):
+    """Read a legacy default panel before DB mutation; never hold a transaction over I/O."""
+    if not target_reps:
+        return {"status": "success", "count": 0, "ambiguous": 0, "unmatched": 0,
+                "message": "No active representatives"}
+    adapter = _LegacyPanelListAdapter(xui_manager)
+    try:
+        clients = adapter.list_clients()
+    except Exception as exc:
+        return {"status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+                "message": f"Legacy panel adapter read failed ({type(exc).__name__})"}
+
+    with get_db() as conn:
+        rows = conn.execute("SELECT id,email,rep_id,owner_tg_id FROM accounts").fetchall()
+        existing = {str(row["email"]).strip().lower(): dict(row) for row in rows}
+
+    scopes = []
+    for rep in target_reps:
+        scope = str(rep.get("scope_filter") or "").strip().lower()
+        scopes.append((rep, scope, [token.strip() for token in scope.split(",") if token.strip()]))
+
+    records = []
+    ambiguous = unmatched = 0
+    for client in clients:
+        email = str(client.get("email") or "").strip()
+        if not email:
+            continue
+        key = email.lower()
+        comment = str(client.get("comment") or "")
+        candidates = [
+            rep for rep, scope, tokens in scopes
+            if scope == "all" or any(token in key or token in comment.lower() for token in tokens)
+        ]
+        previous = existing.get(key)
+        previous_rep = previous.get("rep_id") if previous else None
+        if len(candidates) == 1:
+            selected_rep = int(candidates[0]["id"])
+        elif len(candidates) > 1:
+            ids = {int(item["id"]) for item in candidates}
+            if previous_rep in ids:
+                selected_rep = int(previous_rep)
             else:
-                unmatched += 1
-                # Retain an existing assignment, but do not invent a new one.
-                selected_rep_id = previous_rep_id
+                ambiguous += 1
+                continue
+        else:
+            unmatched += 1
+            if previous is None:
+                continue
+            selected_rep = previous_rep
 
-            code = xui_manager.extract_account_identifier(email) or email
+        try:
             total_gb = round(float(client.get("totalGB") or 0) / (1024 ** 3), 2)
-            expiry_time = int(client.get("expiryTime") or 0)
-            enabled = 1 if client.get("enable", True) else 0
-            sub_id = str(client.get("subId") or "")
-            tg_id = client.get("tgId") or (previous.get("owner_tg_id") if previous else None)
+            expiry = int(client.get("expiryTime") or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        records.append((
+            selected_rep, adapter.account_code(email) or email, email, comment,
+            str(client.get("subId") or ""), 1 if client.get("enable", True) else 0,
+            total_gb, expiry,
+            client.get("tgId") or (previous.get("owner_tg_id") if previous else None),
+        ))
 
-            cur.execute("""
-                INSERT INTO accounts
-                    (rep_id, account_code, email, customer_name, sub_id, enable,
-                     total_gb, expiry_time, owner_tg_id, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(email) DO UPDATE SET
-                    rep_id = excluded.rep_id,
-                    account_code = excluded.account_code,
-                    customer_name = excluded.customer_name,
-                    sub_id = excluded.sub_id,
-                    enable = excluded.enable,
-                    total_gb = excluded.total_gb,
-                    expiry_time = excluded.expiry_time,
-                    owner_tg_id = CASE
-                        WHEN excluded.owner_tg_id IS NOT NULL THEN excluded.owner_tg_id
-                        ELSE accounts.owner_tg_id
-                    END,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (
-                selected_rep_id, str(code), email, comment, sub_id, enabled,
-                total_gb, expiry_time, tg_id
-            ))
+    count = 0
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for item in records:
+            conn.execute(
+                "INSERT INTO accounts(rep_id,account_code,email,customer_name,sub_id,enable,"
+                "total_gb,expiry_time,owner_tg_id,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(email) DO UPDATE SET rep_id=excluded.rep_id,"
+                "account_code=excluded.account_code,customer_name=excluded.customer_name,"
+                "sub_id=excluded.sub_id,enable=excluded.enable,total_gb=excluded.total_gb,"
+                "expiry_time=excluded.expiry_time,owner_tg_id=CASE "
+                "WHEN excluded.owner_tg_id IS NOT NULL THEN excluded.owner_tg_id "
+                "ELSE accounts.owner_tg_id END,updated_at=CURRENT_TIMESTAMP",
+                item,
+            )
             count += 1
+    return {"status": "success", "count": count, "ambiguous": ambiguous,
+            "unmatched": unmatched,
+            "message": "Legacy panel adapter completed its read before persistence"}
 
-    return {
-        "status": "success", "count": count, "ambiguous": ambiguous,
-        "unmatched": unmatched,
-        "message": "Reconciliation completed without arbitrary scope reassignment"
-    }
 
+def sync_rep_accounts(rep_code=None):
+    """Refresh one representative through registered adapters or the legacy read adapter."""
+    with get_db() as conn:
+        if rep_code:
+            rows = conn.execute(
+                "SELECT id,scope_filter FROM representatives WHERE rep_code=? AND is_active=1",
+                (str(rep_code),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id,scope_filter FROM representatives WHERE is_active=1"
+            ).fetchall()
+        target_reps = [dict(row) for row in rows]
+    result = _sync_legacy_schema(target_reps) if not _has_panel_registry() else _sync_panel_rows(target_reps)
+    return int(result.get("count", 0)) if result.get("status") == "success" else 0
+
+
+def sync_all_active_reps_detailed() -> dict:
+    """Reconcile via panel-scoped adapters; legacy databases use a read-only transition adapter."""
+    reps = get_all_active_reps()
+    return _sync_legacy_schema(reps) if not _has_panel_registry() else _sync_panel_rows(reps)
 
 def sync_all_active_reps() -> int:
     """Backward-compatible wrapper for callers that only need a count."""

@@ -993,79 +993,145 @@ def _remember_form_prompt(state: dict, query) -> None:
         state["prompt_msg_id"] = message_id
 
 
-def build_fsm_validation_keyboard(role: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⬅️ تلاش مجدد",callback_data=f"{role}:retry_form"),
-        InlineKeyboardButton("❌ انصراف از فرم",callback_data=f"{role}:cancel_form"),
-    ]])
+
+def _user_fsm_parent(state):
+    candidate = str(state.get("return_callback") or "user:services") if isinstance(state, dict) else "user:services"
+    if not candidate.startswith("user:") or len(candidate) > 80 or any(ord(ch) < 32 for ch in candidate):
+        return "user:services"
+    return candidate
 
 
-async def _reply_fsm_validation_error(update,context,state,message: str) -> bool:
-    attempts=int(state.get("attempts",0))+1
-    state["attempts"]=attempts
-    state["ts"]=time.time()
-    if attempts>=3:
-        parent=state.get("return_callback") or "user:main"
-        context.user_data.pop("user_state",None)
-        await update.message.reply_text(f"❌ فرم پس از ۳ تلاش ناموفق بسته شد.\n{message}",
-            reply_markup=build_back_to_user_keyboard(back_callback=parent))
+def build_fsm_validation_keyboard(role: str = "user", state=None) -> InlineKeyboardMarkup:
+    # End-user forms intentionally never expose admin/root navigation callbacks.
+    parent = _user_fsm_parent(state)
+    rows = [[
+        InlineKeyboardButton("⬅️ تلاش مجدد", callback_data="user:retry_form"),
+        InlineKeyboardButton("🔎 جستجوی دوباره", callback_data="user:prompt_link"),
+        InlineKeyboardButton("❌ انصراف از فرم", callback_data="user:cancel_form"),
+    ]]
+    if parent != "user:main":
+        rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data=parent),
+                     InlineKeyboardButton("🏠 خانه", callback_data="user:main")])
     else:
-        await update.message.reply_text(f"⚠️ {message}\nتلاش {attempts} از ۳؛ فرم همچنان فعال است.",
-            reply_markup=build_fsm_validation_keyboard("user"))
+        rows.append([InlineKeyboardButton("🏠 خانه", callback_data="user:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _reply_fsm_validation_error(update, context, state, message: str) -> bool:
+    attempts = int(state.get("attempts", 0)) + 1
+    state["attempts"] = attempts
+    state["ts"] = time.time()
+    parent = _user_fsm_parent(state)
+    if attempts >= 3:
+        context.user_data.pop("user_state", None)
+        await update.message.reply_text(
+            f"❌ فرم پس از ۳ تلاش ناموفق بسته شد.\n{message}",
+            reply_markup=build_back_to_user_keyboard(back_callback=parent),
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ {message}\nتلاش {attempts} از ۳؛ فرم همچنان فعال است.",
+            reply_markup=build_fsm_validation_keyboard("user", state),
+        )
     return True
 
 
 async def _process_user_text_input_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Processes FSM inputs initiated from end-user portal."""
+    """Process end-user text only in the matching bot-scoped form state."""
     user = update.effective_user
     user_state = context.user_data.get("user_state")
     if not user_state:
         return False
-
-    if time.time()-user_state.get("ts",0)>60:
-        parent=user_state.get("return_callback") or "user:main"
-        context.user_data.pop("user_state",None)
-        await update.message.reply_text("⏱ مهلت زمانی تکمیل این فرم به پایان رسیده است. برای شروع دوباره، فرم را از منو باز کنید.",
-            reply_markup=build_back_to_user_keyboard(back_callback=parent))
+    if not isinstance(user_state, dict):
+        context.user_data.pop("user_state", None)
+        await update.message.reply_text("⛔️ وضعیت فرم معتبر نیست؛ از پورتال کاربری دوباره شروع کنید.",
+                                        reply_markup=build_user_portal_keyboard())
         return True
 
-    msg_text = update.message.text.strip()
-    action = user_state.get("action")
+    active_bot_id = getattr(getattr(context, "bot", None), "id", None)
+    state_bot_id = user_state.get("bot_id")
+    if state_bot_id is not None and active_bot_id is not None and int(state_bot_id) != int(active_bot_id):
+        context.user_data.pop("user_state", None)
+        await update.message.reply_text(
+            "⛔️ این فرم در بات دیگری آغاز شده است؛ از پورتال همین بات دوباره شروع کنید.",
+            reply_markup=build_user_portal_keyboard(),
+        )
+        return True
 
-    if msg_text.lower() in ("cancel","انصراف","لغو"):
-        parent=user_state.get("return_callback") or "user:main"
-        context.user_data.pop("user_state",None)
-        await update.message.reply_text("❌ عملیات لغو شد.",reply_markup=build_back_to_user_keyboard(back_callback=parent))
+    state_actor_id = user_state.get("actor_tg_id")
+    if state_actor_id is not None and str(state_actor_id) != str(getattr(user, "id", None)):
+        context.user_data.pop("user_state", None)
+        await update.message.reply_text(
+            "⛔️ این فرم به کاربر دیگری تعلق دارد؛ از پورتال همین حساب دوباره شروع کنید.",
+            reply_markup=build_user_portal_keyboard(),
+        )
+        return True
+
+    parent = _user_fsm_parent(user_state)
+    if time.time() - float(user_state.get("ts", 0) or 0) > 60:
+        context.user_data.pop("user_state", None)
+        await update.message.reply_text(
+            "⏱ مهلت زمانی تکمیل این فرم به پایان رسیده است. برای شروع دوباره، فرم را از منو باز کنید.",
+            reply_markup=build_back_to_user_keyboard(back_callback=parent),
+        )
+        return True
+
+    msg_text = (getattr(update.message, "text", None) or "").strip()
+    action = user_state.get("action")
+    if msg_text.lower() in ("cancel", "انصراف", "لغو"):
+        context.user_data.pop("user_state", None)
+        await update.message.reply_text(
+            "❌ عملیات لغو شد.",
+            reply_markup=build_back_to_user_keyboard(back_callback=parent),
+        )
         return True
 
     if action == "awaiting_link_code":
         if not msg_text:
-            return await _reply_fsm_validation_error(update,context,user_state,"کد اکانت یا ایمیل سرویس نمی‌تواند خالی باشد.")
+            return await _reply_fsm_validation_error(
+                update, context, user_state, "کد اکانت یا ایمیل سرویس نمی‌تواند خالی باشد."
+            )
         try:
-            linked=database.link_user_to_account(msg_text,user.id,user.username or "",user.full_name or "")
+            linked = database.link_user_to_account(
+                msg_text, user.id, user.username or "", user.full_name or ""
+            )
         except ValueError as exc:
-            return await _reply_fsm_validation_error(update,context,user_state,f"اتصال اکانت انجام نشد: {exc}")
-        if not (isinstance(linked,dict) and linked.get("status")=="ok"):
-            return await _reply_fsm_validation_error(update,context,user_state,"اکانتی با این کد یا ایمیل پیدا نشد؛ ورودی را اصلاح کنید.")
-        context.user_data.pop("user_state",None)
+            return await _reply_fsm_validation_error(update, context, user_state, f"اتصال اکانت انجام نشد: {exc}")
+        except Exception:
+            logger.exception("End-user account link failed")
+            return await _reply_fsm_validation_error(update, context, user_state, "اتصال سرویس موقتاً ممکن نشد؛ دوباره تلاش کنید.")
+        if not (isinstance(linked, dict) and linked.get("status") == "ok"):
+            return await _reply_fsm_validation_error(
+                update, context, user_state, "اکانتی با این کد یا ایمیل در محدوده مجاز شما پیدا نشد؛ ورودی را اصلاح کنید."
+            )
+        context.user_data.pop("user_state", None)
         await update.message.reply_text(
-            f"✅ اکانت {msg_text} با موفقیت به حساب تلگرام شما متصل گردید.\nاز این پس می‌توانید وضعیت مصرف این سرویس را در بخش «📱 سرویس‌های من» مشاهده و تمدید نمایید.",
-            parse_mode=ParseMode.MARKDOWN,reply_markup=build_user_portal_keyboard())
+            f"✅ اکانت {msg_text} با موفقیت به حساب تلگرام شما متصل گردید.\n"
+            "از این پس می‌توانید وضعیت مصرف این سرویس را در بخش «📱 سرویس‌های من» مشاهده و تمدید نمایید.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_user_portal_keyboard(),
+        )
         return True
 
-    return False
-
+    # Search, deposit and sub-profile state names are not implicitly accepted here.
+    # They must be routed by their owning handler; an unknown/foreign state exits home.
+    context.user_data.pop("user_state", None)
+    await update.message.reply_text(
+        "⛔️ مرحله فرم دیگر معتبر نیست؛ از پورتال کاربری دوباره شروع کنید.",
+        reply_markup=build_back_to_user_keyboard(back_callback="user:main"),
+    )
+    return True
 
 
 async def process_user_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Process end-user FSM input, cleaning its prompt only on success or closure."""
-    managed_actions = {"awaiting_link_code"}
+    """Process end-user FSM input, cleaning the exact prompt only on success or exit."""
     state = context.user_data.get("user_state")
     attempts_before = state.get("attempts", 0) if isinstance(state, dict) else 0
     result = await _process_user_text_input_impl(update, context)
-    if isinstance(state, dict) and state.get("action") in managed_actions:
+    if isinstance(state, dict):
         state_is_active = context.user_data.get("user_state") is state
         accepted_input = result is True and state.get("attempts", 0) == attempts_before
         if not state_is_active or accepted_input:
             await _cleanup_form_prompt(update, context, state)
     return result
+

@@ -763,35 +763,89 @@ def _remember_form_prompt(state: dict, query) -> None:
         state["prompt_msg_id"] = message_id
 
 
-def build_fsm_validation_keyboard(role: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⬅️ تلاش مجدد",callback_data=f"{role}:retry_form"),
-        InlineKeyboardButton("❌ انصراف از فرم",callback_data=f"{role}:cancel_form"),
-    ]])
+
+def _fsm_parent_callback(state, role):
+    expected = "rep:" if role == "rep" else "user:"
+    candidate = str(state.get("return_callback") or expected + "main") if isinstance(state, dict) else expected + "main"
+    if not candidate.startswith(expected) or len(candidate) > 80 or any(ord(ch) < 32 for ch in candidate):
+        return expected + "main"
+    return candidate
 
 
-async def _reply_fsm_validation_error(update,context,state,message: str) -> bool:
-    attempts=int(state.get("attempts",0))+1
-    state["attempts"]=attempts
-    state["ts"]=time.time()
-    if attempts>=3:
-        parent=state.get("return_callback") or "rep:main"
-        context.user_data.pop("rep_state",None)
-        await update.message.reply_text(f"❌ فرم پس از ۳ تلاش ناموفق بسته شد.\n{message}",
-            reply_markup=build_back_to_rep_keyboard(back_callback=parent))
+def build_fsm_validation_keyboard(role: str, state=None) -> InlineKeyboardMarkup:
+    selected = "rep" if str(role).lower() == "rep" else "user"
+    parent = _fsm_parent_callback(state, selected)
+    retry = "rep:retry_form" if selected == "rep" else "user:prompt_link"
+    cancel = "rep:cancel_form" if selected == "rep" else "user:main"
+    home = "rep:main" if selected == "rep" else "user:main"
+    rows = [[
+        InlineKeyboardButton("⬅️ تلاش مجدد", callback_data=retry),
+        InlineKeyboardButton("❌ انصراف", callback_data=cancel),
+    ]]
+    if parent != home:
+        rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data=parent),
+                     InlineKeyboardButton("🏠 خانه", callback_data=home)])
     else:
-        await update.message.reply_text(f"⚠️ {message}\nتلاش {attempts} از ۳؛ فرم همچنان فعال است.",
-            reply_markup=build_fsm_validation_keyboard("rep"))
+        rows.append([InlineKeyboardButton("🏠 خانه", callback_data=home)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _reply_fsm_validation_error(update, context, state, message: str) -> bool:
+    attempts = int(state.get("attempts", 0)) + 1
+    state["attempts"] = attempts
+    state["ts"] = time.time()
+    parent = _fsm_parent_callback(state, "rep")
+    if attempts >= 3:
+        context.user_data.pop("rep_state", None)
+        await update.message.reply_text(
+            f"❌ فرم پس از ۳ تلاش ناموفق بسته شد.\n{message}",
+            reply_markup=build_back_to_rep_keyboard(back_callback=parent),
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ {message}\nتلاش {attempts} از ۳؛ فرم همچنان فعال است.",
+            reply_markup=build_fsm_validation_keyboard("rep", state),
+        )
     return True
 
 
 async def _process_rep_text_input_impl(update: Update, context: ContextTypes.DEFAULT_TYPE, rep: dict) -> bool:
-    """Processes FSM inputs initiated from representative dashboard."""
+    """Process only this representative's form state; every failure exits safely."""
     rep_state = context.user_data.get("rep_state")
     if not rep_state:
         return False
+    if not isinstance(rep_state, dict):
+        context.user_data.pop("rep_state", None)
+        await update.message.reply_text("⛔️ وضعیت فرم معتبر نیست؛ از پیشخوان نمایندگی دوباره شروع کنید.",
+                                        reply_markup=build_rep_main_keyboard())
+        return True
 
-    if int(rep_state.get("rep_id") or -1) != int(rep.get("id") or -2):
+    parent = _fsm_parent_callback(rep_state, "rep")
+    active_bot_id = getattr(getattr(context, "bot", None), "id", None)
+    state_bot_id = rep_state.get("bot_id")
+    if state_bot_id is not None and active_bot_id is not None and int(state_bot_id) != int(active_bot_id):
+        context.user_data.pop("rep_state", None)
+        await update.message.reply_text(
+            "⛔️ این فرم در بات دیگری آغاز شده است؛ از پیشخوان همین بات دوباره شروع کنید.",
+            reply_markup=build_rep_main_keyboard(),
+        )
+        return True
+
+    state_actor_id = rep_state.get("actor_tg_id")
+    if state_actor_id is not None and str(state_actor_id) != str(getattr(update.effective_user, "id", None)):
+        context.user_data.pop("rep_state", None)
+        await update.message.reply_text(
+            "⛔️ این فرم به کاربر دیگری تعلق دارد؛ از پیشخوان همین حساب دوباره شروع کنید.",
+            reply_markup=build_rep_main_keyboard(),
+        )
+        return True
+
+    try:
+        state_rep_id = int(rep_state.get("rep_id") or -1)
+        active_rep_id = int(rep.get("id") or -2)
+    except (TypeError, ValueError):
+        state_rep_id, active_rep_id = -1, -2
+    if state_rep_id != active_rep_id:
         context.user_data.pop("rep_state", None)
         await update.message.reply_text(
             "⛔️ زمینه این درخواست متعلق به نمایندگی دیگری است یا دیگر معتبر نیست؛ از پیشخوان نمایندگی دوباره شروع کنید.",
@@ -799,44 +853,58 @@ async def _process_rep_text_input_impl(update: Update, context: ContextTypes.DEF
         )
         return True
 
-    if time.time()-rep_state.get("ts",0)>60:
-        parent=rep_state.get("return_callback") or "rep:main"
-        context.user_data.pop("rep_state",None)
-        await update.message.reply_text("⏱ مهلت زمانی تکمیل این فرم به پایان رسیده است. برای شروع دوباره، فرم را از منو باز کنید.",
-            reply_markup=build_back_to_rep_keyboard(back_callback=parent))
+    if time.time() - float(rep_state.get("ts", 0) or 0) > 60:
+        context.user_data.pop("rep_state", None)
+        await update.message.reply_text(
+            "⏱ مهلت زمانی تکمیل این فرم به پایان رسیده است. برای شروع دوباره، فرم را از منو باز کنید.",
+            reply_markup=build_back_to_rep_keyboard(back_callback=parent),
+        )
         return True
 
-    msg_text = update.message.text.strip()
+    msg_text = (getattr(update.message, "text", None) or "").strip()
     action = rep_state.get("action")
-
-    if msg_text.lower() in ("cancel","انصراف","لغو"):
-        parent=rep_state.get("return_callback") or "rep:main"
-        context.user_data.pop("rep_state",None)
-        await update.message.reply_text("❌ عملیات لغو شد.",reply_markup=build_back_to_rep_keyboard(back_callback=parent))
+    if msg_text.lower() in ("cancel", "انصراف", "لغو"):
+        context.user_data.pop("rep_state", None)
+        await update.message.reply_text(
+            "❌ عملیات لغو شد.",
+            reply_markup=build_back_to_rep_keyboard(back_callback=parent),
+        )
         return True
 
     if action == "awaiting_new_acc_name":
         if not msg_text:
-            return await _reply_fsm_validation_error(update,context,rep_state,"نام مشتری نمی‌تواند خالی باشد.")
-        intent_id = rep_state.get("intent_id", "")
-        intent = database.get_rep_action_intent(intent_id, rep["id"], update.effective_user.id)
+            return await _reply_fsm_validation_error(update, context, rep_state, "نام مشتری نمی‌تواند خالی باشد.")
+        intent_id = str(rep_state.get("intent_id") or "")
+        try:
+            intent = database.get_rep_action_intent(intent_id, rep["id"], update.effective_user.id)
+        except Exception:
+            intent = None
         if not intent or intent.get("status") != "pending":
             context.user_data.pop("rep_state", None)
-            await update.message.reply_text("❌ درخواست صدور منقضی شده یا دیگر معتبر نیست؛ از منوی صدور دوباره شروع کنید.")
+            await update.message.reply_text(
+                "❌ درخواست صدور منقضی شده یا دیگر معتبر نیست؛ از منوی صدور دوباره شروع کنید.",
+                reply_markup=build_back_to_rep_keyboard(back_callback="rep:new_acc_plans"),
+            )
             return True
         try:
-            saved=database.set_rep_action_intent_customer_name(intent_id,rep["id"],update.effective_user.id,msg_text)
-        except ValueError as exc:
-            return await _reply_fsm_validation_error(update,context,rep_state,f"ثبت نام مشتری انجام نشد: {exc}")
+            saved = database.set_rep_action_intent_customer_name(
+                intent_id, rep["id"], update.effective_user.id, msg_text
+            )
+        except (TypeError, ValueError) as exc:
+            return await _reply_fsm_validation_error(update, context, rep_state, f"ثبت نام مشتری انجام نشد: {exc}")
+        except Exception:
+            return await _reply_fsm_validation_error(update, context, rep_state, "ثبت نام مشتری موقتاً ممکن نشد؛ دوباره تلاش کنید.")
         if not saved:
-            return await _reply_fsm_validation_error(update,context,rep_state,"ثبت نام مشتری برای این درخواست ممکن نشد؛ ورودی را اصلاح کنید.")
+            return await _reply_fsm_validation_error(
+                update, context, rep_state, "ثبت نام مشتری برای این درخواست ممکن نشد؛ ورودی را اصلاح کنید."
+            )
         context.user_data.pop("rep_state", None)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 f"✅ تایید صدور با هزینه {intent['amount']:,} تومان",
                 callback_data=f"rep:issue_acc_direct:{intent_id}"
             )],
-            [InlineKeyboardButton("❌ انصراف", callback_data="rep:new_acc_plans")]
+            [InlineKeyboardButton("❌ انصراف", callback_data="rep:new_acc_plans")],
         ])
         await update.message.reply_text(
             f"👤 **نام مشتری:** {msg_text}\n"
@@ -844,39 +912,61 @@ async def _process_rep_text_input_impl(update: Update, context: ContextTypes.DEF
             f"💳 **هزینه:** {intent['amount']:,} تومان\n\n"
             "برای ادامه، صدور را تایید کنید. این درخواست یک شناسه یک‌بارمصرف دارد.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=keyboard
+            reply_markup=keyboard,
         )
         return True
-    elif action == "awaiting_search_query":
-        insp = await asyncio.to_thread(xui_manager.inspect_client,msg_text,scope=rep.get("scope_filter","all"),by_code_only=False)
-        if insp.get("status") == "ok":
-            client_info = insp["data"]
-            owned_account = database.is_account_in_rep_scope(rep["id"], client_info.get("email", ""))
-            if not owned_account:
-                return await _reply_fsm_validation_error(update,context,rep_state,f"اکانت {msg_text} در محدوده ثبت‌شده نمایندگی شما یافت نشد.")
-            context.user_data.pop("rep_state",None)
-            acc_code = owned_account["account_code"]
-            report_text = xui_manager.format_status_report(client_info, is_admin=False)
-            pending_res = database.get_pending_reservation(acc_code)
-            keyboard = _build_account_keyboard(acc_code, update.effective_user.id, is_enabled=bool(client_info["raw"].get("enable", True)), role="rep", pending_res=pending_res)
-            await update.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        else:
-            return await _reply_fsm_validation_error(update,context,rep_state,f"اکانت {msg_text} در محدوده نمایندگی شما یافت نشد.")
+
+    if action == "awaiting_search_query":
+        if not msg_text:
+            return await _reply_fsm_validation_error(update, context, rep_state, "کد اکانت یا ایمیل برای جستجو خالی است.")
+        try:
+            insp = await asyncio.to_thread(
+                xui_manager.inspect_client, msg_text,
+                scope=rep.get("scope_filter", "all"), by_code_only=False
+            )
+        except Exception:
+            logger.exception("Representative account search failed")
+            return await _reply_fsm_validation_error(update, context, rep_state, "جستجوی سرویس موقتاً ممکن نشد؛ دوباره تلاش کنید.")
+        if not isinstance(insp, dict) or insp.get("status") != "ok":
+            return await _reply_fsm_validation_error(
+                update, context, rep_state, f"اکانت {msg_text} در پنل یا محدوده ثبت‌شده نمایندگی شما یافت نشد."
+            )
+        client_info = insp.get("data") or {}
+        owned_account = database.is_account_in_rep_scope(rep["id"], client_info.get("email", ""))
+        if not owned_account:
+            return await _reply_fsm_validation_error(
+                update, context, rep_state, f"اکانت {msg_text} در محدوده ثبت‌شده نمایندگی شما یافت نشد."
+            )
+        context.user_data.pop("rep_state", None)
+        acc_code = owned_account["account_code"]
+        report_text = xui_manager.format_status_report(client_info, is_admin=False)
+        pending_res = database.get_pending_reservation(acc_code)
+        keyboard = _build_account_keyboard(
+            acc_code, update.effective_user.id,
+            is_enabled=bool(client_info.get("raw", {}).get("enable", True)),
+            role="rep", pending_res=pending_res,
+        )
+        await update.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         return True
 
-    return False
-
+    # Unknown/stale FSM states must never consume text or leave a dead-end form open.
+    context.user_data.pop("rep_state", None)
+    await update.message.reply_text(
+        "⛔️ مرحله فرم دیگر معتبر نیست؛ از منوی نمایندگی دوباره شروع کنید.",
+        reply_markup=build_back_to_rep_keyboard(back_callback="rep:main"),
+    )
+    return True
 
 
 async def process_rep_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE, rep: dict) -> bool:
-    """Process representative FSM input, cleaning its prompt only on success or closure."""
-    managed_actions = {"awaiting_new_acc_name", "awaiting_search_query"}
+    """Process representative FSM input and clean only its owned prompt on exit."""
     state = context.user_data.get("rep_state")
     attempts_before = state.get("attempts", 0) if isinstance(state, dict) else 0
     result = await _process_rep_text_input_impl(update, context, rep)
-    if isinstance(state, dict) and state.get("action") in managed_actions:
+    if isinstance(state, dict):
         state_is_active = context.user_data.get("rep_state") is state
         accepted_input = result is True and state.get("attempts", 0) == attempts_before
         if not state_is_active or accepted_input:
             await _cleanup_form_prompt(update, context, state)
     return result
+

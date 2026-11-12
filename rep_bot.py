@@ -5,6 +5,7 @@ import asyncio
 import time
 import re
 import html
+from types import SimpleNamespace
 from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -199,41 +200,211 @@ def send_admin_log(text: str, rep_id: int | None = None):
 
 # --- Commands ---
 
+
+def _onboard_v52_start(user, bot_id: int) -> tuple[str, dict | None]:
+    """Idempotently establish identity, default profile, wallet and bot customer link."""
+    import identity_service
+    import subscription_service
+
+    actor_id = int(user.id)
+    is_root = actor_id == int(ADMIN_TELEGRAM_ID)
+    now = int(time.time())
+    with database.get_db() as conn:
+        prior_settings = conn.execute(
+            "SELECT active_persona FROM user_settings WHERE user_id=?", (actor_id,)
+        ).fetchone()
+        if is_root:
+            identity_service.ensure_personal_identity(conn, actor_id)
+            if prior_settings is None:
+                conn.execute(
+                    "UPDATE user_settings SET active_persona='admin' WHERE user_id=?",
+                    (actor_id,),
+                )
+        else:
+            conn.execute(
+                "INSERT INTO bot_users(telegram_id,role,username,full_name) "
+                "VALUES(?,'end_user',?,?) ON CONFLICT(telegram_id) DO UPDATE SET "
+                "username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE bot_users.username END,"
+                "full_name=CASE WHEN excluded.full_name<>'' THEN excluded.full_name ELSE bot_users.full_name END",
+                (actor_id, user.username or "", user.full_name or ""),
+            )
+            conn.execute(
+                "INSERT INTO user_wallets(user_id,balance_toman) VALUES(?,0) "
+                "ON CONFLICT(user_id) DO NOTHING",
+                (actor_id,),
+            )
+            conn.execute(
+                "INSERT INTO user_settings(user_id,first_connect_mode,active_persona) "
+                "VALUES(?,0,'end_user') ON CONFLICT(user_id) DO NOTHING",
+                (actor_id,),
+            )
+        subscription_service.ensure_default_profile(conn, actor_id, now=now)
+        bot = conn.execute(
+            "SELECT status FROM bot_registry WHERE bot_id=?", (int(bot_id),)
+        ).fetchone()
+        if bot is not None and str(bot["status"]).lower() == "active":
+            conn.execute(
+                "INSERT INTO bot_customers(bot_id,user_tg_id,started_at) VALUES(?,?,?) "
+                "ON CONFLICT(bot_id,user_tg_id) DO NOTHING",
+                (int(bot_id), actor_id, now),
+            )
+        actor = identity_service.resolve_actor(conn, actor_id)
+        setting = conn.execute(
+            "SELECT active_persona FROM user_settings WHERE user_id=?", (actor_id,)
+        ).fetchone()
+        selected = str(setting["active_persona"] if setting else "end_user").strip().lower()
+
+        if actor.is_root:
+            if selected in {"rep", "representative"} and actor.rep_id is not None:
+                rep_row = conn.execute(
+                    "SELECT * FROM representatives WHERE id=? AND is_active=1 AND deleted_at IS NULL",
+                    (actor.rep_id,),
+                ).fetchone()
+                if rep_row is not None:
+                    return "rep", dict(rep_row)
+            if selected in {"end_user", "user"}:
+                return "end_user", None
+            # Only ADMIN_TELEGRAM_ID can resolve to the administrative persona.
+            return "super_admin", None
+
+        if selected in {"rep", "representative"} and actor.persona == "rep" and actor.rep_id is not None:
+            rep_row = conn.execute(
+                "SELECT * FROM representatives WHERE id=? AND is_active=1 AND deleted_at IS NULL",
+                (actor.rep_id,),
+            ).fetchone()
+            if rep_row is not None:
+                return "rep", dict(rep_row)
+        # A forged 'admin' persona on an ordinary account resolves to the user portal.
+        return "end_user", None
+
+
+def _register_application_handlers(application: Application, bot_id: int | None = None):
+    """Attach the exact same command/message/callback surface to each isolated bot."""
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("admin", start_cmd))
+    application.add_handler(CommandHandler("panel", start_cmd))
+    application.add_handler(CommandHandler("menu", start_cmd))
+    application.add_handler(CommandHandler("cancel", cancel_cmd))
+    application.add_handler(CommandHandler("link", link_cmd))
+    application.add_handler(CommandHandler("pricing", pricing_cmd))
+    application.add_handler(CommandHandler("setprice", setprice_cmd))
+    application.add_handler(CommandHandler("billing", billing_cmd))
+    application.add_handler(CommandHandler("balance", billing_cmd))
+    application.add_handler(CommandHandler("factor", billing_cmd))
+    application.add_handler(CommandHandler("wallet", wallet_cmd))
+    application.add_handler(CommandHandler("deposit", deposit_cmd))
+    application.add_handler(CommandHandler("card", card_cmd))
+    application.add_handler(CommandHandler("pay", pay_cmd))
+    application.add_handler(CommandHandler("sync", sync_cmd))
+    application.add_handler(CommandHandler("operations", operations_cmd))
+    application.add_handler(CommandHandler("unlock", unlock_operation_cmd))
+    application.add_handler(CommandHandler("resolveintent", resolve_user_intent_cmd))
+    application.add_handler(CommandHandler("resolverepintent", resolve_rep_intent_cmd))
+    application.add_handler(CommandHandler("resolvereprenewal", resolve_rep_renewal_cmd))
+    application.add_handler(CommandHandler("resolvereservation", resolve_reservation_cmd))
+    application.add_handler(CommandHandler("resolveadminrenewal", resolve_admin_renewal_cmd))
+    application.add_handler(CommandHandler("stats", stats_cmd))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+
+
+async def _run_multi_bot_runtime():
+    """Verify primary getMe, then start all registry-owned bots with one shared scheduler."""
+    import hmac
+    import multi_bot_runtime
+    from crypto_store import decrypt_secret
+
+    with database.get_db() as conn:
+        primary = conn.execute(
+            "SELECT bot_id,token_cipher,status FROM bot_registry "
+            "WHERE is_primary=1 ORDER BY bot_id"
+        ).fetchall()
+    if len(primary) != 1 or str(primary[0]["status"]).lower() != "active":
+        raise RuntimeError("multi-bot rollout requires exactly one active primary registry identity")
+    primary_id = int(primary[0]["bot_id"])
+    try:
+        registered_token = decrypt_secret(str(primary[0]["token_cipher"]), "hstagent/columns/v1")
+    except Exception:
+        raise RuntimeError("primary bot registry credential could not be verified") from None
+    if not hmac.compare_digest(str(BOT_TOKEN), str(registered_token)):
+        raise RuntimeError("BOT_TOKEN does not match the encrypted primary registry credential")
+
+    preflight = Application.builder().token(BOT_TOKEN).build()
+    try:
+        await preflight.initialize()
+        actual = await preflight.bot.get_me()
+    finally:
+        try:
+            await preflight.shutdown()
+        except Exception:
+            pass
+    if int(getattr(actual, "id", 0) or 0) != primary_id:
+        raise RuntimeError("Telegram getMe primary identity does not match bot_registry")
+
+    # One scheduler object is shared with every isolated Application. The
+    # reservation and receipt workers start once, against the verified primary.
+    scheduler = {"owner_bot_id": primary_id, "watchdog_interval_seconds": 300}
+    with database.get_db() as conn:
+        runtime = await multi_bot_runtime.run_registered_bots(
+            conn, database=database, scheduler=scheduler,
+            handler_factory=lambda app, selected_bot_id: _register_application_handlers(app, selected_bot_id),
+        )
+    primary_app = runtime.get("applications", {}).get(primary_id)
+    if primary_app is None:
+        await multi_bot_runtime.stop_registered_bots(runtime)
+        raise RuntimeError("verified primary bot failed to start in multi-bot runtime")
+    if runtime.get("failed_bot_ids"):
+        logger.error("Some registered bots failed to start: %s", runtime["failed_bot_ids"])
+
+    workers = [
+        asyncio.create_task(watchdog_worker(primary_app), name="central-reservation-watchdog"),
+        asyncio.create_task(receipt_notification_worker(primary_app), name="central-receipt-outbox"),
+    ]
+    try:
+        await asyncio.Event().wait()
+    finally:
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        await multi_bot_runtime.stop_registered_bots(runtime)
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
-    
-    # A fresh start also closes the dedicated card-deposit amount prompt.
+
     await _cleanup_deposit_amount_prompt(context, chat.id)
-    # Always clear any active FSM state on start/admin commands
     context.user_data.pop("admin_state", None)
     context.user_data.pop("rep_state", None)
     context.user_data.pop("user_state", None)
     context.user_data.pop("fsm_state", None)
-    
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+
+    if _runtime_flag("v52_multi_bot_enabled") and chat and chat.type == "private":
+        try:
+            role, rep = _onboard_v52_start(user, int(context.bot.id))
+        except Exception:
+            logger.exception("v5.2 start onboarding failed")
+            await update.message.reply_text("⛔️ راه‌اندازی هویت/پروفایل امن انجام نشد؛ دسترسی صادر نشد.")
+            return
+    else:
+        role, rep = database.get_user_role(user.id, chat.id, thread_id)
+
     if await _submit_v52_order_receipt(update, context, role):
         return
     if role == "unauthorized_group":
         return
-
     if database.is_user_blocked(user.id):
-        await update.message.reply_text("⛔️ دسترسی شما به این بات توسط مدیریت مسدود شده است.")
+        await update.message.reply_text("⛔️ دسترسی حساب شما به این بات توسط مدیریت مسدود شده است.")
         return
-
     if role == "super_admin":
         await admin_panel.show_admin_dashboard(update, context)
         return
-
     if role == "rep":
         await rep_panel.show_rep_dashboard(update, context, rep)
         return
-
-    # End-User View
     await user_portal.show_user_portal(update, context)
-
-
 
 def _v52_actor_context(update, context, persona=None, rep=None):
     user, chat = getattr(update, "effective_user", None), getattr(update, "effective_chat", None)
@@ -1285,10 +1456,169 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Renewal & Reserve Queue Logic ---
 
+
+def _runtime_flag(name: str) -> bool:
+    try:
+        value = database.get_setting(name, default="0")
+    except Exception:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _is_root_personal_renewal(user, role, account) -> bool:
+    """Root exemption requires explicit personal purpose and exact root ownership."""
+    if str(role or "").strip().lower() != "super_admin" or user is None:
+        return False
+    if not isinstance(account, dict):
+        return False
+    owner = account.get("owner_tg_id")
+    return (
+        bool(account.get("is_personal_use"))
+        and owner is not None
+        and str(owner) == str(getattr(user, "id", None))
+        and str(account.get("seller_key") or "root") == "root"
+    )
+
+
+async def _create_v52_renewal_checkout(
+    user, role, rep, acc_record, gb, days, plan_code, bot_id,
+    *, root_personal=False,
+):
+    """Persist an immutable quote/order and render its before/after renewal preview."""
+    if isinstance(bot_id, bool) or not isinstance(bot_id, int) or bot_id <= 0:
+        raise ValueError("شناسه معتبر بات برای checkout در دسترس نیست.")
+    account_id = acc_record.get("id")
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+        raise ValueError("شناسه داخلی حساب برای تمدید v5.2 موجود نیست.")
+
+    binding = database.get_account_panel_binding(account_id=account_id)
+    if not binding or binding.get("panel_id") is None:
+        raise ValueError("حساب فاقد اتصال یکتای پنل است؛ عملیات انجام نشد.")
+    if str(binding.get("lifecycle") or "") not in {"active", "capacity"}:
+        raise ValueError("چرخه عمر پنل اجازه تمدید را نمی‌دهد.")
+
+    adapter = database.get_panel_adapter_for_account(account_id)
+    lookup = await adapter.get_client(str(binding["email"]))
+    if getattr(lookup, "state", None) != "found" or getattr(lookup, "client", None) is None:
+        raise ValueError("وضعیت فعلی حساب از پنل قابل تأیید نیست.")
+    current = lookup.client
+
+    from renewal_calculator import calculate_renewal
+    from pricing_service import price_chain
+    from quote_service import create_quote
+    from order_service import create_order
+    import checkout_ui
+
+    now = int(time.time())
+    plan_bytes = int(round(float(gb) * (1024 ** 3)))
+    if plan_bytes <= 0 or int(days) <= 0:
+        raise ValueError("مقدار پلن تمدید معتبر نیست.")
+    before = {
+        "quota_mode": current.quota_mode,
+        "quota_bytes": current.quota_bytes,
+        "used_bytes": current.used_bytes,
+        "time_mode": current.time_mode,
+        "expires_at": current.expires_at,
+        "enabled": current.enabled,
+    }
+    if current.quota_mode != "finite" or current.time_mode != "dated":
+        raise ValueError("حالت حجم/زمان پنل برای تمدید خودکار پشتیبانی‌شده نیست.")
+
+    remaining_bytes = max(int(current.quota_bytes or 0) - int(current.used_bytes or 0), 0)
+    remaining_days = max(int(current.expires_at or now) - now, 0) / 86400
+    modes = database.get_account_renewal_modes(str(binding["account_code"]), int(user.id))
+    rollover_gb = database.get_setting("rollover_max_gb", default=2.0, cast_type=float)
+    rollover_days = database.get_setting("rollover_max_days", default=2.0, cast_type=float)
+    if root_personal or not bool(modes.get("rollover_enabled")):
+        method = "reset_volume_time"
+    elif remaining_bytes <= int(float(rollover_gb) * (1024 ** 3)) and remaining_days <= float(rollover_days):
+        method = "add_both"
+    else:
+        method = "reset_volume_add_time"
+    after = calculate_renewal(
+        current, {"quota_bytes": plan_bytes, "days": int(days)}, method, now,
+    )
+    public_after = {
+        key: after[key] for key in
+        ("quota_mode", "quota_bytes", "used_bytes", "time_mode", "expires_at", "enabled")
+    }
+
+    seller_key = str(binding.get("seller_key") or (
+        f"rep:{int(binding['rep_id'])}" if binding.get("rep_id") is not None else "root"
+    ))
+    payer_tg_id = int(user.id) if root_personal or binding.get("owner_tg_id") is None else int(binding["owner_tg_id"])
+    with database.get_db() as conn:
+        bot = conn.execute(
+            "SELECT rep_id,is_primary,status FROM bot_registry WHERE bot_id=?", (bot_id,)
+        ).fetchone()
+        if bot is None or str(bot["status"]).lower() != "active":
+            raise ValueError("هویت این بات در registry فعال نیست.")
+        bot_seller = (
+            "root" if bool(bot["is_primary"]) and bot["rep_id"] is None
+            else f"rep:{int(bot['rep_id'])}" if bot["rep_id"] is not None else ""
+        )
+        # The primary bot may host a representative desk; the rep's own account
+        # still prices against that representative's registered merchant edge.
+        if str(role).lower() == "rep":
+            import bot_context_service
+            route = bot_context_service.authorize_checkout_route(
+                conn, SimpleNamespace(bot=SimpleNamespace(id=bot_id)),
+                actor_tg_id=int(user.id), action="rep_renew", account_id=account_id,
+            )
+            seller_key = str(route["seller_key"])
+        elif bot_seller != seller_key:
+            raise ValueError("فروشنده حساب با هویت ثبت‌شده بات مطابقت ندارد.")
+
+        pricing = price_chain(
+            conn, plan_code=plan_code, seller_key=seller_key,
+            buyer_tg_id=payer_tg_id,
+            purpose="personal_use" if root_personal else "vpn_renew",
+            now=now,
+        )
+        quote = create_quote(
+            conn, actor_tg_id=int(user.id), bot_id=bot_id,
+            merchant_key=seller_key, purpose="vpn_renew",
+            amount_toman=int(pricing["amount_toman"]),
+            spec={
+                "purpose": "vpn_renew", "payer_tg_id": payer_tg_id,
+                "before": before, "after": public_after,
+                "renewal_method": method, "days": int(days),
+                "plan_quota_bytes": plan_bytes,
+            },
+            price_edges=list(pricing["price_edges"]),
+            account_id=account_id, plan_code=plan_code,
+            panel_id=int(binding["panel_id"]), now=now,
+        )
+        rail = "exempt" if int(pricing["amount_toman"]) == 0 else "card_to_card"
+        order = create_order(
+            conn, quote_id=quote["quote_id"], actor_tg_id=int(user.id),
+            bot_id=bot_id, payment_rail=rail, now=now,
+        )
+
+    persona = "admin" if role == "super_admin" else "rep" if role == "rep" else "user"
+    ctx = {
+        "actor_tg_id": int(user.id), "telegram_id": int(user.id),
+        "bot_id": bot_id, "persona": persona,
+        "rep_id": rep.get("id") if isinstance(rep, dict) else None,
+        "is_root": int(user.id) == int(ADMIN_TELEGRAM_ID),
+    }
+    redirect = (
+        f"v52:pay:{order['order_id']}:card"
+        if rail == "card_to_card" else f"v52:home:{persona}"
+    )
+    page = checkout_ui.preview_renew(
+        ctx, account_id, plan_code, quote=quote,
+        redirect_callback=redirect,
+        parent_callback=f"v52:home:{persona}",
+        persona=persona,
+    )
+    return page.text, page.reply_markup
+
 async def process_account_renewal(
     user, role, rep, acc_record, client_info, gb: float, days: float,
     plan_code: str, effective_first: bool, curr_comment: str, comment_updated: bool = False,
     confirmation_id: str | None = None,
+    bot_id: int | None = None,
 ):
     account_code = acc_record["account_code"]
     email = acc_record["email"]
@@ -1327,7 +1657,34 @@ async def process_account_renewal(
         return False, "⛔️ مشخصات حجم یا مدت با پلن مصوب مطابقت ندارد؛ عملیات انجام نشد.", early_keyboard
     plan_name = str(plan["name"])
     target_rep_id = acc_record.get("rep_id")
-    is_admin_exempt = is_super_admin or (target_rep_id is None)
+    root_personal_exempt = _is_root_personal_renewal(user, role, acc_record)
+    # A confirmation issued before this bridge stays on its original terminal
+    # intent path. It is not a new checkout and must not be charged a second time.
+    legacy_admin_confirmation = is_super_admin and confirmation_id is not None
+    is_admin_exempt = root_personal_exempt or legacy_admin_confirmation
+
+    # New requests enter the immutable quote/order pipeline. A legacy confirmation
+    # remains on its legacy intent path and is never silently converted to a second charge.
+    if _runtime_flag("v52_renewal_bridge_enabled") and confirmation_id is None:
+        try:
+            preview_text, preview_keyboard = await _create_v52_renewal_checkout(
+                user, role, rep, acc_record, gb, days, plan_code, bot_id,
+                root_personal=root_personal_exempt,
+            )
+            return True, preview_text, preview_keyboard
+        except Exception as exc:
+            logger.exception("v5.2 renewal quote preparation failed for %s", account_code)
+            return False, f"⛔️ پیش‌نمایش تمدید امن ایجاد نشد: {exc}", early_keyboard
+
+    # A commercial root operation cannot use the legacy no-debit confirmation.
+    # It must be reopened as a quoted order; root personal use remains exempt.
+    if is_super_admin and not is_admin_exempt:
+        return False, (
+            "⛔️ تمدید تجاری مدیریت کل معاف از صورت‌حساب نیست؛ "
+            "تأیید legacy اجرا نشد و باید checkout جدید ساخته شود."
+        ), early_keyboard
+    if role == "rep" and target_rep_id is None:
+        return False, "⛔️ حساب به نمایندگی مشخصی متصل نیست؛ برداشت انجام نشد.", early_keyboard
     if not is_admin_exempt and charge <= 0:
         return False, "⛔️ قیمت پلن برای نمایندگی معتبر نیست؛ با مدیریت تماس بگیرید.", early_keyboard
 
@@ -2331,7 +2688,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok, msg_out, keyboard = await process_account_renewal(
             user=user, role=role, rep=rep, acc_record=acc_record, client_info=client_info,
             gb=gb, days=days, plan_code=plan_code, effective_first=effective_first,
-            curr_comment=curr_comment, comment_updated=comment_updated
+            curr_comment=curr_comment, comment_updated=comment_updated,
+            bot_id=getattr(getattr(context, "bot", None), "id", None),
         )
         await update.message.reply_text(msg_out, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
@@ -3078,6 +3436,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gb=plan["gb"], days=plan["days"], plan_code=plan_code, effective_first=on_first,
             curr_comment=curr_comment, comment_updated=False,
             confirmation_id=renewal_confirmation_id,
+            bot_id=getattr(getattr(context, "bot", None), "id", None),
         )
         await safe_edit_message(query, msg_out, reply_markup=keyboard, delete_transient_photo=True)
         await query.answer("عملیات تمدید / صف رزرو پردازش شد.")
@@ -3340,158 +3699,156 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Background Reserve Queue Watchdog Task ---
 
+
+async def _watchdog_cycle(application: Application, *, now: int | None = None) -> dict:
+    """One panel-scoped reservation sweep; all panel I/O occurs outside DB transactions."""
+    import reservation_service
+    import scheduler_service
+    from renewal_calculator import calculate_renewal
+
+    timestamp = int(time.time()) if now is None else int(now)
+    trigger_gb = database.get_setting("reserve_trigger_gb", default=0.15, cast_type=float)
+    pending = database.get_all_pending_reservations()
+    result = {"read": 0, "triggered": 0, "activated": 0, "maintenance_skipped": 0,
+              "unknown": 0, "failed": 0}
+    period = str(timestamp // 300)
+
+    for reservation in pending:
+        reservation_id = int(reservation["id"])
+        binding = database.get_account_panel_binding(
+            account_id=reservation.get("account_id"),
+            email=reservation.get("email"),
+            account_code=reservation.get("account_code"),
+        )
+        if not binding or not binding.get("panel_id"):
+            logger.warning("Watchdog skipped reservation %s: account/panel binding is ambiguous", reservation_id)
+            continue
+
+        try:
+            adapter = database.get_panel_adapter_for_account(int(binding["id"]))
+            lookup = await adapter.get_client(str(binding["email"]))
+        except Exception:
+            logger.exception("Watchdog panel read failed for reservation %s", reservation_id)
+            continue
+        if getattr(lookup, "state", None) != "found" or getattr(lookup, "client", None) is None:
+            continue
+
+        client = lookup.client
+        result["read"] += 1
+        if client.time_mode == "on_hold" or client.time_mode == "unknown" or client.quota_mode == "unknown":
+            continue
+
+        trigger = client.enabled is False
+        reason = "غیرفعال بودن سرویس"
+        if client.time_mode == "dated" and client.expires_at is not None and int(client.expires_at) <= timestamp:
+            trigger, reason = True, "پایان اعتبار زمانی"
+        if client.quota_mode == "finite" and client.quota_bytes is not None and client.used_bytes is not None:
+            remaining_bytes = max(int(client.quota_bytes) - int(client.used_bytes), 0)
+            if remaining_bytes <= int(float(trigger_gb) * (1024 ** 3)):
+                trigger, reason = True, f"اتمام حجم (باقیمانده: {remaining_bytes / (1024 ** 3):.2f} GB)"
+        if not trigger:
+            continue
+        result["triggered"] += 1
+
+        # Read/reconciliation above is allowed in maintenance. No activation write
+        # is attempted until the account's own panel is explicitly active.
+        if str(binding.get("lifecycle") or "") != "active":
+            result["maintenance_skipped"] += 1
+            continue
+
+        try:
+            with database.get_db() as conn:
+                claim = scheduler_service.claim_period_job(
+                    conn, kind="reservation_watchdog",
+                    target=f"{int(binding['panel_id'])}:{reservation_id}",
+                    period=period, due_at=timestamp, now=timestamp,
+                    lease_seconds=300,
+                )
+            if claim is None:
+                continue
+            with database.get_db() as conn:
+                prepared = reservation_service.prepare_activation(
+                    conn, int(binding["id"]), reservation_id, now=timestamp
+                )
+            if prepared is None:
+                continue
+        except Exception:
+            logger.exception("Watchdog could not claim activation for reservation %s", reservation_id)
+            result["failed"] += 1
+            continue
+
+        outcome = "unknown"
+        try:
+            # First-connect countdown cannot be represented by a verified adapter
+            # target yet. Stop safely instead of silently changing its semantics.
+            if bool(reservation.get("on_first_connect")):
+                outcome = "definite_failure"
+                logger.warning("Watchdog requires first-connect adapter evidence for reservation %s", reservation_id)
+            else:
+                target = calculate_renewal(
+                    client,
+                    {"quota_bytes": int(round(float(reservation["gb"]) * (1024 ** 3))),
+                     "days": int(reservation["days"])},
+                    "reset_volume_time",
+                    timestamp,
+                )
+                lock_token = prepared["locks"][1]["token"]
+                mutation = await adapter.renew_client(
+                    str(binding["email"]), target,
+                    f"reservation-{reservation_id}-{lock_token[:16]}",
+                )
+                state = getattr(mutation, "state", None)
+                outcome = state if state in {"success", "definite_failure", "unknown"} else "unknown"
+        except Exception:
+            logger.exception("Watchdog activation result is unknown for reservation %s", reservation_id)
+            outcome = "unknown"
+
+        try:
+            with database.get_db() as conn:
+                finalized = reservation_service.finish_activation(conn, prepared, outcome=outcome)
+        except Exception:
+            # A failed local finalization after panel success remains locked for reconciliation.
+            logger.exception("Watchdog could not finalize reservation %s", reservation_id)
+            result["unknown"] += 1
+            continue
+
+        if outcome == "success" and finalized.get("state") == "success":
+            result["activated"] += 1
+            rep_info = database.get_rep_by_id(reservation.get("rep_id"))
+            message = (
+                f"🚀 **فعال‌سازی خودکار بسته رزرو (Watchdog):**\n\n"
+                f"• اکانت: `{binding['email']}` (`{reservation.get('account_code')}`)\n"
+                f"• نماینده: **{rep_info['name'] if rep_info else 'مدیریت کل'}**\n"
+                f"• علت فعال‌سازی: **{reason}**\n"
+                f"• بسته فعال‌شده: **{reservation.get('plan_name')}** "
+                f"({reservation.get('gb')} گیگ / {reservation.get('days')} روز)"
+            )
+            await asyncio.to_thread(send_admin_log, message)
+            if rep_info and rep_info.get("group_id") and rep_info.get("topic_id"):
+                try:
+                    await application.bot.send_message(
+                        chat_id=rep_info["group_id"], message_thread_id=rep_info["topic_id"],
+                        text=message, parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    logger.exception("Watchdog representative notification failed for reservation %s", reservation_id)
+        elif outcome == "unknown" or finalized.get("locks_retained"):
+            result["unknown"] += 1
+        else:
+            result["failed"] += 1
+    return result
+
+
 async def watchdog_worker(application: Application):
-    logger.info("Starting background Reserve Queue Watchdog...")
+    logger.info("Starting panel-scoped reservation watchdog (300-second interval)...")
     while True:
         try:
-            interval = database.get_setting("watchdog_interval_sec", default=300, cast_type=int)
-            trigger_gb = database.get_setting("reserve_trigger_gb", default=0.15, cast_type=float)
-
-            # Step 1: Check pending reservations in local SQLite
-            pending_reservations = database.get_all_pending_reservations()
-            if pending_reservations:
-                logger.info(f"Watchdog cycle: inspecting {len(pending_reservations)} pending reserve packages...")
-
-                def fetch_all():
-                    s = xui_manager.get_session()
-                    r = s.get(f"{xui_manager.BASE_URL}/panel/api/clients/list", timeout=15)
-                    return r.json().get("obj", []) if r.ok else []
-
-                all_clients = await asyncio.to_thread(fetch_all)
-                client_map = {c.get("email"): c for c in all_clients if c.get("email")}
-
-                for res in pending_reservations:
-                    email = res["email"]
-                    c = client_map.get(email)
-                    if not c:
-                        continue
-
-                    client_detail = xui_manager.parse_client_info(c, full_detail=None)
-                    rem_gb = float(client_detail.get("remaining_gb", 0) if isinstance(client_detail.get("remaining_gb"), (int, float)) else 999.0)
-                    days_left = client_detail.get("days_left")
-                    is_expired = client_detail.get("is_expired", False)
-                    is_depleted = client_detail.get("is_depleted", False)
-                    is_enabled = bool(client_detail.get("enable", True))
-
-                    trigger = False
-                    reason = ""
-                    if not is_enabled or is_expired or (days_left is not None and days_left <= 0):
-                        trigger = True
-                        reason = "پایان اعتبار زمانی"
-                    elif is_depleted or rem_gb <= trigger_gb:
-                        trigger = True
-                        reason = f"اتمام حجم (باقیمانده: {rem_gb:.2f} GB)"
-
-                    if trigger:
-                        res_id = int(res["id"])
-                        lock_key = f"reservation-activation:{res_id}"
-                        lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
-                        if not lock_token:
-                            logger.info(
-                                "Watchdog skipped reservation %s because another activation/reconciliation owns it",
-                                res_id
-                            )
-                            continue
-
-                        # Re-read the reservation after acquiring the same lease used by
-                        # manual activation and cancellation; this closes the race.
-                        current_res = database.get_reservation_by_id(res_id)
-                        if not current_res or current_res.get("status") != "pending":
-                            database.release_operation_lock(lock_key, lock_token)
-                            continue
-                        email = current_res["email"]
-                        gb = current_res["gb"]
-                        days = current_res["days"]
-                        on_first = bool(current_res.get("on_first_connect", 0))
-                        logger.info(f"Watchdog auto-activating reserve package for {email} ({reason})")
-
-                        try:
-                            ren_res = await asyncio.to_thread(
-                                xui_manager.renew_client,
-                                email, gb, days, comment=None, rollover=False,
-                                countdown=True if on_first else "auto",
-                                scope="all", by_code_only=True
-                            )
-                        except Exception:
-                            # The request may have reached the panel. Keep the lease
-                            # so another actor cannot blindly issue the same renewal.
-                            logger.exception(
-                                "Watchdog outcome is unknown for reservation %s; activation lease retained",
-                                res_id
-                            )
-                            continue
-
-                        if _xui_operation_failed(ren_res):
-                            database.release_operation_lock(lock_key, lock_token)
-                            logger.error(
-                                "Watchdog received a definite X-UI failure for reservation %s; "
-                                "reservation remains pending (response=%r)",
-                                res_id, ren_res
-                            )
-                            continue
-
-                        if not _xui_operation_succeeded(ren_res):
-                            logger.error(
-                                "Watchdog received an ambiguous X-UI result for reservation %s; "
-                                "activation lease retained (response=%r)",
-                                res_id, ren_res
-                            )
-                            continue
-
-                        try:
-                            activated = database.activate_reservation(
-                                res_id, actor_id=0, actor_name="watchdog"
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Watchdog X-UI activation succeeded but local reservation state write failed: %s",
-                                res_id,
-                            )
-                            continue
-                        if not activated:
-                            logger.error(
-                                "X-UI renewed reservation %s but database activation failed; lease retained",
-                                res_id
-                            )
-                            continue
-                        database.release_operation_lock(lock_key, lock_token)
-
-                        account_code = current_res["account_code"]
-                        plan_name = current_res["plan_name"]
-                        rep_id = current_res["rep_id"]
-                        rep_info = database.get_rep_by_id(rep_id)
-
-                        log_msg = (
-                            f"🚀 **فعال‌سازی خودکار بسته رزرو (Watchdog):**\n\n"
-                            f"• اکانت: `{email}` (`{account_code}`)\n"
-                            f"• نماینده: **{rep_info['name'] if rep_info else 'مدیریت کل'}**\n"
-                            f"• علت فعال‌سازی: **{reason}**\n"
-                            f"• بسته فعال‌شده: **{plan_name}** ({gb} گیگ / {days} روز)\n"
-                            f"• وضعیت: شروع دوره جدید با صفر شدن ترافیک قبلی"
-                        )
-                        await asyncio.to_thread(send_admin_log, log_msg)
-
-                        if rep_info and rep_info.get("group_id") and rep_info.get("topic_id"):
-                            try:
-                                await application.bot.send_message(
-                                    chat_id=rep_info["group_id"],
-                                    message_thread_id=rep_info["topic_id"],
-                                    text=(
-                                        f"🚀 **بسته رزرو اکانت `{account_code}` به صورت خودکار فعال گردید.**\n\n"
-                                        f"• علت فعال‌سازی: {reason}\n"
-                                        f"• بسته: **{plan_name}** ({gb} گیگ / {days} روز)\n"
-                                        f"• وضعیت: آغاز دوره جدید با صفر شدن ترافیک قبلی"
-                                    ),
-                                    parse_mode=ParseMode.MARKDOWN
-                                )
-                            except Exception as e:
-                                logger.error(f"Failed to send rep auto-activation notice: {e}")
-
-        except Exception as e:
-            logger.error(f"Error in watchdog worker cycle: {e}", exc_info=True)
-
-        interval = database.get_setting("watchdog_interval_sec", default=300, cast_type=int)
-        await asyncio.sleep(interval)
+            await _watchdog_cycle(application)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Watchdog cycle failed")
+        await asyncio.sleep(300)
 
 async def receipt_notification_worker(application: Application):
     """Retry durable admin receipt notifications independently of the X-UI watchdog."""
@@ -3509,48 +3866,31 @@ async def receipt_notification_worker(application: Application):
         await asyncio.sleep(30)
 
 
+
 def main():
     database.init_db()
+    if _runtime_flag("v52_multi_bot_enabled"):
+        startup_sync = database.sync_all_active_reps_detailed()
+        if startup_sync.get("status") != "success":
+            logger.error("Initial panel-scoped database sync failed: %s", startup_sync.get("message"))
+        try:
+            asyncio.run(_run_multi_bot_runtime())
+        except KeyboardInterrupt:
+            logger.info("Multi-bot runtime stopped.")
+        return
+
     startup_sync = database.sync_all_active_reps_detailed()
     if startup_sync.get("status") != "success":
-        logger.error("Initial X-UI database sync failed: %s", startup_sync.get("message"))
-    
+        logger.error("Initial panel-scoped database sync failed: %s", startup_sync.get("message"))
+
     async def post_init(application: Application):
+        # Single-bot compatibility mode keeps exactly one watchdog/outbox worker.
         asyncio.create_task(watchdog_worker(application))
         asyncio.create_task(receipt_notification_worker(application))
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("admin", start_cmd))
-    app.add_handler(CommandHandler("panel", start_cmd))
-    app.add_handler(CommandHandler("menu", start_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
-    app.add_handler(CommandHandler("link", link_cmd))
-    app.add_handler(CommandHandler("pricing", pricing_cmd))
-    app.add_handler(CommandHandler("setprice", setprice_cmd))
-    app.add_handler(CommandHandler("billing", billing_cmd))
-    app.add_handler(CommandHandler("balance", billing_cmd))
-    app.add_handler(CommandHandler("factor", billing_cmd))
-    app.add_handler(CommandHandler("wallet", wallet_cmd))
-    app.add_handler(CommandHandler("deposit", deposit_cmd))
-    app.add_handler(CommandHandler("card", card_cmd))
-    app.add_handler(CommandHandler("pay", pay_cmd))
-    app.add_handler(CommandHandler("sync", sync_cmd))
-    app.add_handler(CommandHandler("operations", operations_cmd))
-    app.add_handler(CommandHandler("unlock", unlock_operation_cmd))
-    app.add_handler(CommandHandler("resolveintent", resolve_user_intent_cmd))
-    app.add_handler(CommandHandler("resolverepintent", resolve_rep_intent_cmd))
-    app.add_handler(CommandHandler("resolvereprenewal", resolve_rep_renewal_cmd))
-    app.add_handler(CommandHandler("resolvereservation", resolve_reservation_cmd))
-    app.add_handler(CommandHandler("resolveadminrenewal", resolve_admin_renewal_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    
+    _register_application_handlers(app)
     logger.info("Starting upgraded HstAgentBot polling with Watchdog...")
-    app.run_polling(drop_pending_updates=True)
+    # Never discard pending Telegram updates during startup.
+    app.run_polling(drop_pending_updates=False)
 
-if __name__ == "__main__":
-    main()
