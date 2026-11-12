@@ -31,6 +31,20 @@ xui_manager = load_integration("xui_manager")
 logger = logging.getLogger("RepPanel")
 
 
+def _v52_ui_enabled() -> bool:
+    try:
+        value = database.get_setting("v52_ui_enabled", "0")
+    except Exception:
+        value = "0"
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+async def _dispatch_v52_from_rep(update, context, rep):
+    from rep_bot import _dispatch_v52_callback
+    return await _dispatch_v52_callback(update, context, role="rep", rep=rep)
+
+
+
 def _build_account_keyboard(account_code: str, user_id: int, **kwargs):
     """Build representative account cards from persisted account renewal policies."""
     modes = database.get_account_renewal_modes(account_code, user_id)
@@ -61,6 +75,10 @@ def build_rep_main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🏷 تعرفه‌های همکاری", callback_data="rep:pricing"),
         ]
     ]
+    if _v52_ui_enabled():
+        keyboard.extend([[InlineKeyboardButton("👥 زیرنمایندگان", callback_data="v52:subreps:1"),
+                          InlineKeyboardButton("👤 پروفایل‌ها", callback_data="v52:profiles")],
+                         [InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")]])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -115,6 +133,12 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     thread_id = update.effective_message.message_thread_id if update.effective_message else None
 
     data = query.data or ""
+    if data.startswith("v52:"):
+        if data == "v52:subreps:1":
+            data = "v52:subreps:" + str(int(rep.get("id") or 0))
+            query.data = data
+        await _dispatch_v52_from_rep(update, context, rep)
+        return
     parts = data.split(":")
     action = parts[1] if len(parts)>1 else "main"
     if action=="cancel_form":

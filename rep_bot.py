@@ -2,6 +2,8 @@ import os
 import sys
 import logging
 import asyncio
+import time
+import re
 import html
 from datetime import datetime, timezone
 
@@ -31,6 +33,7 @@ import nlp_matcher
 import admin_panel
 import rep_panel
 import user_portal
+import v52_router
 import finance_manager
 from receipt_notifications import process_receipt_notification_outbox
 import sub_manager
@@ -210,6 +213,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("fsm_state", None)
     
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    if await _submit_v52_order_receipt(update, context, role):
+        return
     if role == "unauthorized_group":
         return
 
@@ -227,6 +232,352 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # End-User View
     await user_portal.show_user_portal(update, context)
+
+
+
+def _v52_actor_context(update, context, persona=None, rep=None):
+    user, chat = getattr(update, "effective_user", None), getattr(update, "effective_chat", None)
+    bot = getattr(context, "bot", None)
+    return {"actor_tg_id": getattr(user, "id", None), "telegram_id": getattr(user, "id", None),
+            "bot_id": getattr(bot, "id", None), "chat_id": getattr(chat, "id", None),
+            "chat_type": getattr(chat, "type", None), "persona": persona or "user",
+            "rep_id": rep.get("id") if isinstance(rep, dict) else None,
+            "is_root": bool(getattr(user, "id", None) == ADMIN_TELEGRAM_ID)}
+
+
+async def _send_v52_page(query, page, notice=""):
+    if page is None:
+        from ui_v52 import render_error
+        page = render_error("مسیر v5.2 در دسترس نیست.", parent_callback="v52:home:user")
+    text_value, markup = getattr(page, "text", None), getattr(page, "reply_markup", None)
+    if text_value is None and isinstance(page, dict):
+        text_value, markup = page.get("text"), page.get("reply_markup")
+    if text_value is None:
+        from ui_v52 import render_error
+        fallback = render_error("پاسخ UI قابل نمایش نیست.", parent_callback="v52:home:user")
+        text_value, markup = fallback.text, fallback.reply_markup
+    await query.edit_message_text(text_value, reply_markup=markup, parse_mode="HTML")
+    await query.answer(notice or "صفحهٔ v5.2")
+
+
+async def _load_v52_receipt_page(update, context, attempt_id, ctx):
+    import checkout_ui
+    import payment_service
+    query, actor_id = update.callback_query, int(ctx.get("actor_tg_id") or 0)
+    bot_id = int(ctx.get("bot_id") or 0)
+    with database.get_db() as conn:
+        row = conn.execute("SELECT attempt_id,order_id,assigned_card_id,state,evidence_cipher,created_at "
+                           "FROM payment_attempts WHERE attempt_id=?", (str(attempt_id),)).fetchone()
+        if row is None:
+            raise ValueError("درخواست پرداخت پیدا نشد.")
+        attempt = payment_service._open_attempt_result(conn, row)
+        o = conn.execute("SELECT order_id,actor_tg_id,bot_id,merchant_key,purpose,payment_rail,amount_toman,"
+                         "status,received_toman,created_at,expires_at,revision FROM payment_orders WHERE order_id=?",
+                         (str(row["order_id"]),)).fetchone()
+        if o is None:
+            raise ValueError("سفارش متصل به رسید پیدا نشد.")
+        order = {"order_id": str(o[0]), "actor_tg_id": int(o[1]), "bot_id": int(o[2]),
+                 "merchant_key": str(o[3]), "purpose": str(o[4]), "payment_rail": str(o[5]),
+                 "amount_toman": int(o[6]), "status": str(o[7]), "received_toman": int(o[8]),
+                 "created_at": int(o[9]), "expires_at": int(o[10]), "revision": int(o[11])}
+    if order["actor_tg_id"] != actor_id or order["bot_id"] != bot_id:
+        raise PermissionError("این دستور پرداخت متعلق به این کاربر/بات نیست.")
+    context.user_data.update({"v52_payment_attempt_id": str(attempt_id),
+                              "v52_payment_order_id": order["order_id"],
+                              "v52_payment_amount": order["amount_toman"],
+                              "v52_payment_pending": True})
+    await _send_v52_page(query, checkout_ui.preview_receipt(ctx, attempt, order=order),
+                         "فقط یک تصویر رسید برای همین سفارش ارسال کنید.")
+
+
+async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
+    query = getattr(update, "callback_query", None)
+    if query is None:
+        return False
+    data, user = str(query.data or ""), update.effective_user
+    selected_role = role or "user"
+    if selected_role == "rep" and rep is None:
+        current_role, current_rep = database.get_user_role(
+            user.id, update.effective_chat.id,
+            update.effective_message.message_thread_id if update.effective_message else None)
+        if current_role == "rep":
+            rep = current_rep
+    persona = "admin" if selected_role == "super_admin" else "rep" if selected_role == "rep" else "user"
+    ctx = _v52_actor_context(update, context, persona, rep)
+    try:
+        route = v52_router.route_callback(data, context=ctx)
+    except Exception:
+        route = None
+    page = None
+    match = re.fullmatch(r"v52:subreps:([1-9][0-9]{0,17})", data)
+    if match:
+        import rep_admin_ui
+        page = rep_admin_ui.show_sub_reps(ctx, int(match.group(1)), persona=persona)
+    else:
+        match = re.fullmatch(r"v52:cfg:([1-9][0-9]{0,17})", data)
+        if match:
+            import config_delivery_ui
+            page = await config_delivery_ui.show_configs(ctx, int(match.group(1)),
+                        adapter_factory=admin_panel._get_admin_panel_adapter_factory(context))
+        else:
+            match = re.fullmatch(r"v52:qr:([1-9][0-9]{0,17}):([0-9]{1,4})", data)
+            if match:
+                import config_delivery_ui
+                result = await config_delivery_ui.deliver_config_qr(
+                    ctx, int(match.group(1)), int(match.group(2)),
+                    adapter_factory=admin_panel._get_admin_panel_adapter_factory(context), message=query.message)
+                await query.answer("QR کانفیگ ارسال شد." if result.state == "ok" else "شماره کانفیگ معتبر نیست.")
+                return True
+            match = re.fullmatch(r"v52:allcfg:([1-9][0-9]{0,17})", data)
+            if match:
+                import config_delivery_ui
+                await config_delivery_ui.deliver_all_configs(
+                    ctx, int(match.group(1)), adapter_factory=admin_panel._get_admin_panel_adapter_factory(context),
+                    message=query.message)
+                await query.answer("تحویل کانفیگ‌ها انجام شد.")
+                return True
+            if data == "v52:panels":
+                from ui_v52 import render_page, button
+                with database.get_db() as conn:
+                    rows = conn.execute("SELECT id,name,panel_type,lifecycle,is_default FROM panels ORDER BY is_default DESC,id").fetchall()
+                body = "\n".join(
+                    f"پنل {int(row['id'])}: {row['name']} · {row['panel_type']} · {row['lifecycle']}"
+                    for row in rows
+                ) or "پنلی ثبت نشده است."
+                buttons = [[button("مشاهده پنل " + str(int(row["id"])), "v52:panel:" + str(int(row["id"])))]
+                           for row in rows]
+                buttons.append([button("افزودن پنل", "v52:panelnew")])
+                page = render_page("مدیریت پنل‌ها", body, persona="admin", rows=buttons)
+            elif data == "v52:panelnew":
+                import panel_admin_ui
+                page = panel_admin_ui.begin_add_panel(ctx)
+            elif data == "v52:bots":
+                from ui_v52 import render_page, button
+                reps = database.get_all_active_reps()
+                body = "ثبت بات اختصاصی برای نماینده‌های فعال؛ توکن فقط در فرم خصوصی دریافت می‌شود."
+                buttons = [[button("ثبت بات نماینده " + str(rep_item.get("id")), "v52:bot:" + str(int(rep_item["id"])))]
+                           for rep_item in reps]
+                buttons.insert(0, [button("ثبت بات اصلی", "v52:bot:primary")])
+                page = render_page("مدیریت بات‌ها", body, persona="admin", rows=buttons)
+            elif data == "v52:bot:primary":
+                import bot_admin_ui
+                page = bot_admin_ui.begin_register_bot(ctx, rep_id=None, is_primary=True, chat_type="private")
+            elif data == "v52:domains":
+                from ui_v52 import render_page, button
+                reps = database.get_all_active_reps()
+                body = "دامنه‌ها به هویت نمایندهٔ مالک متصل می‌شوند؛ ثبت فقط پس از بررسی و اثبات دامنه انجام می‌شود."
+                buttons = [[button("ثبت دامنه برای نماینده " + str(rep_item.get("id")),
+                                   "v52:domain:" + str(int(rep_item["id"])))]
+                           for rep_item in reps]
+                page = render_page("مدیریت دامنه‌ها", body, persona="admin", rows=buttons)
+            elif data == "v52:cards":
+                import finance_admin_ui
+                page = finance_admin_ui.edit_bank_card(ctx)
+            else:
+                match = re.fullmatch(r"v52:card:([1-9][0-9]{0,17})", data)
+                if match:
+                    import finance_admin_ui
+                    with database.get_db() as conn:
+                        row = conn.execute("SELECT * FROM bank_cards WHERE id=?", (int(match.group(1)),)).fetchone()
+                    page = finance_admin_ui.edit_bank_card(ctx, None if row is None else dict(row))
+                elif data == "v52:plans":
+                    import finance_admin_ui
+                    plans = database.get_pricing_plans(active_only=True)
+                    page = finance_admin_ui.edit_plan(ctx, plans[0]) if plans else None
+                else:
+                    match = re.fullmatch(r"v52:settle:([1-9][0-9]{0,17})", data)
+                    if match:
+                        from ui_v52 import render_error
+                        page = render_error("snapshot بدهی همان edge موجود نیست؛ هیچ posting مالی انجام نشد.",
+                                             persona=persona, parent_callback="v52:cards")
+                    else:
+                        match = re.fullmatch(r"v52:receipt:([0-9a-fA-F-]{16,40})", data)
+                        if match:
+                            try:
+                                await _load_v52_receipt_page(update, context, match.group(1), ctx)
+                            except Exception as exc:
+                                from ui_v52 import render_error
+                                await _send_v52_page(query, render_error(str(exc), persona=persona,
+                                                                         parent_callback="v52:shop"))
+                            return True
+
+    if page is None and isinstance(route, v52_router.Route):
+        name, params = route.handler, route.params
+        try:
+            if name == "route_home":
+                target = params.get("persona")
+                if target == "admin":
+                    await admin_panel.show_admin_dashboard(update, context, edit_message=True)
+                elif target == "rep":
+                    await rep_panel.show_rep_dashboard(update, context, rep or {}, edit_message=True)
+                else:
+                    await user_portal.show_user_portal(update, context, edit_message=True)
+                await query.answer("منوی اصلی")
+                return True
+            elif name == "choose_rail":
+                if params.get("rail") not in {"card", "card_to_card"}:
+                    from ui_v52 import render_error
+                    page = render_error("این پل پرداخت در W18-B01 فعال نشده است؛ هیچ برداشت یا تحویلی انجام نشد.",
+                                        persona=persona, parent_callback="v52:shop")
+                else:
+                    import payment_service
+                    import checkout_ui
+                    order_id = str(params["order_id"])
+                    with database.get_db() as conn:
+                        order_row = conn.execute(
+                            "SELECT order_id,actor_tg_id,bot_id,merchant_key,purpose,payment_rail,amount_toman,"
+                            "status,received_toman,created_at,expires_at,revision FROM payment_orders WHERE order_id=?",
+                            (order_id,),
+                        ).fetchone()
+                        if order_row is None:
+                            raise ValueError("سفارش پرداخت پیدا نشد.")
+                        order = {"order_id": str(order_row[0]), "actor_tg_id": int(order_row[1]),
+                                 "bot_id": int(order_row[2]), "merchant_key": str(order_row[3]),
+                                 "purpose": str(order_row[4]), "payment_rail": str(order_row[5]),
+                                 "amount_toman": int(order_row[6]), "status": str(order_row[7]),
+                                 "received_toman": int(order_row[8]), "created_at": int(order_row[9]),
+                                 "expires_at": int(order_row[10]), "revision": int(order_row[11])}
+                        if order["actor_tg_id"] != int(user.id) or order["bot_id"] != int(ctx["bot_id"]):
+                            raise PermissionError("سفارش متعلق به این کاربر/بات نیست.")
+                        attempt = payment_service.create_card_attempt(
+                            conn, order_id=order_id, actor_tg_id=int(user.id),
+                            bot_id=int(ctx["bot_id"]), now=int(time.time())
+                        )
+                    context.user_data.update({
+                        "v52_payment_attempt_id": attempt["attempt_id"],
+                        "v52_payment_order_id": order_id,
+                        "v52_payment_amount": int(order["amount_toman"]),
+                        "v52_payment_pending": True,
+                    })
+                    page = checkout_ui.preview_receipt(ctx, attempt, order=order)
+            elif name == "preview_rotation":
+                import account_actions_ui
+                page = account_actions_ui.preview_rotation(ctx, params["account_id"], params["rotation_type"],
+                                                           parent_callback=f"v52:sub:{params['account_id']}")
+            elif name == "show_grants":
+                import access_ui
+                page = access_ui.show_grants(ctx, params["account_id"], persona=persona)
+            elif name == "preview_revoke":
+                import access_ui
+                page = access_ui.preview_revoke(ctx, params["account_id"], params["grantee_tg_id"], persona=persona)
+            elif name == "begin_register":
+                import domain_ui
+                page = domain_ui.begin_register(ctx, params["rep_id"])
+            elif name == "begin_register_bot":
+                import bot_admin_ui
+                page = bot_admin_ui.begin_register_bot(ctx, params["rep_id"], chat_type=ctx.get("chat_type"))
+            elif name == "preview_lifecycle":
+                import panel_admin_ui
+                page = panel_admin_ui.preview_lifecycle(ctx, params["panel_id"], params["lifecycle"])
+            elif name == "open_account_profiles":
+                import account_card_service
+                card = await account_card_service.build_account_card(
+                    ctx, params["account_id"], adapter_factory=admin_panel._get_admin_panel_adapter_factory(context))
+                page = type("V52Page", (), {"text": card.text, "reply_markup": card.reply_markup})()
+            elif name == "list_profiles":
+                import profile_list_ui
+                page = profile_list_ui.list_profiles(ctx)
+            elif name == "show_profile":
+                import profile_actions_ui
+                page = profile_actions_ui.show_profile(ctx, params["profile_id"])
+            elif name == "show_catalog":
+                import goods_ui
+                page = goods_ui.show_catalog(ctx)
+            elif name == "preview_product":
+                import goods_ui
+                page = goods_ui.preview_product(ctx, params["product_id"])
+            else:
+                from ui_v52 import render_error
+                page = render_error(f"مسیر {name} handler اجرایی مستقل ندارد؛ عملیات انجام نشد.",
+                                    persona=persona, parent_callback="v52:home:" + persona)
+        except Exception as exc:
+            logger.exception("v5.2 bridge dispatch failed for %s", data)
+            from ui_v52 import render_error
+            page = render_error(f"اجرای صفحهٔ v5.2 ممکن نشد: {exc}",
+                                persona=persona, parent_callback="v52:home:" + persona)
+    if page is None:
+        from ui_v52 import render_error
+        page = render_error("callback در registry یا Bridge مجاز W18 شناخته نشد؛ عملیات قدیمی اجرا نشد.",
+                            persona=persona, parent_callback="v52:home:" + persona)
+    await _send_v52_page(query, page)
+    return True
+
+
+async def _show_legacy_reset_preview(update, context, role, rep=None):
+    import account_actions_ui
+    from ui_v52 import render_error
+    query = update.callback_query
+    parts = str(query.data or "").split(":")
+    code = parts[-1] if len(parts) > 1 else ""
+    persona = "admin" if role == "super_admin" else "rep" if role == "rep" else "user"
+    try:
+        account = database.get_account_by_code_or_email(code)
+        if not account or not account.get("id"):
+            raise ValueError("حساب برای پیش‌نمایش پیدا نشد.")
+        page = account_actions_ui.preview_rotation(_v52_actor_context(update, context, persona, rep),
+                                                   int(account["id"]), "sub", parent_callback="v52:home:" + persona)
+    except Exception:
+        page = render_error("درخواست قدیمی بازنشانی اجرا نشد؛ شناسه یا مجوز قابل تأیید نیست.",
+                            persona=persona, parent_callback="v52:home:" + persona)
+    await _send_v52_page(query, page, "پیش‌نمایش؛ هیچ تغییری در پنل انجام نشد.")
+
+
+async def _submit_v52_order_receipt(update, context, role):
+    state, message, user = getattr(context, "user_data", {}) or {}, update.message, update.effective_user
+    attempt_id = state.get("v52_payment_attempt_id")
+    if not attempt_id or not state.get("v52_payment_pending") or message is None or not message.photo:
+        return False
+    if role not in {"end_user", "rep"} or database.is_user_blocked(user.id):
+        await message.reply_text("⛔️ ثبت رسید برای این نقش/حساب مجاز نیست.")
+        return True
+    amount = state.get("v52_payment_amount")
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+        await message.reply_text("⚠️ مبلغ ثابت سفارش قابل تأیید نیست؛ درخواست امن متوقف شد.")
+        return True
+    try:
+        import payment_service
+        with database.get_db() as conn:
+            result = payment_service.submit_receipt(conn, attempt_id=str(attempt_id),
+                actor_tg_id=int(user.id), bot_id=int(context.bot.id), amount_toman=int(amount),
+                receipt_photo_id=str(message.photo[-1].file_id), now=int(time.time()),
+                media_group_id=message.media_group_id)
+    except Exception:
+        logger.exception("Order-bound v5.2 receipt submission failed")
+        await message.reply_text("❌ رسید سفارش ثبت نشد؛ وضعیت سفارش و درخواست پرداخت محفوظ ماند.")
+        return True
+    for key in ("v52_payment_attempt_id", "v52_payment_order_id", "v52_payment_amount", "v52_payment_pending"):
+        state.pop(key, None)
+    notice = "رسید قبلاً ثبت شده بود؛ ثبت تکراری انجام نشد." if result.get("replayed") else "رسید به سفارش متصل و برای بررسی ثبت شد."
+    await message.reply_text(f"✅ {notice}\nشناسه رسید: {result.get('receipt_id')}\nوضعیت سفارش: {result.get('order_status', 'pending_review')}")
+    try:
+        await process_receipt_notification_outbox(context.bot, limit=10)
+    except Exception:
+        logger.exception("Order receipt notification remains queued")
+    return True
+
+
+async def _route_v52_fsm_text(update, context):
+    user, chat, bot = update.effective_user, update.effective_chat, getattr(context, "bot", None)
+    if not all((user, chat, getattr(bot, "id", None))):
+        return False
+    route = v52_router.route_text({"bot_id": int(bot.id), "actor_tg_id": int(user.id), "chat_id": int(chat.id)},
+                                  update.message.text or "", now=int(time.time()))
+    if route is False:
+        return False
+    await update.message.reply_text("متن در draft ثبت‌شدهٔ v5.2 دریافت شد؛ مسیر قدیمی NLP آن را دوباره مصرف نمی‌کند.")
+    return True
+
+
+async def _route_v52_fsm_photo(update, context):
+    user, chat, bot, message = update.effective_user, update.effective_chat, getattr(context, "bot", None), update.message
+    if not all((user, chat, getattr(bot, "id", None), message, message.photo)):
+        return False
+    route = v52_router.route_photo({"bot_id": int(bot.id), "actor_tg_id": int(user.id), "chat_id": int(chat.id)},
+                                   str(message.photo[-1].file_id), now=int(time.time()))
+    if route is False:
+        return False
+    await message.reply_text("تصویر به draft پشتیبانی v5.2 متصل شد؛ مسیر رسید legacy اجرا نشد.")
+    return True
 
 async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -251,14 +602,23 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = args[0].strip()
     u_name = getattr(user, "username", "") or ""
     u_full = getattr(user, "full_name", "") or ""
-    res = database.link_user_to_account(code, user.id, u_name, u_full)
-    if res.get("status") == "ok":
-        await update.message.reply_text(
-            f"✅ اکانت `{code}` با موفقیت به حساب تلگرام شما متصل گردید.\nاکنون می‌توانید با ارسال کد `{code}` وضعیت آن را استعلام کنید.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    import account_link_service
+    link_context = {"actor_tg_id": user.id, "telegram_id": user.id}
+    candidates = account_link_service.resolve_link_candidates(link_context, code)
+    if candidates.get("status") == "ambiguous":
+        import access_ui
+        page = access_ui.show_link_candidates(link_context, code, persona="user", parent_callback="user:main")
+        await update.message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+        return
+    if candidates.get("status") != "resolved" or len(candidates.get("account_ids", [])) != 1:
+        await update.message.reply_text(f"❌ حساب مجاز و یکتایی با کد `{code}` پیدا نشد.", parse_mode=ParseMode.MARKDOWN)
+        return
+    result = account_link_service.claim_or_access(link_context, int(candidates["account_ids"][0]))
+    if result.get("status") in {"claimed", "owner", "grant_access", "root_access"}:
+        await update.message.reply_text(f"✅ دسترسی حساب `{code}` برای این حساب تلگرام تأیید شد.\nاکنون می‌توانید سرویس را از پورتال مشاهده کنید.",
+                                        parse_mode=ParseMode.MARKDOWN)
     else:
-        await update.message.reply_text(f"❌ اکانتی با کد `{code}` یافت نشد.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("⛔️ این حساب قابل اتصال یا مشاهده نیست.", parse_mode=ParseMode.MARKDOWN)
 
 async def pricing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1386,6 +1746,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ ارسال فیش فقط برای نقش کاربر نهایی یا نماینده مجاز است.")
         return
 
+    # Order-bound attempts are handled before legacy wallet receipts.
+    if await _submit_v52_order_receipt(update, context, role):
+        return
+    if await _route_v52_fsm_photo(update, context):
+        return
+
     navigation_keyboard = build_receipt_navigation_keyboard(role)
     if not update.message.photo:
         await update.message.reply_text(
@@ -1492,6 +1858,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ دسترسی شما به این بات توسط مدیریت مسدود شده است.")
         return
     if role == "super_admin" and chat.type != "private":
+        return
+
+    if await _route_v52_fsm_text(update, context):
         return
 
     # Text triggers for glass dashboard
@@ -2040,6 +2409,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = query.data or ""
+    if data.startswith("v52:"):
+        await _dispatch_v52_callback(update, context, role=role, rep=rep)
+        return
+    v52_enabled = False
+    try:
+        v52_enabled = str(database.get_setting("v52_ui_enabled", "0")).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    except Exception:
+        pass
+    if v52_enabled and (data.startswith("reset_sub:") or data.startswith("confirm_reset_sub:") or data.startswith("do_reset_sub:")):
+        await _show_legacy_reset_preview(update, context, role, rep)
+        return
 
     # Admin views and mutations can expose financial/personal records; they are
     # restricted to the bot's private chat even when the super-admin ID is used

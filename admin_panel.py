@@ -19,6 +19,95 @@ backup_and_report = load_integration("backup_and_report")
 
 logger = logging.getLogger("HstAgentBot.AdminPanel")
 
+
+_V52_ADMIN_ADAPTER_FACTORY = None
+
+
+def _v52_admin_enabled() -> bool:
+    try:
+        value = database.get_setting("v52_ui_enabled", "0")
+    except Exception:
+        value = "0"
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _get_admin_panel_adapter_factory(context=None):
+    """Resolve injected factory first; otherwise build the scoped W17 factory."""
+    global _V52_ADMIN_ADAPTER_FACTORY
+    containers = []
+    if context is not None:
+        containers.extend([getattr(context, "bot_data", None),
+                           getattr(getattr(context, "application", None), "bot_data", None)])
+    for container in containers:
+        if isinstance(container, dict):
+            for key in ("panel_adapter_factory", "adapter_factory", "v52_adapter_factory"):
+                candidate = container.get(key)
+                if callable(getattr(candidate, "resolve_account_adapter", None)):
+                    return candidate
+    if _V52_ADMIN_ADAPTER_FACTORY is not None:
+        return _V52_ADMIN_ADAPTER_FACTORY
+    from panel_adapters.factory import PanelAdapterFactory
+    import requests
+
+    def panel_loader(panel_id):
+        with database.get_db() as conn:
+            row = conn.execute("SELECT * FROM panels WHERE id=?", (int(panel_id),)).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        record["is_active"] = str(record.get("lifecycle") or "").lower() == "active"
+        return record
+
+    def account_loader(account_id):
+        with database.get_db() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id=? AND deleted_at IS NULL",
+                               (int(account_id),)).fetchone()
+        return None if row is None else dict(row)
+
+    def account_id_resolver(panel_id, email):
+        with database.get_db() as conn:
+            row = conn.execute("SELECT id FROM accounts WHERE panel_id=? AND lower(email)=lower(?) "
+                               "AND deleted_at IS NULL ORDER BY id LIMIT 1",
+                               (int(panel_id), str(email))).fetchone()
+        return None if row is None else int(row["id"])
+
+    data = getattr(context, "bot_data", None) if context is not None else None
+    manual_repository = data.get("manual_pool_repository") if isinstance(data, dict) else None
+    _V52_ADMIN_ADAPTER_FACTORY = PanelAdapterFactory(
+        panel_loader=panel_loader, account_loader=account_loader,
+        session_factory=lambda _panel: requests.Session(), manual_repository=manual_repository,
+        account_id_resolver=account_id_resolver, transaction_probe=lambda: False,
+    )
+    return _V52_ADMIN_ADAPTER_FACTORY
+
+
+def _get_admin_panel_adapter(panel_id=None, context=None, adapter_factory=None):
+    """Return the selected active panel adapter; never construct a URL directly."""
+    candidate = adapter_factory
+    if candidate is None and context is not None:
+        data = getattr(context, "bot_data", None)
+        if isinstance(data, dict):
+            candidate = data.get("panel_adapter_factory") or data.get("adapter_factory")
+    selected = panel_id
+    if selected is None:
+        with database.get_db() as conn:
+            row = conn.execute("SELECT id FROM panels WHERE lifecycle='active' "
+                               "ORDER BY is_default DESC,id LIMIT 1").fetchone()
+        selected = int(row["id"]) if row is not None else None
+    if selected is None:
+        raise RuntimeError("هیچ پنل فعالی برای مدیریت انتخاب نشده است.")
+    if callable(getattr(candidate, "get_adapter", None)):
+        return candidate.get_adapter(int(selected))
+    if callable(getattr(candidate, "list_clients", None)):
+        return candidate
+    return _get_admin_panel_adapter_factory(context).get_adapter(int(selected))
+
+
+async def _dispatch_v52_from_admin(update, context):
+    from rep_bot import _dispatch_v52_callback
+    return await _dispatch_v52_callback(update, context, role="super_admin", rep=None)
+
+
 # --- Keyboards ---
 
 def build_admin_main_keyboard() -> InlineKeyboardMarkup:
@@ -47,6 +136,12 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("💾 پشتیبان‌گیری سریع دیتابیس", callback_data="admin:backup")
         ]
     ]
+    if _v52_admin_enabled():
+        keyboard.extend([
+            [InlineKeyboardButton("🖥 پنل‌ها", callback_data="v52:panels"), InlineKeyboardButton("🤖 بات‌ها", callback_data="v52:bots")],
+            [InlineKeyboardButton("🌐 دامنه‌ها", callback_data="v52:domains"), InlineKeyboardButton("💳 کارت‌ها", callback_data="v52:cards")],
+            [InlineKeyboardButton("🏷 تعرفه‌ها", callback_data="v52:plans"), InlineKeyboardButton("🧾 عملیات", callback_data="v52:ops")],
+        ])
     return InlineKeyboardMarkup(keyboard)
 
 def build_back_to_admin_keyboard(
@@ -266,6 +361,9 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         return
 
     data = query.data or ""
+    if data.startswith("v52:"):
+        await _dispatch_v52_from_admin(update, context)
+        return
     parts=data.split(":")
     action=parts[1] if len(parts)>1 else "main"
     sub_action=parts[2] if len(parts)>2 else ""
@@ -899,37 +997,21 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         await query.edit_message_text(f"⚠️ **گزارش اکانت‌های بحرانی و روبه‌اتمام:**\n\n{report_text}", parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("گزارش اکانت‌های بحرانی")
 
-    # 9. Free Pool Accounts Watchdog
+    # 9. Free Pool Accounts Watchdog — read-only through the selected root-scoped adapter.
     elif action == "pool":
-        def fetch_unused_clients():
-            s = xui_manager.get_session()
-            r = s.get(f"{xui_manager.BASE_URL}/panel/api/clients/list")
-            all_c = r.json().get("obj", []) if r.ok else []
-            un = []
-            for c in all_c:
-                em = c.get("email", "")
-                if em:
-                    tr = c.get("traffic") or {}
-                    up = tr.get("up", 0) or c.get("up", 0) or 0
-                    down = tr.get("down", 0) or c.get("down", 0) or 0
-                    com = c.get("comment") or ""
-                    exp = c.get("expiryTime") or 0
-                    if up == 0 and down == 0 and not com and exp < 0:
-                        un.append(em)
-            return un
-            
-        unused = await asyncio.to_thread(fetch_unused_clients)
-        badge = "🟢 وضعیت مطلوب" if len(unused) >= 10 else "⚠️ ظرفیت رو به اتمام"
-        text = (
-            f"🏊 **استخر اکانت‌های آزاد (Pool Watchdog):**\n\n"
-            f"• وضعیت ظرفیت: **{badge}**\n"
-            f"• تعداد کل اکانت‌های آماده تخصیص: **{len(unused)}**\n\n"
-            f"نمونه اکانت‌های آماده استخر:\n" +
-            "\n".join([f"• `{e}`" for e in unused[:6]])
-        )
+        try:
+            adapter = _get_admin_panel_adapter(context=context)
+            clients = await adapter.list_clients(scope_filter="all")
+            labels = [str(getattr(client, "email", "")) for client in clients if getattr(client, "email", None)]
+            text = ("🏊 **نمای کلی حساب‌های پنل انتخاب‌شده:**\\n\\n"
+                    f"• تعداد حساب‌های قابل مشاهده در اسکوپ root: **{len(clients)}**\\n"
+                    "• نمونه شناسه‌ها:\\n" + "\\n".join(f"• {item}" for item in labels[:6]))
+        except Exception:
+            logger.exception("Scoped panel adapter read failed in admin pool view")
+            text = "⚠️ خواندن پنل انتخاب‌شده در اسکوپ root ممکن نشد؛ هیچ fallback مستقیمی اجرا نشد."
         keyboard = build_back_to_admin_keyboard()
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        await query.answer("استخر آزاد")
+        await query.answer("نمای پنل")
 
     # 10. Instant Backup & Download
     elif action == "backup":

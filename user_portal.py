@@ -31,6 +31,39 @@ xui_manager = load_integration("xui_manager")
 logger = logging.getLogger("UserPortal")
 
 
+def _v52_ui_enabled() -> bool:
+    try:
+        value = database.get_setting("v52_ui_enabled", "0")
+    except Exception:
+        value = "0"
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+async def _dispatch_v52_from_portal(update, context, role="end_user", rep=None):
+    from rep_bot import _dispatch_v52_callback
+    return await _dispatch_v52_callback(update, context, role=role, rep=rep)
+
+
+async def _show_legacy_reset_preview(update, context, owned_account):
+    from account_actions_ui import preview_rotation
+    from ui_v52 import render_error
+    from rep_bot import _v52_actor_context
+    query = update.callback_query
+    account_id = owned_account.get("id") if isinstance(owned_account, dict) else None
+    try:
+        if account_id is None:
+            raise ValueError("شناسه داخلی حساب برای پیش‌نمایش در دسترس نیست.")
+        page = preview_rotation(_v52_actor_context(update, context, "user"), int(account_id), "sub",
+                                parent_callback=f"user:view_acc:{owned_account.get('account_code', '')}")
+    except Exception:
+        page = render_error("بازنشانی قدیمی اجرا نشد؛ مسیر پیش‌نمایش تازه در دسترس نیست.",
+                            persona="user", parent_callback="user:services")
+    await query.edit_message_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+    await query.answer("پیش‌نمایش؛ هیچ تغییری در پنل انجام نشد.")
+
+
+
+
 def build_user_portal_keyboard() -> InlineKeyboardMarkup:
     """Builds the main interactive portal keyboard for an end-user."""
     keyboard = [
@@ -46,6 +79,9 @@ def build_user_portal_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📋 تعرفه‌ها و قیمت‌ها", callback_data="user:pricing"),
         ]
     ]
+    if _v52_ui_enabled():
+        keyboard.append([InlineKeyboardButton("👥 پروفایل‌های من", callback_data="v52:profiles"),
+                         InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -134,6 +170,9 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     data = query.data or ""
+    if data.startswith("v52:"):
+        await _dispatch_v52_from_portal(update, context, role="end_user")
+        return
     parts = data.split(":")
     action = parts[1] if len(parts)>1 else "main"
     if action=="cancel_form":
@@ -155,7 +194,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
     # Every service-specific user action must be re-authorized against the exact DB owner.
     account_actions = {
         "view_acc", "get_sub_link", "get_qr", "reset_sub",
-        "unlink_confirm", "do_unlink", "renew_plans"
+        "unlink_confirm", "do_unlink", "renew_plans", "confirm_reset_sub", "do_reset_sub"
     }
     owned_account = None
     if action == "do_renew":
@@ -177,12 +216,16 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         # Retain the opaque token while normalizing the verified account target.
         parts = [parts[0], parts[1], owned_account["email"], renew_intent["plan_code"], intent_id]
     elif action in account_actions:
-        requested_identifier = parts[2] if len(parts) > 2 else ""
+        requested_identifier = parts[2] if len(parts) > 2 else (parts[1] if action in {"confirm_reset_sub", "do_reset_sub"} else "")
         owned_account = database.get_user_owned_account(user.id, requested_identifier)
         if not owned_account:
             await query.answer("⛔️ این سرویس به حساب تلگرام شما متصل نیست.", show_alert=True)
             return
         parts[2] = owned_account["email"]
+    if _v52_ui_enabled() and action in {"reset_sub", "confirm_reset_sub", "do_reset_sub"}:
+        await _show_legacy_reset_preview(update, context, owned_account)
+        return
+
 
     # 1. Main Portal
     if action == "main":
@@ -751,6 +794,9 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 7. Renew Account Via Wallet Selection
     elif action == "renew_plans":
+        if _v52_ui_enabled() and owned_account.get("rep_id") is not None:
+            await query.answer("⛔️ سرویس متصل به نماینده فقط برای مشاهده و دریافت اطلاعات است؛ تمدید باید از مسیر نماینده انجام شود.", show_alert=True)
+            return
         acc_code = owned_account["account_code"]
         plans = database.get_pricing_plans(active_only=True)
         wallet_bal = database.get_user_wallet_balance(user.id)

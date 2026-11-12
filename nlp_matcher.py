@@ -7,6 +7,19 @@ import database
 from server_integrations import load_integration
 xui_manager = load_integration("xui_manager")
 
+
+def _v52_ui_enabled(capabilities=None, explicit=None) -> bool:
+    if explicit is not None:
+        return bool(explicit)
+    if isinstance(capabilities, dict) and any(bool(capabilities.get(k)) for k in ("v52", "v5_2", "profiles", "config_delivery")):
+        return True
+    try:
+        value = database.get_setting("v52_ui_enabled", "0")
+    except Exception:
+        value = "0"
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
 def normalize_text(text: str) -> str:
     if not text:
         return ""
@@ -127,7 +140,7 @@ def detect_intent(text: str) -> tuple[str, dict]:
 
     return "unknown", {}
 
-def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_connect: bool = False, role: str = "rep", pending_res: dict = None, rollover_enabled: bool = True) -> InlineKeyboardMarkup:
+def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_connect: bool = False, role: str = "rep", pending_res: dict = None, rollover_enabled: bool = True, account_id: int | None = None, persona: str | None = None, capabilities: dict | None = None, v52_enabled: bool | None = None) -> InlineKeyboardMarkup:
     """
     Dynamic interactive account card:
     - Pending reservation status buttons (if any in queue)
@@ -138,6 +151,13 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
     toggle_conn_action = "suspend" if is_enabled else "activate"
     mode_text = "⏱ شروع: با اولین اتصال" if on_first_connect else "⏱ شروع: از زمان تمدید"
     rollover_text = "🔄 رول‌اوور: فعال" if rollover_enabled else "⏹ رول‌اوور: غیرفعال"
+    bridge_enabled = _v52_ui_enabled(capabilities, v52_enabled)
+    if account_id is None and bridge_enabled:
+        try:
+            account = database.get_account_by_code_or_email(account_code)
+            account_id = account.get("id") if isinstance(account, dict) else account["id"] if account is not None else None
+        except Exception:
+            account_id = None
     
     keyboard = [
         [
@@ -208,12 +228,15 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
         ])
     
     # Two balanced deliverable actions. Legacy deliv_sub remains backend-compatible.
+    if bridge_enabled and account_id:
+        keyboard.append([InlineKeyboardButton("👥 پروفایل‌ها و دسترسی‌ها", callback_data=f"v52:sub:{int(account_id)}")])
     keyboard.append([
         InlineKeyboardButton("📱 سابسکریپشن + QR", callback_data=f"deliv_qr:{account_code}"),
         InlineKeyboardButton("⚡ کانفیگ‌ها + QR", callback_data=f"deliv_cfg:{account_code}")
     ])
+    reset_callback = f"confirm_reset_sub:{account_code}" if bridge_enabled else f"reset_sub:{account_code}"
     keyboard.append([
-        InlineKeyboardButton("🔄 بازنشانی لینک ساب (ابطال قبلی)", callback_data=f"reset_sub:{account_code}")
+        InlineKeyboardButton("🔄 بازنشانی لینک ساب (ابطال قبلی)", callback_data=reset_callback)
     ])
     if role == "super_admin":
         keyboard.append([
