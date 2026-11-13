@@ -263,3 +263,27 @@ def test_rep_account_card_reset_local_persistence_failure_keeps_lock(monkeypatch
 
     assert not released
     assert query.answers and "ثبت محلی انجام نشد" in query.answers[-1][0]
+
+
+
+def test_user_reset_first_click_is_preview_only_when_v52_is_enabled(monkeypatch):
+    update, query = make_update("user:reset_sub:ACC-1")
+    setup_user_role(monkeypatch)
+    monkeypatch.setattr(user_portal, "_v52_ui_enabled", lambda: True)
+    events = []
+
+    async def show_preview(*args, **kwargs):
+        events.append("preview")
+
+    monkeypatch.setattr(user_portal, "_show_legacy_reset_preview", show_preview)
+    monkeypatch.setattr(
+        user_portal.database, "acquire_operation_lock",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("first click acquired mutation lock")),
+    )
+    monkeypatch.setattr(
+        user_portal.sub_manager, "reset_client_subscription",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("first click reached panel mutation")),
+    )
+    asyncio.run(user_portal.handle_user_callbacks(update, SimpleNamespace(user_data={})))
+    assert events == ["preview"]
+    assert query.answers == []

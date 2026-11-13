@@ -56,14 +56,50 @@ DEFAULT_SETTINGS = [
 ]
 
 def _insert_audit(cur, rep_id, account_code, email, action, actor_id, actor_name, details, result_status):
-    cur.execute("""
-        INSERT INTO audit_logs (rep_id, account_code, email, action, actor_id, actor_name, details_json, result_status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        rep_id, str(account_code or ""), str(email or ""), action, actor_id,
-        actor_name, json.dumps(details, ensure_ascii=False) if isinstance(details, (dict, list)) else str(details),
-        result_status
-    ))
+    """Delegate encrypted audit writes; legacy schemas receive redacted metadata only."""
+    import audit_service
+
+    columns = {row[1] for row in cur.connection.execute("PRAGMA table_info(audit_logs)")}
+    encryption_ready = "details_cipher" in columns
+    if encryption_ready:
+        try:
+            import crypto_store
+            crypto_store.load_master_key()
+        except Exception:
+            encryption_ready = False
+
+    if not encryption_ready:
+        safe_details = audit_service.redact_sensitive(details)
+        if isinstance(safe_details, dict):
+            safe_metadata = dict(safe_details)
+        else:
+            safe_metadata = {"details": safe_details} if safe_details is not None else {}
+        safe_metadata["_audit_action"] = str(action)
+        safe_metadata["_audit_result"] = str(result_status)
+        details_json = json.dumps(
+            safe_metadata, ensure_ascii=False, sort_keys=True, default=str,
+        )
+        cur.execute(
+            "INSERT INTO audit_logs(rep_id,account_code,email,action,actor_id,actor_name,details_json,result_status) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                rep_id, str(account_code or ""), str(email or ""), str(action),
+                int(actor_id or 0), actor_name, details_json, str(result_status),
+            ),
+        )
+        return int(cur.lastrowid)
+
+    return audit_service.record_audit(
+        action=str(action),
+        actor_id=int(actor_id or 0),
+        actor_name=actor_name,
+        details=details,
+        rep_id=rep_id,
+        account_code=account_code,
+        email=email,
+        result_status=str(result_status),
+        connection=cur.connection,
+    )
 
 
 def _record_rep_ledger_entry(cur, rep_id, account_code, email, plan_code, tx_type, amount, description, actor_id, actor_name):
@@ -1083,19 +1119,62 @@ def get_all_bot_users():
         return [dict(r) for r in rows]
 
 def get_account_by_code_or_email(identifier: str) -> dict | None:
-    """Return exact account details and the current representative name."""
-    value = str(identifier or '').strip()
+    """Return a minimal account DTO; secret columns never cross this reader boundary."""
+    value = str(identifier or "").strip()
     if not value:
         return None
     with get_db() as conn:
-        row = conn.execute('''
-            SELECT a.*, r.name AS rep_name
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
+        optional = {
+            "owner_tg_id": "NULL AS owner_tg_id",
+            "customer_name": "'' AS customer_name",
+            "enable": "1 AS enable",
+            "total_gb": "0 AS total_gb",
+            "expiry_time": "0 AS expiry_time",
+            "panel_id": "NULL AS panel_id",
+            "revision": "1 AS revision",
+        }
+        selected = [
+            "a.id",
+            "a.rep_id",
+            "a.account_code",
+            "a.email",
+        ]
+        selected.extend(
+            f"a.{name}" if name in columns else expression
+            for name, expression in optional.items()
+        )
+        selected.append("r.name AS rep_name")
+        rows = conn.execute(
+            "SELECT " + ",".join(selected) + """
             FROM accounts AS a
-            LEFT JOIN representatives AS r ON r.id = a.rep_id
-            WHERE LOWER(a.account_code) = LOWER(?) OR LOWER(a.email) = LOWER(?)
-            LIMIT 1
-        ''', (value, value)).fetchone()
-        return dict(row) if row else None
+            LEFT JOIN representatives AS r ON r.id=a.rep_id
+            WHERE LOWER(a.account_code)=LOWER(?) OR LOWER(a.email)=LOWER(?)
+            ORDER BY a.id
+            """,
+            (value, value),
+        ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("Account identifier is ambiguous")
+        return dict(rows[0]) if rows else None
+
+
+def read_account_sub_id(account_id: int) -> str | None:
+    """Decrypt only a migrated sub_id_cipher; never fall back to legacy plaintext."""
+    if isinstance(account_id, bool) or int(account_id) <= 0:
+        raise ValueError("account_id must be a positive integer")
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT sub_id_cipher FROM accounts WHERE id=? AND deleted_at IS NULL",
+            (int(account_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    cipher = row["sub_id_cipher"] if "sub_id_cipher" in row.keys() else None
+    if not cipher:
+        raise ValueError("account subscription secret is not migrated; plaintext fallback is disabled")
+    from crypto_store import decrypt_secret
+    return decrypt_secret(str(cipher), "hstagent/columns/v1")
 
 
 def reassign_account(account_code, new_rep_id=None, new_owner_tg_id=None, to_pool: bool = False, actor_id: int = 0, actor_name: str = 'Admin'):
@@ -1428,39 +1507,103 @@ def get_recent_ledger_entries(rep_id=None, limit=10):
             rows = cur.execute(query, (limit,)).fetchall()
         return [dict(r) for r in rows]
 
-def get_financial_ledger_paginated(rep_id=None, page=1, page_size=10) -> tuple[list, int, int]:
+def get_financial_ledger_paginated(
+    rep_id=None, page=1, page_size=10, *, scope=None, merchant_key=None, edge_id=None,
+) -> tuple[list, int, int]:
+    """Read a merchant/edge-scoped ledger page; root-wide access must be explicit.
+
+    scope='rep' includes that merchant's own rows, active child edges, and
+    identifiable legacy rows. It never widens to another merchant's rows.
+    scope='edge' pins one active edge.
+    """
     page_size = max(1, min(int(page_size), 100))
     page = max(1, int(page))
+    # Compatibility for the original admin reader: rep_id=None represented
+    # the root ledger; all new scoped callers should pass scope explicitly.
+    selected_scope = str(scope or ("rep" if rep_id is not None else "root")).strip().lower()
+    if selected_scope not in {"root", "rep", "merchant", "edge"}:
+        raise ValueError("an explicit root, rep, merchant or edge ledger scope is required")
+
+    params = []
+    if selected_scope == "root":
+        if rep_id is not None or merchant_key is not None or edge_id is not None:
+            raise ValueError("root ledger scope cannot be combined with a narrower selector")
+        base_where = "1=1"
+    elif selected_scope == "rep":
+        if isinstance(rep_id, bool) or rep_id is None or int(rep_id) <= 0:
+            raise ValueError("rep scope requires a positive rep_id")
+        selected_merchant = f"rep:{int(rep_id)}"
+        if merchant_key is not None and str(merchant_key) != selected_merchant:
+            raise PermissionError("representative cannot read another merchant")
+        base_where = (
+            "(l.merchant_key=? OR "
+            "l.edge_id IN (SELECT e.id FROM rep_edges e WHERE e.parent_key=? AND e.active=1) OR "
+            "(l.rep_id=? AND l.ledger_scope='legacy'))"
+        )
+        params.extend((selected_merchant, selected_merchant, int(rep_id)))
+        if edge_id is not None:
+            base_where += (
+                " AND l.edge_id=? AND EXISTS (SELECT 1 FROM rep_edges e "
+                "WHERE e.id=? AND e.parent_key=? AND e.active=1)"
+            )
+            params.extend((int(edge_id), int(edge_id), selected_merchant))
+    elif selected_scope == "merchant":
+        selected_merchant = str(merchant_key or "").strip()
+        if not selected_merchant or len(selected_merchant) > 200:
+            raise ValueError("merchant scope requires a canonical merchant_key")
+        if edge_id is not None:
+            raise ValueError("merchant scope cannot be widened with an edge selector")
+        base_where = "l.merchant_key=?"
+        params.append(selected_merchant)
+    else:
+        if edge_id is None or isinstance(edge_id, bool) or int(edge_id) <= 0:
+            raise ValueError("edge scope requires a positive edge_id")
+        selected_merchant = str(merchant_key or "").strip()
+        if not selected_merchant:
+            raise ValueError("edge scope requires the owning merchant_key")
+        base_where = (
+            "l.edge_id=? AND EXISTS (SELECT 1 FROM rep_edges e WHERE e.id=l.edge_id "
+            "AND e.active=1 AND e.parent_key=?)"
+        )
+        params.extend((int(edge_id), selected_merchant))
+
     with get_db() as conn:
         cur = conn.cursor()
-        base_where = "1=1"
-        params = []
-        if rep_id is not None:
-            base_where += " AND l.rep_id = ?"
-            params.append(rep_id)
-
+        columns = {row["name"] for row in cur.execute("PRAGMA table_info(financial_ledger)")}
+        if selected_scope != "root" and not {"merchant_key", "edge_id", "ledger_scope"}.issubset(columns):
+            # Pre-W09 databases have no merchant/edge columns. Preserve the
+            # historical rep reader only as an own-rep subset; never widen it.
+            if selected_scope == "rep" and edge_id is None:
+                base_where = "l.rep_id=?"
+                params = [int(rep_id)]
+            else:
+                raise ValueError("scoped ledger schema is unavailable; refusing a broad legacy read")
+        opening_expr = "LOWER(COALESCE(l.transaction_type,'')) IN ('opening','opening_anchor','opening_balance')"
+        if "business_key" in columns:
+            opening_expr += " OR LOWER(COALESCE(l.business_key,'')) LIKE 'opening:%'"
         total = cur.execute(
             f"SELECT COUNT(*) FROM financial_ledger l WHERE {base_where}", tuple(params)
         ).fetchone()[0]
-        total_pages = max(1, (total + page_size - 1) // page_size)
+        total_pages = max(1, (int(total) + page_size - 1) // page_size)
         page = min(page, total_pages)
         offset = (page - 1) * page_size
-
         query = f"""
-        SELECT l.*,
-               r.name as rep_name,
-               r.rep_code as rep_code,
-               u.full_name as user_full_name,
-               u.username as user_username
-        FROM financial_ledger l
-        LEFT JOIN representatives r ON l.rep_id = r.id
-        LEFT JOIN bot_users u ON l.user_id = u.telegram_id
-        WHERE {base_where}
-        ORDER BY l.id DESC
-        LIMIT ? OFFSET ?
+            SELECT l.*,
+                   r.name AS rep_name,
+                   r.rep_code AS rep_code,
+                   u.full_name AS user_full_name,
+                   u.username AS user_username,
+                   CASE WHEN ({opening_expr}) THEN 1 ELSE 0 END AS is_opening_anchor,
+                   CASE WHEN ({opening_expr}) THEN 0 ELSE l.amount END AS sales_amount
+            FROM financial_ledger l
+            LEFT JOIN representatives r ON l.rep_id=r.id
+            LEFT JOIN bot_users u ON l.user_id=u.telegram_id
+            WHERE {base_where}
+            ORDER BY l.id DESC
+            LIMIT ? OFFSET ?
         """
         rows = cur.execute(query, tuple(params + [page_size, offset])).fetchall()
-        return [dict(r) for r in rows], total, total_pages
+        return [dict(row) for row in rows], int(total), int(total_pages)
 def get_user_first_connect_mode(user_id: int) -> bool:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1880,7 +2023,7 @@ def _sync_panel_rows(target_reps):
                     continue
                 email_l = email.casefold()
                 prior_row = conn.execute(
-                    "SELECT id,rep_id,account_code,customer_name,sub_id,enable,total_gb,"
+                    "SELECT id,rep_id,account_code,customer_name,enable,total_gb,"
                     "expiry_time,owner_tg_id,seller_key,is_personal_use "
                     "FROM accounts WHERE panel_id=? AND LOWER(email)=LOWER(?) "
                     "AND deleted_at IS NULL ORDER BY id",
@@ -1931,7 +2074,7 @@ def _sync_panel_rows(target_reps):
 
                 sub_id = _sync_client_value(client, "subscription_id")
                 if not isinstance(sub_id, str) or not sub_id:
-                    sub_id = str(prior.get("sub_id") or "") if prior else ""
+                    sub_id = ""
                 account_code = str(prior.get("account_code") or email) if prior else email
                 customer_name = str(prior.get("customer_name") or "") if prior else ""
                 owner_tg_id = prior.get("owner_tg_id") if prior else None
@@ -3967,52 +4110,158 @@ def get_pending_payment_receipts():
         rows = cur.execute("SELECT * FROM payment_receipts WHERE status = 'pending' ORDER BY id ASC").fetchall()
         return [dict(r) for r in rows]
 
-def approve_payment_receipt(receipt_id_or_code, admin_tg_id: int, admin_name: str = "Admin") -> dict:
-    """Approve a receipt and apply the associated credit exactly once, atomically."""
+def _receipt_row(cur, receipt_id_or_code):
+    if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
+        return cur.execute(
+            "SELECT * FROM payment_receipts WHERE id=?",
+            (int(receipt_id_or_code),),
+        ).fetchone()
+    return cur.execute(
+        "SELECT * FROM payment_receipts WHERE tracking_code=?",
+        (str(receipt_id_or_code),),
+    ).fetchone()
+
+
+def _approve_order_linked_receipt(receipt, admin_tg_id, admin_name, *, nonce, now):
+    """Hand an order-linked receipt to W08 at a clean transaction boundary."""
+    if not isinstance(nonce, str) or not nonce:
+        raise ValueError("order-linked receipts require a one-use payment-service confirmation nonce")
+    bot_id = int(receipt.get("bot_id") or 0)
+    if bot_id <= 0:
+        raise ValueError("order-linked receipt has no canonical bot identity")
+    import payment_service
+
+    with get_db() as conn:
+        # No caller-owned write transaction is open here. payment_service owns
+        # the atomic boundary and rechecks pending state, actor and nonce itself.
+        result = payment_service.approve_order_receipt(
+            conn,
+            receipt_id=int(receipt["id"]),
+            reviewer_tg_id=int(admin_tg_id),
+            bot_id=bot_id,
+            nonce=nonce,
+            now=int(now if now is not None else time.time()),
+        )
+        updated = conn.execute(
+            "SELECT * FROM payment_receipts WHERE id=?",
+            (int(receipt["id"]),),
+        ).fetchone()
+        if updated is None:
+            raise RuntimeError("approved receipt disappeared after payment-service delegation")
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        _insert_audit(
+            cur, receipt.get("rep_id"), receipt.get("tracking_code"), "",
+            "payment_receipt_order_reviewed", int(admin_tg_id),
+            admin_name or "Admin",
+            {
+                "receipt_id": int(receipt["id"]),
+                "order_id": str(receipt.get("order_id") or ""),
+                "amount_toman": int(receipt.get("amount_toman") or 0),
+                "payment_status": str(result.get("status") or "unknown"),
+                "wallet_credit": int(result.get("wallet_credit") or 0),
+                "panel_job": bool(result.get("panel_job")),
+            },
+            str(result.get("status") or "unknown"),
+        )
+        latest = cur.execute(
+            "SELECT * FROM payment_receipts WHERE id=?",
+            (int(receipt["id"]),),
+        ).fetchone()
+        response = dict(latest)
+        response.update({
+            "status": str(result.get("status") or "unknown"),
+            "payment_result": dict(result),
+        })
+        return response
+
+
+def approve_payment_receipt(
+    receipt_id_or_code, admin_tg_id: int, admin_name: str = "Admin",
+    *, nonce: str | None = None, now: int | None = None,
+) -> dict:
+    """Approve a legacy receipt locally or delegate an invoice receipt to W08."""
+    with get_db() as conn:
+        row = _receipt_row(conn.cursor(), receipt_id_or_code)
+        if row is None:
+            raise ValueError("Receipt not found")
+        snapshot = dict(row)
+    if snapshot.get("order_id"):
+        return _approve_order_linked_receipt(
+            snapshot, admin_tg_id, admin_name, nonce=nonce, now=now,
+        )
+
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
-        if isinstance(receipt_id_or_code, int) or str(receipt_id_or_code).isdigit():
-            row = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (int(receipt_id_or_code),)).fetchone()
-        else:
-            row = cur.execute("SELECT * FROM payment_receipts WHERE tracking_code = ?", (str(receipt_id_or_code),)).fetchone()
-        if not row:
+        row = _receipt_row(cur, receipt_id_or_code)
+        if row is None:
             raise ValueError("Receipt not found")
         receipt = dict(row)
-        if receipt["status"] != "pending":
-            return receipt
-
-        cur.execute("""
-            UPDATE payment_receipts
-            SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND status = 'pending'
-        """, (admin_tg_id, receipt["id"]))
-        if cur.rowcount != 1:
-            latest = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt["id"],)).fetchone()
-            return dict(latest) if latest else receipt
-
-        amount = int(receipt["amount_toman"])
-        if amount <= 0:
-            raise ValueError("Receipt has an invalid amount")
-        if receipt["role"] == "rep":
-            if receipt.get("rep_id") is None:
-                raise ValueError("Representative receipt has no representative account")
-            _record_rep_ledger_entry(
-                cur, receipt["rep_id"], "", "", "",
-                "credit", amount, f"تسویه فیش کارت‌به‌کارت {receipt['tracking_code']}",
-                admin_tg_id, admin_name
-            )
-        elif receipt["role"] == "end_user":
-            _credit_user_wallet(
-                cur, receipt["user_id"], amount,
-                f"شارژ کیف پول با فیش {receipt['tracking_code']}",
-                admin_tg_id, admin_name
-            )
+        # A concurrent linker may have converted the receipt after the
+        # initial read. Roll back and re-enter through the invoice boundary.
+        if receipt.get("order_id"):
+            conn.rollback()
         else:
-            raise ValueError("Receipt role is invalid")
+            if receipt["status"] != "pending":
+                return receipt
+            amount = int(receipt["amount_toman"])
+            if amount <= 0:
+                raise ValueError("Receipt has an invalid amount")
+            receipt_columns = {
+                column[1] for column in cur.execute("PRAGMA table_info(payment_receipts)")
+            }
+            invoice_guard = " AND order_id IS NULL" if "order_id" in receipt_columns else ""
+            changed = cur.execute(
+                "UPDATE payment_receipts "
+                "SET status='approved',reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status='pending'" + invoice_guard,
+                (int(admin_tg_id), int(receipt["id"])),
+            )
+            if changed.rowcount != 1:
+                latest = _receipt_row(cur, receipt["id"])
+                return dict(latest) if latest else receipt
+            if receipt["role"] == "rep":
+                if receipt.get("rep_id") is None:
+                    raise ValueError("Representative receipt has no representative account")
+                _record_rep_ledger_entry(
+                    cur, receipt["rep_id"], "", "", "", "credit", amount,
+                    f"تسویه فیش کارت‌به‌کارت {receipt['tracking_code']}",
+                    int(admin_tg_id), admin_name,
+                )
+            elif receipt["role"] == "end_user":
+                _credit_user_wallet(
+                    cur, receipt["user_id"], amount,
+                    f"شارژ کیف پول با فیش {receipt['tracking_code']}",
+                    int(admin_tg_id), admin_name,
+                )
+            else:
+                raise ValueError("Receipt role is invalid")
+            _insert_audit(
+                cur, receipt.get("rep_id"), receipt.get("tracking_code"), "",
+                "payment_receipt_approved", int(admin_tg_id), admin_name or "Admin",
+                {
+                    "receipt_id": int(receipt["id"]),
+                    "tracking_code": str(receipt["tracking_code"]),
+                    "amount_toman": amount,
+                    "role": str(receipt["role"]),
+                },
+                "approved",
+            )
+            updated = _receipt_row(cur, receipt["id"])
+            return dict(updated)
 
-        updated = cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt["id"],)).fetchone()
-        return dict(updated)
+    # The receipt was linked while this call waited for the SQLite write lock.
+    with get_db() as conn:
+        latest = _receipt_row(conn.cursor(), receipt_id_or_code)
+        if latest is None:
+            raise ValueError("Receipt not found")
+        linked = dict(latest)
+    if not linked.get("order_id"):
+        raise RuntimeError("receipt changed during approval; refusing implicit retry")
+    return _approve_order_linked_receipt(
+        linked, admin_tg_id, admin_name, nonce=nonce, now=now,
+    )
 def cancel_payment_receipt(receipt_id_or_code, user_id: int) -> dict:
     """Cancel an unsubmitted pending receipt owned by this user, without ledger effects."""
     with get_db() as conn:
