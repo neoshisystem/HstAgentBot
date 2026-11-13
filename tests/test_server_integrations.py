@@ -47,12 +47,16 @@ def test_xui_manager_contract_rejects_missing_or_non_callable_method():
 def test_backup_report_contract_requires_token_and_both_delivery_methods():
     module = _fake_module("backup_and_report")
     assert validate_integration_contract("backup_and_report", module) is module
-    del module.BOT_TOKEN
+    assert not hasattr(module, "BOT_TOKEN")
     module.send_telegram_document = "not-callable"
     with pytest.raises(RuntimeError) as error:
         validate_integration_contract("backup_and_report", module)
-    assert "BOT_TOKEN" in str(error.value)
     assert "send_telegram_document" in str(error.value)
+
+    exposed_secret = _fake_module("backup_and_report")
+    exposed_secret.BOT_TOKEN = "PRIVATE_TOKEN_MARKER"
+    with pytest.raises(RuntimeError, match="BOT_TOKEN"):
+        validate_integration_contract("backup_and_report", exposed_secret)
 
 
 def test_loader_does_not_mask_missing_internal_dependency(monkeypatch, tmp_path):

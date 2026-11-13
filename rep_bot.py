@@ -42,7 +42,6 @@ from xui_result import XUIResult, classify_xui_result
 
 from server_integrations import load_integration
 xui_manager = load_integration("xui_manager")
-backup_and_report = load_integration("backup_and_report")
 
 # Set up logging
 logging.basicConfig(
@@ -149,54 +148,30 @@ async def _cleanup_deposit_amount_prompt(context: ContextTypes.DEFAULT_TYPE, cha
 
 
 def send_admin_log(text: str, rep_id: int | None = None):
-    """
-    Sends operational event notifications:
-    - Routes logs to the designated representative's log topic or the operational log topic.
-    - Mirrors to Super Admin DM if configured in system settings.
+    """Queue operational reports through trusted Product routing and the outbox.
+
+    Caller-provided chat/topic identifiers and helper-module tokens are never
+    used. Abuse reports are routed by report_router exclusively to root DM.
     """
     try:
-        import re
-        import json
-        import urllib.request
-        clean_html = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        clean_html = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", clean_html)
-        clean_html = re.sub(r"`(.*?)`", r"<code>\1</code>", clean_html)
+        from internal_reporting import send_telegram_message
 
-        rep_topic = None
-        if rep_id:
-            rep = database.get_rep_by_id(rep_id)
-            if rep and rep.get("topic_id"):
-                rep_topic = rep["topic_id"]
-
-        op_top = database.get_setting("operational_logs_topic_id", default=OPERATIONAL_LOGS_TOPIC_ID, cast_type=int)
-        target_topic = rep_topic or op_top
-
-        try:
-            backup_and_report.send_telegram_message(target_topic, clean_html, parse_mode="HTML")
-        except Exception:
-            backup_and_report.send_telegram_message(target_topic, text, parse_mode=None)
-
-        admin_dm_top = database.get_setting("admin_dm_topic_id", default=ADMIN_DM_LOGS_TOPIC_ID, cast_type=int)
-        admin_tg_id = database.get_setting("admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int)
-        if admin_tg_id and admin_dm_top:
-            try:
-                url = f"https://api.telegram.org/bot{backup_and_report.BOT_TOKEN}/sendMessage"
-                payload = {
-                    "chat_id": admin_tg_id,
-                    "message_thread_id": admin_dm_top,
-                    "text": clean_html,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                }
-                urllib.request.urlopen(urllib.request.Request(
-                    url,
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"}
-                ), timeout=10)
-            except Exception as e:
-                logger.error(f"Failed to mirror log to Admin DM: {e}")
-    except Exception as e:
-        logger.error(f"Failed to send admin log: {e}")
+        result = send_telegram_message(
+            None,
+            str(text),
+            parse_mode="HTML",
+            rep_id=rep_id,
+        )
+        if not isinstance(result, dict) or result.get("queued") is not True:
+            logger.warning(
+                "Admin report was not queued (state=%s)",
+                result.get("state", "unknown") if isinstance(result, dict) else "unknown",
+            )
+        return result
+    except Exception as exc:
+        # Avoid logging exception payloads that may contain deployment secrets.
+        logger.error("Failed to queue admin report: %s", type(exc).__name__)
+        return {"ok": False, "queued": False, "state": "unknown"}
 
 # --- Commands ---
 
