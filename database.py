@@ -2136,6 +2136,22 @@ def _has_panel_registry():
 
 def _sync_legacy_schema(target_reps):
     """Read a legacy default panel before DB mutation; never hold a transaction over I/O."""
+    # This adapter writes the pre-v5.2 UNIQUE(email) schema. Never let it run
+    # against migration-003's panel-scoped account key.
+    with get_db() as schema_conn:
+        account_columns = {
+            str(row["name"])
+            for row in schema_conn.execute("PRAGMA table_info(accounts)").fetchall()
+        }
+    if "panel_id" in account_columns:
+        return {
+            "status": "error",
+            "count": 0,
+            "ambiguous": 0,
+            "unmatched": 0,
+            "message": "Legacy account sync is disabled for panel-scoped schema; use _sync_panel_rows",
+        }
+
     if not target_reps:
         return {"status": "success", "count": 0, "ambiguous": 0, "unmatched": 0,
                 "message": "No active representatives"}
@@ -2246,24 +2262,175 @@ def sync_all_active_reps() -> int:
     return int(result.get("count", 0)) if result.get("status") == "success" else 0
 
 
-def upsert_account_record(rep_id, email, account_code, customer_name="", sub_id="", enable=1, total_gb=0, expiry_time=0, owner_tg_id=None):
+def upsert_account_record(
+    rep_id,
+    email,
+    account_code,
+    customer_name="",
+    sub_id="",
+    enable=1,
+    total_gb=0,
+    expiry_time=0,
+    owner_tg_id=None,
+    panel_id=None,
+):
+    """Upsert an account safely on both legacy and panel-scoped schemas.
+
+    The original positional signature remains compatible.  On migration-003
+    databases, callers should supply panel_id; a missing value is inferred
+    only when the email identifies one existing row or exactly one default
+    panel is configured.
+    """
+    email_value = str(email)
+    account_code_value = str(account_code)
+
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-        INSERT INTO accounts (rep_id, account_code, email, customer_name, sub_id, enable, total_gb, expiry_time, owner_tg_id, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(email) DO UPDATE SET
-            rep_id = excluded.rep_id,
-            account_code = excluded.account_code,
-            customer_name = CASE WHEN excluded.customer_name != '' THEN excluded.customer_name ELSE customer_name END,
-            sub_id = CASE WHEN excluded.sub_id != '' THEN excluded.sub_id ELSE sub_id END,
-            enable = excluded.enable,
-            total_gb = CASE WHEN excluded.total_gb > 0 THEN excluded.total_gb ELSE total_gb END,
-            expiry_time = excluded.expiry_time,
-            owner_tg_id = CASE WHEN excluded.owner_tg_id IS NOT NULL THEN excluded.owner_tg_id ELSE accounts.owner_tg_id END,
-            updated_at = CURRENT_TIMESTAMP
-        """, (rep_id, str(account_code), email, customer_name, sub_id, enable, total_gb, expiry_time, owner_tg_id))
-        conn.commit()
+        account_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+        }
+
+        # Preserve the historical UNIQUE(email) behavior before migration 003.
+        if "panel_id" not in account_columns:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO accounts (
+                    rep_id, account_code, email, customer_name, sub_id, enable,
+                    total_gb, expiry_time, owner_tg_id, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(email) DO UPDATE SET
+                    rep_id = excluded.rep_id,
+                    account_code = excluded.account_code,
+                    customer_name = CASE
+                        WHEN excluded.customer_name != '' THEN excluded.customer_name
+                        ELSE accounts.customer_name END,
+                    sub_id = CASE
+                        WHEN excluded.sub_id != '' THEN excluded.sub_id
+                        ELSE accounts.sub_id END,
+                    enable = excluded.enable,
+                    total_gb = CASE
+                        WHEN excluded.total_gb > 0 THEN excluded.total_gb
+                        ELSE accounts.total_gb END,
+                    expiry_time = excluded.expiry_time,
+                    owner_tg_id = CASE
+                        WHEN excluded.owner_tg_id IS NOT NULL THEN excluded.owner_tg_id
+                        ELSE accounts.owner_tg_id END,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    rep_id, account_code_value, email_value, customer_name, sub_id,
+                    enable, total_gb, expiry_time, owner_tg_id,
+                ),
+            )
+            return
+
+        # Migration 003 changes the logical key to (panel_id, email NOCASE).
+        # The write lock makes the existence check and UPDATE/INSERT one
+        # atomic operation even when multiple workers reconcile concurrently.
+        conn.execute("BEGIN IMMEDIATE")
+        selected_panel_id = panel_id
+
+        if selected_panel_id is not None:
+            if isinstance(selected_panel_id, bool):
+                raise ValueError("panel_id must be a positive integer")
+            try:
+                selected_panel_id = int(selected_panel_id)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("panel_id must be a positive integer") from None
+            if selected_panel_id <= 0:
+                raise ValueError("panel_id must be a positive integer")
+            panel = conn.execute(
+                "SELECT 1 FROM panels WHERE id=?",
+                (selected_panel_id,),
+            ).fetchone()
+            if panel is None:
+                raise ValueError("panel_id does not identify an existing panel")
+        else:
+            matching_rows = conn.execute(
+                """
+                SELECT id, panel_id
+                FROM accounts
+                WHERE email = ? COLLATE NOCASE
+                ORDER BY id
+                """,
+                (email_value,),
+            ).fetchall()
+            if len(matching_rows) > 1:
+                raise ValueError(
+                    "account email is ambiguous across panels; pass panel_id explicitly"
+                )
+            if len(matching_rows) == 1:
+                selected_panel_id = matching_rows[0]["panel_id"]
+            else:
+                panels_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='panels'"
+                ).fetchone()
+                default_panels = (
+                    conn.execute(
+                        "SELECT id FROM panels WHERE is_default=1 ORDER BY id"
+                    ).fetchall()
+                    if panels_table is not None else []
+                )
+                if len(default_panels) > 1:
+                    raise ValueError(
+                        "multiple default panels are configured; pass panel_id explicitly"
+                    )
+                if len(default_panels) == 1:
+                    selected_panel_id = int(default_panels[0]["id"])
+                # No default panel: NULL panel_id is allowed by migration 003.
+                # We still serialize and manually upsert this NULL-scoped row.
+
+        if selected_panel_id is None:
+            where_sql = "panel_id IS NULL AND email = ? COLLATE NOCASE"
+            where_params = (email_value,)
+        else:
+            where_sql = "panel_id = ? AND email = ? COLLATE NOCASE"
+            where_params = (selected_panel_id, email_value)
+
+        cur = conn.execute(
+            f"""
+            UPDATE accounts
+            SET rep_id = ?,
+                account_code = ?,
+                customer_name = CASE WHEN ? != '' THEN ? ELSE accounts.customer_name END,
+                sub_id = CASE WHEN ? != '' THEN ? ELSE accounts.sub_id END,
+                enable = ?,
+                total_gb = CASE WHEN ? > 0 THEN ? ELSE accounts.total_gb END,
+                expiry_time = ?,
+                owner_tg_id = CASE
+                    WHEN ? IS NOT NULL THEN ?
+                    ELSE accounts.owner_tg_id END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE {where_sql}
+            """,
+            (
+                rep_id,
+                account_code_value,
+                customer_name, customer_name,
+                sub_id, sub_id,
+                enable,
+                total_gb, total_gb,
+                expiry_time,
+                owner_tg_id, owner_tg_id,
+                *where_params,
+            ),
+        )
+        if cur.rowcount == 0:
+            conn.execute(
+                """
+                INSERT INTO accounts (
+                    rep_id, account_code, email, customer_name, sub_id, enable,
+                    total_gb, expiry_time, owner_tg_id, panel_id, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    rep_id, account_code_value, email_value, customer_name, sub_id,
+                    enable, total_gb, expiry_time, owner_tg_id, selected_panel_id,
+                ),
+            )
 
 def is_account_in_rep_scope(rep_id, query):
     """Resolve an exact account identifier only within the representative's scope."""

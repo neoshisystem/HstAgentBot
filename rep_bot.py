@@ -3869,3 +3869,6 @@ def main():
     # Never discard pending Telegram updates during startup.
     app.run_polling(drop_pending_updates=False)
 
+
+if __name__ == "__main__":
+    main()
