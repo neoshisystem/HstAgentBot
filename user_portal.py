@@ -66,28 +66,75 @@ async def _show_legacy_reset_preview(update, context, owned_account):
 
 
 
-def build_user_portal_keyboard() -> InlineKeyboardMarkup:
+_USER_PORTAL_ROLES = frozenset({"end_user", "rep", "super_admin"})
+
+# A higher-privileged actor who switched *down* into the end-user view must always
+# be able to climb back out. Without these rows the user portal is a one-way door.
+_PERSONA_SWITCH_UP: dict[str, tuple[tuple[str, str], ...]] = {
+    "super_admin": (("🧑‍💼 بازگشت به پنل نمایندگی", "v52:persona:rep"),
+                    ("👑 بازگشت به مدیریت کل", "v52:persona:admin")),
+    "rep": (("🧑‍💼 بازگشت به پنل نمایندگی", "v52:persona:rep"),),
+}
+
+
+def user_portal_access(role: str) -> bool:
+    """The end-user view is open to end users and to any higher role viewing as one."""
+    return str(role or "").strip().lower() in _USER_PORTAL_ROLES
+
+
+def persona_switch_rows(base_role: str | None) -> list[list[InlineKeyboardButton]]:
+    """Rows that let a super-admin or representative leave the end-user view."""
+    return [[InlineKeyboardButton(label, callback_data=callback)]
+            for label, callback in _PERSONA_SWITCH_UP.get(str(base_role or "").strip().lower(), [])]
+
+
+def ensure_portal_customer_rows(user) -> None:
+    """Guarantee the personal customer rows the end-user view reads.
+
+    ``ensure_bot_user`` never rewrites an existing role, so a super-admin calling it
+    keeps ``super_admin``. The wallet row is required by every wallet/service section.
+    """
+    if user is None or getattr(user, "id", None) is None:
+        return
+    try:
+        database.ensure_bot_user(user.id, user.username or "", user.full_name or "", role="end_user")
+        with database.get_db() as conn:
+            conn.execute(
+                "INSERT INTO user_wallets(user_id,balance_toman) VALUES(?,0) "
+                "ON CONFLICT(user_id) DO NOTHING",
+                (int(user.id),),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("user portal customer-row guarantee failed")
+
+
+def build_user_portal_keyboard(base_role: str | None = None) -> InlineKeyboardMarkup:
     """Build a focused consumer workspace after the v5.2 rollout."""
     if _v52_ui_enabled():
-        return InlineKeyboardMarkup([
+        rows = [
             [InlineKeyboardButton("📱 سرویس‌های من", callback_data="user:services"),
              InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
             [InlineKeyboardButton("👤 پروفایل‌های اشتراک", callback_data="v52:profiles"),
              InlineKeyboardButton("💳 کیف پول", callback_data="user:wallet")],
             [InlineKeyboardButton("🎫 تیکت‌های من", callback_data="v52:tickets"),
-             InlineKeyboardButton("🔐 گزارش محرمانه", callback_data="v52:abuse")],
+             InlineKeyboardButton("🚨 گزارش تخلف", callback_data="v52:abuse")],
             # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
             [InlineKeyboardButton("🛒 خرید سرویس جدید", callback_data="user:buy_service"),
              InlineKeyboardButton("🔗 اتصال اکانت به تلگرام", callback_data="user:prompt_link")],
             [InlineKeyboardButton("📋 تعرفه‌ها و قیمت‌ها", callback_data="user:pricing")],
-        ])
-    return InlineKeyboardMarkup([
+        ]
+        rows.extend(persona_switch_rows(base_role))
+        return InlineKeyboardMarkup(rows)
+    rows = [
         [InlineKeyboardButton("📱 سرویس‌های من", callback_data="user:services"),
          InlineKeyboardButton("🛒 خرید سرویس جدید", callback_data="user:buy_service")],
         [InlineKeyboardButton("💳 کیف پول و شارژ حساب", callback_data="user:wallet"),
          InlineKeyboardButton("🔗 اتصال اکانت به تلگرام", callback_data="user:prompt_link")],
         [InlineKeyboardButton("📋 تعرفه‌ها و قیمت‌ها", callback_data="user:pricing")],
-    ])
+    ]
+    rows.extend(persona_switch_rows(base_role))
+    return InlineKeyboardMarkup(rows)
 
 def build_back_to_user_keyboard(extra_buttons=None, back_callback="user:main") -> InlineKeyboardMarkup:
     """Builds two-tier navigation back button returning to previous step or user portal."""
@@ -115,14 +162,16 @@ async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         user.id, chat.id,
         update.effective_message.message_thread_id if update.effective_message else None,
     )
-    if role != "end_user":
+    if not user_portal_access(role):
         notice = "⛔️ پورتال کاربری فقط برای نقش کاربر نهایی در دسترس است."
         if update.callback_query:
             await update.callback_query.answer(notice, show_alert=True)
         elif update.message:
             await update.message.reply_text(notice)
         return
-    database.ensure_bot_user(user.id, user.username or "", user.full_name or "", role="end_user")
+    # A super-admin or representative viewing as an end user still needs personal
+    # customer rows; without them every wallet/service section raises.
+    ensure_portal_customer_rows(user)
 
     if database.is_user_blocked(user.id):
         msg = "⛔️ دسترسی حساب شما به این بات توسط مدیریت مسدود شده است."
@@ -141,7 +190,7 @@ async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         f"• تعداد سرویس‌های متصل: **{len(linked_accs)} سرویس**\n\n"
         "👇 لطفاً بخش مورد نظر خود را انتخاب نمایید:"
     )
-    keyboard = build_user_portal_keyboard()
+    keyboard = build_user_portal_keyboard(base_role=role)
     if _v52_ui_enabled():
         for account in linked_accs:
             account_id = account.get("id") if isinstance(account, dict) else None
@@ -161,6 +210,21 @@ async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, e
 
 
 async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point: a byte-identical re-render is idempotent, never an error.
+
+    Telegram rejects an ``edit_message_text`` whose text and markup match the
+    current message ("Message is not modified"). Pressing the same portal button
+    twice is a normal user action, so that specific rejection is swallowed here
+    instead of escaping the handler and leaving the user with no feedback.
+    """
+    try:
+        await _handle_user_callbacks_impl(update, context)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+
+
+async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Routes and handles all end-user interactive callbacks (data starting with user:)."""
     query = update.callback_query
     user = update.effective_user
@@ -174,7 +238,7 @@ async def handle_user_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         user.id, chat.id,
         update.effective_message.message_thread_id if update.effective_message else None,
     )
-    if role != "end_user":
+    if not user_portal_access(role):
         await query.answer(
             "⛔️ این مسیر فقط برای حساب‌های کاربر نهایی مجاز است.",
             show_alert=True

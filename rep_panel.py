@@ -58,10 +58,38 @@ def _build_account_keyboard(account_code: str, user_id: int, **kwargs):
     )
 
 
-def build_rep_main_keyboard() -> InlineKeyboardMarkup:
+def _base_role_for(update) -> str:
+    """Resolve the actor's permanent role, for persona-switch affordances only."""
+    user, chat = getattr(update, "effective_user", None), getattr(update, "effective_chat", None)
+    if user is None or chat is None:
+        return "rep"
+    try:
+        role, _ = database.get_user_role(
+            user.id, chat.id,
+            update.effective_message.message_thread_id if update.effective_message else None,
+        )
+    except Exception:
+        return "rep"
+    return str(role or "rep")
+
+
+def _persona_switch_rows(base_role: str | None) -> list[list[InlineKeyboardButton]]:
+    """Rows that let the actor leave the representative view.
+
+    A super-admin parked in the representative workspace must always see the way
+    back to global management; a representative only ever needs the user portal.
+    """
+    rows = []
+    if str(base_role or "").strip().lower() == "super_admin":
+        rows.append([InlineKeyboardButton("👑 بازگشت به مدیریت کل", callback_data="v52:persona:admin")])
+    rows.append([InlineKeyboardButton("👤 ورود به پورتال کاربری", callback_data="v52:persona:user")])
+    return rows
+
+
+def build_rep_main_keyboard(base_role: str | None = None) -> InlineKeyboardMarkup:
     """Build the representative workspace with v5.2 sales, profiles and support."""
     if _v52_ui_enabled():
-        return InlineKeyboardMarkup([
+        rows = [
             [InlineKeyboardButton("📋 سرویس‌های من", callback_data="rep:acc_list:all:1"),
              InlineKeyboardButton("🆕 صدور سرویس", callback_data="rep:new_acc_plans")],
             [InlineKeyboardButton("👤 پروفایل‌ها", callback_data="v52:profiles"),
@@ -73,10 +101,10 @@ def build_rep_main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("⏳ صف بسته‌های رزرو من", callback_data="rep:reserves"),
              InlineKeyboardButton("📊 آمار کلی اکانت‌ها", callback_data="rep:stats")],
             [InlineKeyboardButton("🏷 تعرفه‌های همکاری", callback_data="rep:pricing")],
-            # --- Persona Switcher ---
-            [InlineKeyboardButton("👤 پورتال کاربری", callback_data="v52:persona:user")],
-        ])
-    return InlineKeyboardMarkup([
+        ]
+        rows.extend(_persona_switch_rows(base_role))
+        return InlineKeyboardMarkup(rows)
+    rows = [
         [InlineKeyboardButton("🆕 صدور اکانت جدید", callback_data="rep:new_acc_plans"),
          InlineKeyboardButton("📋 لیست اکانت‌های من", callback_data="rep:acc_list:all:1")],
         [InlineKeyboardButton("🔍 جستجو و استعلام اکانت", callback_data="rep:prompt_search"),
@@ -84,7 +112,9 @@ def build_rep_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⏳ صف بسته‌های رزرو من", callback_data="rep:reserves"),
          InlineKeyboardButton("📊 آمار کلی اکانت‌ها", callback_data="rep:stats")],
         [InlineKeyboardButton("🏷 تعرفه‌های همکاری", callback_data="rep:pricing")],
-    ])
+    ]
+    rows.extend(_persona_switch_rows(base_role))
+    return InlineKeyboardMarkup(rows)
 
 def build_back_to_rep_keyboard(extra_buttons=None, back_callback="rep:main") -> InlineKeyboardMarkup:
     """Builds two-tier navigation back button returning to previous step or representative dashboard."""
@@ -118,7 +148,7 @@ async def show_rep_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"• تعداد اکانت‌های تحت پوشش: **{summary.get('tx_count', 0)} تراکنش**\n\n"
         "👇 لطفاً یکی از گزینه‌های زیر را انتخاب فرمایید:"
     )
-    keyboard = build_rep_main_keyboard()
+    keyboard = build_rep_main_keyboard(base_role=_base_role_for(update))
 
     if edit_message and update.callback_query:
         try:

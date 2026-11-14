@@ -801,6 +801,132 @@ def _v52_begin_digital_import(ctx, product_id: int):
     )
 
 
+def _v52_orders_page(ctx, persona: str):
+    """List the acting user's own payment orders; another actor's orders never appear."""
+    from ui_v52 import render_page
+    actor_id = int(ctx.get("actor_tg_id") or 0)
+    with database.get_db() as conn:
+        rows = conn.execute(
+            "SELECT order_id,status,purpose,amount_toman,created_at FROM payment_orders "
+            "WHERE actor_tg_id=? ORDER BY created_at DESC, order_id LIMIT 12",
+            (actor_id,),
+        ).fetchall()
+    if not rows:
+        body = "سفارشی برای این حساب ثبت نشده است."
+    else:
+        lines = [
+            f"• {str(row['order_id'])[:12]} · {row['status']} · "
+            f"{int(row['amount_toman']):,} تومان · {row['purpose']}"
+            for row in rows
+        ]
+        body = f"تعداد سفارش‌های شما: {len(rows)}\n" + "\n".join(lines)
+    return render_page("سفارش‌های من", body, persona=persona,
+                       parent_callback="v52:home:" + persona)
+
+
+def _v52_finance_page(ctx):
+    """Root finance overview: the entries that exist, and nothing invented."""
+    from ui_v52 import render_page, button
+    with database.get_db() as conn:
+        cards = conn.execute("SELECT COUNT(*) FROM bank_cards").fetchone()[0]
+        plans = conn.execute("SELECT COUNT(*) FROM pricing_plans WHERE is_active=1").fetchone()[0]
+    body = (
+        f"کارت‌های ثبت‌شده: {int(cards)}\n"
+        f"تعرفه‌های فعال: {int(plans)}\n"
+        "تسویه فقط روی edge صریح نماینده انجام می‌شود؛ فروش خرده‌فروشی در تسویه دخالت ندارد."
+    )
+    return render_page(
+        "امور مالی و تسویه‌ها", body, persona="admin",
+        rows=[[button("💳 کارت‌های پرداخت", "v52:cards")],
+              [button("🏷 تعرفه‌ها", "v52:plans")]],
+        parent_callback="v52:home:admin",
+    )
+
+
+def _v52_new_panel_code(conn) -> str:
+    """Allocate a unique panel code for a wizard-created panel."""
+    used = {str(row[0]) for row in conn.execute("SELECT panel_code FROM panels").fetchall()}
+    index = 1
+    while f"panel-{index}" in used:
+        index += 1
+    return f"panel-{index}"
+
+
+def _v52_create_panel_draft(panel_type: str) -> int:
+    """Insert a maintenance-mode, non-default, non-sellable panel row for the wizard."""
+    selected = "3x-ui" if str(panel_type).lower() in {"3x-ui", "3xui", "xui"} else "manual"
+    now = int(time.time())
+    with database.get_db() as conn:
+        code = _v52_new_panel_code(conn)
+        cursor = conn.execute(
+            "INSERT INTO panels(panel_code,name,panel_type,lifecycle,is_default,created_at) "
+            "VALUES(?,?,?,'maintenance',0,?)",
+            (code, f"پنل {code}", selected, now),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def _v52_begin_panel_draft(ctx, panel_type: str):
+    """Start the URL draft for a brand-new panel; the row is created but not sellable."""
+    from ui_v52 import render_page
+    if not ctx.get("is_root"):
+        raise PermissionError("افزودن پنل فقط در اختیار root است.")
+    selected = "3x-ui" if str(panel_type).lower() in {"3x-ui", "3xui", "xui"} else "manual"
+    panel_id = _v52_create_panel_draft(selected)
+    v52_router.DEFAULT_FSM.set(
+        ctx, "panel_connection_url",
+        payload={"panel_id": panel_id, "new_panel": True, "panel_type": selected},
+        parent_callback="v52:panels", now=int(time.time()),
+    )
+    return render_page(
+        "افزودن پنل جدید",
+        f"نوع انتخابی: {selected}\nشناسه پنل ساخته‌شده: {panel_id}\n"
+        "نشانی کامل پنل را بدون نام کاربری/رمز، query یا fragment ارسال کنید. "
+        "پنل جدید در وضعیت maintenance است، پیش‌فرض نیست و به هیچ تعرفه‌ای متصل نمی‌شود.",
+        persona="admin", page_kind="form", parent_callback="v52:panels",
+    )
+
+
+def _v52_confirm_panel_draft(ctx, step: str):
+    """Explain the remaining wizard step without inventing a completed save."""
+    from ui_v52 import render_page
+    if not ctx.get("is_root"):
+        raise PermissionError("افزودن پنل فقط در اختیار root است.")
+    body = (
+        "برای تکمیل افزودن پنل، ابتدا نشانی و توکن را از مسیر «افزودن پنل» ثبت کنید؛ "
+        "سپس از «مدیریت پنل‌ها → مشاهده پنل» اتصال را آزمایش و پنل را فعال کنید.\n"
+        "این صفحه هیچ ذخیره‌سازی جدیدی انجام نمی‌دهد."
+    )
+    return render_page("تکمیل افزودن پنل", body, persona="admin",
+                       parent_callback="v52:panels")
+
+
+def _v52_preview_panel_policy(ctx, panel_id: int):
+    """Show the stored panel policy for root, or a clear not-found page."""
+    from ui_v52 import render_page, render_error
+    if not ctx.get("is_root"):
+        raise PermissionError("سیاست پنل فقط در اختیار root است.")
+    with database.get_db() as conn:
+        row = conn.execute("SELECT * FROM panels WHERE id=?", (int(panel_id),)).fetchone()
+    if row is None:
+        return render_error("پنل موردنظر وجود ندارد.", persona="admin",
+                            parent_callback="v52:panels")
+    panel = dict(row)
+    body = (
+        f"پنل: {int(panel_id)}\n"
+        f"وضعیت: {panel.get('lifecycle', '')}\n"
+        f"پنهان: {'بله' if int(panel.get('is_hidden') or 0) else 'خیر'}\n"
+        f"حداکثر کلاینت: {int(panel.get('max_clients') or 0) or 'نامحدود'}\n"
+        f"استراتژی نام‌گذاری: {panel.get('username_strategy', '')}\n"
+        f"روش تمدید: {panel.get('renewal_method', '')}\n"
+        f"Revision: {int(panel.get('revision') or 1)}\n"
+        "تغییر سیاست در این لایه فقط پس از تأیید صریح و با CAS روی revision انجام می‌شود."
+    )
+    return render_page("سیاست پنل", body, persona="admin",
+                       parent_callback=f"v52:panel:{int(panel_id)}")
+
+
 def _load_confirmation(nonce: str):
     """Read one action confirmation row by nonce."""
     with database.get_db() as conn:
@@ -1203,19 +1329,39 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                     persona="admin", page_kind="result", parent_callback=f"v52:panel:{panel_id}",
                 )
             elif name == "list_tickets":
-                import support_service
+                import support_ui
+                page = support_ui.tickets_page(
+                    ctx, group=str(params.get("group") or "open"),
+                    parent_callback="v52:home:" + persona,
+                )
+            elif name == "begin_new_ticket":
+                import support_ui
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "support_ticket_body",
+                    payload={"kind": "ticket", "account_id": 0, "ticket_type": "general"},
+                    parent_callback="v52:tickets", now=int(time.time()),
+                )
+                page = support_ui.begin_ticket(ctx, 0, submit=False, parent_callback="v52:tickets")
+            elif name == "list_abuse":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("گزارش‌های تخلف فقط در اختیار مدیریت کل است.")
+                import abuse_service
                 from ui_v52 import render_page, button
-                tickets = support_service.list_tickets(ctx)
-                rows = [[button(
-                    f"{item['ticket_id'][:8]} · {item['status']}",
-                    "v52:ticket:" + str(item["ticket_id"])
-                )] for item in tickets[:12]]
-                rows.append([button("گزارش محرمانه", "v52:abuse")])
+                reports = abuse_service.list_abuse_reports(ctx)
+                rows = [[button(f"{str(item['ticket_id'])[:8]} · {item['status']}",
+                                "v52:ticket:" + str(item["ticket_id"]))] for item in reports[:12]]
                 page = render_page(
-                    "تیکت‌های پشتیبانی",
-                    f"تعداد تیکت‌های قابل مشاهده: {len(tickets)}\n"
-                    "گزارش‌های محرمانه فقط در پیوی root قابل مشاهده‌اند.",
-                    persona=persona, rows=rows,
+                    "🚨 گزارش‌های تخلف",
+                    f"تعداد گزارش‌های ثبت‌شده: {len(reports)}\n"
+                    "این مسیر کاملاً جدا از تیکت‌های پشتیبانی است و فقط برای مدیریت کل "
+                    "نمایش داده می‌شود؛ هیچ نسخه‌ای به صندوق نماینده نمی‌رود.",
+                    persona="admin", rows=rows, parent_callback="v52:home:admin",
+                )
+            elif name == "close_ticket":
+                import support_ui
+                page = support_ui.reply_or_escalate(
+                    ctx, str(params["ticket_id"]), action="close",
+                    confirm=True, parent_callback="v52:tickets",
                 )
             elif name == "begin_ticket":
                 import support_ui
@@ -1259,7 +1405,8 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         "پاسخ به تیکت",
                         f"شناسه: {ticket_id}\n{summary}\n\nپاسخ خود را در پیام بعدی ارسال کنید.",
                         persona=persona, page_kind="form",
-                        rows=[[button("ارجاع به root", "v52:escalate:" + ticket_id)],
+                        rows=[[button("⬆️ ارجاع تیکت به مدیریت کل", "v52:escalate:" + ticket_id)],
+                              [button("✅ بستن تیکت", "v52:close:" + ticket_id)],
                               [button("بازگشت به تیکت‌ها", "v52:tickets")]],
                     )
             elif name == "sync_topics":
@@ -1347,7 +1494,54 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 page = domain_ui.begin_register(ctx, params["rep_id"])
             elif name == "begin_register_bot":
                 import bot_admin_ui
-                page = bot_admin_ui.begin_register_bot(ctx, params["rep_id"], chat_type=ctx.get("chat_type"))
+                if params.get("kind") == "primary":
+                    page = bot_admin_ui.begin_register_bot(
+                        ctx, rep_id=None, is_primary=True, chat_type=ctx.get("chat_type"))
+                elif params.get("kind") == "rep":
+                    from ui_v52 import render_page, button
+                    reps = database.get_all_active_reps()
+                    rows = [[button("ثبت بات نماینده " + str(int(item["id"])),
+                                    "v52:bot:" + str(int(item["id"])))] for item in reps]
+                    page = render_page(
+                        "ثبت بات نماینده",
+                        "نمایندهٔ مالک بات را انتخاب کنید. توکن فقط در پیوی root دریافت می‌شود.",
+                        persona="admin", rows=rows, parent_callback="v52:bots",
+                    )
+                else:
+                    page = bot_admin_ui.begin_register_bot(ctx, params["rep_id"], chat_type=ctx.get("chat_type"))
+            elif name == "show_sub_reps":
+                import rep_admin_ui
+                page = rep_admin_ui.show_sub_reps(ctx, int(params["rep_id"]), persona=persona)
+            elif name == "list_orders":
+                page = _v52_orders_page(ctx, persona)
+            elif name == "show_finance":
+                page = _v52_finance_page(ctx)
+            elif name == "list_panels":
+                from ui_v52 import render_page, button
+                with database.get_db() as conn:
+                    panel_rows = conn.execute(
+                        "SELECT id,name,panel_type,lifecycle,is_default FROM panels "
+                        "ORDER BY is_default DESC,id").fetchall()
+                body = "\n".join(
+                    f"پنل {int(row['id'])}: {row['name']} · {row['panel_type']} · {row['lifecycle']}"
+                    for row in panel_rows
+                ) or "پنلی ثبت نشده است."
+                buttons = [[button("مشاهده پنل " + str(int(row["id"])), "v52:panel:" + str(int(row["id"])))]
+                           for row in panel_rows]
+                buttons.append([button("افزودن پنل", "v52:panelnew")])
+                page = render_page("مدیریت پنل‌ها", body, persona="admin", rows=buttons)
+            elif name == "begin_add_panel":
+                import panel_admin_ui
+                page = panel_admin_ui.begin_add_panel(ctx)
+            elif name == "begin_panel_draft":
+                page = _v52_begin_panel_draft(ctx, str(params["panel_type"]))
+            elif name == "confirm_panel_draft":
+                page = _v52_confirm_panel_draft(ctx, str(params["step"]))
+            elif name == "preview_panel_policy":
+                page = _v52_preview_panel_policy(ctx, int(params["panel_id"]))
+            elif name == "open_receipt":
+                await _load_v52_receipt_page(update, context, str(params["attempt_id"]), ctx)
+                return True
             elif name == "preview_lifecycle":
                 import panel_admin_ui
                 page = panel_admin_ui.preview_lifecycle(ctx, params["panel_id"], params["lifecycle"])
@@ -4051,7 +4245,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 0.2 End-User Portal Navigation
     if action == "user":
-        if role != "end_user":
+        # A super-admin or representative whose active persona is the end-user view
+        # must be able to drive the portal; only genuinely foreign roles are denied.
+        if not user_portal.user_portal_access(role):
             await query.answer(
                 "⛔️ پورتال کاربری فقط برای نقش کاربر نهایی مجاز است.",
                 show_alert=True

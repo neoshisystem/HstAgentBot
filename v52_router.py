@@ -40,6 +40,9 @@ class FSMEntry:
 
 _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[str]], dict[str, Any]]], ...] = (
     (re.compile(r"^v52:home:(admin|rep|user)$"), "route_home", "persona", lambda m: {"persona": m[1]}),
+    # Legacy placeholder emitted by older builds' navigation rows; kept registered so
+    # messages already delivered to users keep navigating instead of erroring.
+    (re.compile(r"^v52:back:(admin|rep|user)$"), "route_home", "persona", lambda m: {"persona": m[1]}),
     (re.compile(r"^v52:sub:([1-9][0-9]{0,17})$"), "open_account_profiles", "view_config", lambda m: {"account_id": int(m[1])}),
     (re.compile(r"^v52:profiles$"), "list_profiles", "actor", lambda m: {}),
     (re.compile(r"^v52:profile:([1-9][0-9]{0,17})$"), "show_profile", "owner/root", lambda m: {"profile_id": int(m[1])}),
@@ -64,6 +67,25 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:panel:([1-9][0-9]{0,17})$"), "show_panel", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:panelconfig:([1-9][0-9]{0,17})$"), "begin_panel_config", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:paneltest:([1-9][0-9]{0,17})$"), "test_panel_connection", "root", lambda m: {"panel_id": int(m[1])}),
+    # Admin navigation surfaces emitted by the merged menus and the panel/bot
+    # wizards. Every one of them must resolve to a bridge handler, otherwise the
+    # button dead-ends in the "W18 bridge" error page.
+    (re.compile(r"^v52:panels$"), "list_panels", "root", lambda m: {}),
+    (re.compile(r"^v52:panel$"), "list_panels", "root", lambda m: {}),
+    (re.compile(r"^v52:panelnew$"), "begin_add_panel", "root", lambda m: {}),
+    (re.compile(r"^v52:panelnew:(3x-ui|manual)$"), "begin_panel_draft", "root", lambda m: {"panel_type": m[1]}),
+    (re.compile(r"^v52:panelnew:(test|confirm)$"), "confirm_panel_draft", "root", lambda m: {"step": m[1]}),
+    (re.compile(r"^v52:panelpolicy:([1-9][0-9]{0,17})$"), "preview_panel_policy", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:bots$"), "list_bots", "root", lambda m: {}),
+    (re.compile(r"^v52:bot:(primary|rep)$"), "begin_register_bot", "root", lambda m: {"kind": m[1]}),
+    (re.compile(r"^v52:domains$"), "list_domains", "root", lambda m: {}),
+    (re.compile(r"^v52:cards$"), "list_cards", "root", lambda m: {}),
+    (re.compile(r"^v52:plans$"), "list_plans", "root", lambda m: {}),
+    (re.compile(r"^v52:finance$"), "show_finance", "root", lambda m: {}),
+    (re.compile(r"^v52:orders$"), "list_orders", "actor", lambda m: {}),
+    (re.compile(r"^v52:account:([1-9][0-9]{0,17})$"), "open_account_profiles", "view_config", lambda m: {"account_id": int(m[1])}),
+    (re.compile(r"^v52:subreps:([1-9][0-9]{0,17})$"), "show_sub_reps", "root", lambda m: {"rep_id": int(m[1])}),
+    (re.compile(r"^v52:receipt:([0-9a-fA-F-]{16,40})$"), "open_receipt", "payer", lambda m: {"attempt_id": m[1]}),
     (re.compile(r"^v52:life:([1-9][0-9]{0,17}):(active|sold_out|hidden|drain|maintenance)$"), "preview_lifecycle", "root", lambda m: {"panel_id": int(m[1]), "lifecycle": m[2]}),
     (re.compile(r"^v52:life-confirm:([1-9][0-9]{0,17}):(active|sold_out|hidden|drain|maintenance)$"), "confirm_lifecycle", "root", lambda m: {"panel_id": int(m[1]), "lifecycle": m[2]}),
     (re.compile(r"^v52:buy:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "preview_buy", "seller route", lambda m: {"plan_code": m[1]}),
@@ -79,8 +101,12 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:goods:([1-9][0-9]{0,17})$"), "preview_product", "actor+seller", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:fulfill:([A-Za-z0-9._:-]{1,36})$"), "prepare_manual_delivery", "assigned seller/root", lambda m: {"order_id": m[1]}),
     (re.compile(r"^v52:tickets$"), "list_tickets", "actor", lambda m: {}),
+    (re.compile(r"^v52:tickets:(open|answered|closed|all)$"), "list_tickets", "actor", lambda m: {"group": m[1]}),
+    (re.compile(r"^v52:newticket$"), "begin_new_ticket", "actor", lambda m: {}),
     (re.compile(r"^v52:support:([0-9]{1,18})$"), "begin_ticket", "view authorized", lambda m: {"account_id": int(m[1])}),
     (re.compile(r"^v52:abuse$"), "begin_abuse", "all actors; private root destination", lambda m: {}),
+    (re.compile(r"^v52:abuse:list$"), "list_abuse", "root", lambda m: {}),
+    (re.compile(r"^v52:close:([A-Za-z0-9_-]{1,32})$"), "close_ticket", "ticket scope", lambda m: {"ticket_id": m[1]}),
     (re.compile(r"^v52:ticket:([A-Za-z0-9_-]{1,32})$"), "reply_or_escalate", "ticket scope", lambda m: {"ticket_id": m[1]}),
     (re.compile(r"^v52:escalate:([A-Za-z0-9_-]{1,32})$"), "reply_or_escalate", "assigned seller/root", lambda m: {"ticket_id": m[1], "action": "escalate"}),
     (re.compile(r"^v52:transfer:([1-9][0-9]{0,17})$"), "reply_or_escalate", "root preview", lambda m: {"account_id": int(m[1]), "action": "transfer"}),

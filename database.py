@@ -885,25 +885,40 @@ def update_panel_connection(panel_id: int, raw_url: str, api_token: str) -> dict
 
 
 def set_panel_lifecycle(panel_id: int, lifecycle: str) -> dict:
-    """Set the canonical lifecycle; activation requires saved connection details."""
+    """Set the canonical lifecycle; activation requires saved connection details.
+
+    The stored CHECK enum is ``('active','capacity','drain','maintenance')``, which
+    is narrower than the five UI states. ``sold_out`` is the stored ``capacity``
+    state and ``hidden`` is the separate ``is_hidden`` flag, so neither can raise a
+    CHECK violation from the lifecycle buttons.
+    """
     allowed = {"active", "sold_out", "hidden", "drain", "maintenance"}
     if isinstance(panel_id, bool) or not isinstance(panel_id, int) or panel_id <= 0:
         raise ValueError("panel_id must be a positive integer")
     state = str(lifecycle or "").strip().lower()
     if state not in allowed:
         raise ValueError("unsupported panel lifecycle")
+    stored_states = {"active": "active", "sold_out": "capacity",
+                     "drain": "drain", "maintenance": "maintenance"}
     with get_db() as conn:
         row = conn.execute("SELECT * FROM panels WHERE id=?", (panel_id,)).fetchone()
         if row is None:
             raise ValueError("panel does not exist")
         keys = set(row.keys())
+        # "hidden" is a visibility flag, not a lifecycle: keep the current state.
+        stored = stored_states.get(state)
+        if stored is None:
+            stored = str(row["lifecycle"]) if "lifecycle" in keys else "maintenance"
         if state == "active":
             raw_url = row["raw_url"] if "raw_url" in keys else row["base_url"] if "base_url" in keys else ""
             cipher = row["auth_cipher"] if "auth_cipher" in keys else row["api_token_cipher"] if "api_token_cipher" in keys else ""
             if not raw_url or not cipher:
                 raise ValueError("configure the panel URL and encrypted API token before activation")
         updates = ["lifecycle=?"]
-        values = [state]
+        values: list = [stored]
+        if "is_hidden" in keys:
+            updates.append("is_hidden=?")
+            values.append(1 if state == "hidden" else 0)
         if "revision" in keys:
             updates.append("revision=revision+1")
         if "updated_at" in keys:
@@ -911,7 +926,7 @@ def set_panel_lifecycle(panel_id: int, lifecycle: str) -> dict:
             values.append(int(time.time()))
         values.append(panel_id)
         conn.execute(f"UPDATE panels SET {','.join(updates)} WHERE id=?", tuple(values))
-    return {"panel_id": panel_id, "lifecycle": state}
+    return {"panel_id": panel_id, "lifecycle": state, "stored_lifecycle": stored}
 
 
 # --- Dynamic System Settings Management ---

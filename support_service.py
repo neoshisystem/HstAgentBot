@@ -252,7 +252,16 @@ def build_diagnostic_snapshot(
     return snapshot
 
 
-def _assignment(conn: sqlite3.Connection, account) -> tuple[str, int | None]:
+def _sender_is_rep(conn: sqlite3.Connection, ctx: Any) -> bool:
+    """True when the ticket author is themselves an active representative."""
+    return bool(_rep_ids_for_actor(conn, _actor_id(ctx), _value(ctx, "rep_id")))
+
+
+def _assignment(conn: sqlite3.Connection, account, *, sender_is_rep: bool = False) -> tuple[str, int | None]:
+    if sender_is_rep:
+        # A representative's own ticket belongs to global management, never to a
+        # peer seller and never back into the representative's own queue.
+        return "root", None
     seller_key = str(account["seller_key"] or "root")
     rep_id = account["rep_id"]
     if seller_key.startswith("rep:"):
@@ -273,44 +282,65 @@ def _assignment(conn: sqlite3.Connection, account) -> tuple[str, int | None]:
 
 
 def create_ticket(
-    ctx: Any, account_id: int, body: str = "", *,
+    ctx: Any, account_id: int | None = None, body: str = "", *,
     ticket_type: str = "disorder", attachment_file_id: str | None = None,
     attachment_bot_id: int | None = None, panel_reader=None, now: int | None = None,
 ) -> dict:
-    """Create a support ticket even when the panel snapshot is unavailable."""
+    """Create a support ticket even when the panel snapshot is unavailable.
+
+    ``account_id`` may be omitted (or zero) for a general ticket that names no
+    account; such a ticket skips the panel snapshot and is routed by the author's
+    role alone. A ticket authored by a representative always goes to root.
+    """
     actor_id = _actor_id(ctx)
-    exact_id = _positive(account_id, "account_id")
+    raw_account = 0 if account_id is None else account_id
+    if isinstance(raw_account, bool) or not isinstance(raw_account, int) or raw_account < 0:
+        raise SupportError("account_id must be zero or a positive integer")
+    exact_id = int(raw_account)
     bot_id = _bot_id(ctx)
     selected_type = str(ticket_type or "").strip().lower()
     if selected_type not in _TICKET_TYPES:
         raise SupportError("unsupported support ticket type")
-    if not authorize_account(ctx, exact_id, "view_stats"):
+    if exact_id == 0:
+        if selected_type == "disorder":
+            selected_type = "general"
+        if not str(body or "").strip() and not attachment_file_id:
+            raise SupportError("a ticket must contain text or an attachment")
+    elif not authorize_account(ctx, exact_id, "view_stats"):
         raise PermissionError("actor cannot open a ticket for this account")
     timestamp = _timestamp(now)
-    snapshot = build_diagnostic_snapshot(
-        ctx, exact_id, panel_reader=panel_reader, now=timestamp
-    )
-    snapshot_cipher = encrypt_secret(
-        json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        _LABEL,
-    )
+    if exact_id:
+        snapshot = build_diagnostic_snapshot(
+            ctx, exact_id, panel_reader=panel_reader, now=timestamp
+        )
+        snapshot_cipher = encrypt_secret(
+            json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            _LABEL,
+        )
+    else:
+        snapshot = {"account_id": None, "state": "not_applicable", "unavailable": False}
+        snapshot_cipher = None
     ticket_id = secrets.token_urlsafe(18)
     source_bot = _positive(attachment_bot_id, "attachment_bot_id") if attachment_bot_id is not None else bot_id
 
     with database.get_db() as conn, _atomic(conn):
         _validate_bot(conn, bot_id)
-        account = conn.execute(
-            "SELECT id,rep_id,seller_key,deleted_at FROM accounts WHERE id=?",
-            (exact_id,),
-        ).fetchone()
-        if account is None or account["deleted_at"] is not None:
-            raise SupportError("account does not exist or is deleted")
-        assigned_key, assigned_rep = _assignment(conn, account)
+        sender_is_rep = _sender_is_rep(conn, ctx)
+        if exact_id:
+            account = conn.execute(
+                "SELECT id,rep_id,seller_key,deleted_at FROM accounts WHERE id=?",
+                (exact_id,),
+            ).fetchone()
+            if account is None or account["deleted_at"] is not None:
+                raise SupportError("account does not exist or is deleted")
+            assigned_key, assigned_rep = _assignment(conn, account, sender_is_rep=sender_is_rep)
+        else:
+            assigned_key, assigned_rep = "root", None
         conn.execute(
             "INSERT INTO support_tickets(ticket_id,sender_tg_id,bot_id,account_id,rep_id,"
             "ticket_type,assigned_key,status,snapshot_cipher,created_at,updated_at) "
             "VALUES(?,?,?,?,?,?,?,'unseen',?,?,?)",
-            (ticket_id, actor_id, bot_id, exact_id, assigned_rep,
+            (ticket_id, actor_id, bot_id, exact_id or None, assigned_rep,
              selected_type, assigned_key, snapshot_cipher, timestamp, timestamp),
         )
         message_id = _insert_message(
@@ -338,16 +368,41 @@ def _visible_ticket(conn: sqlite3.Connection, ctx: Any, ticket) -> bool:
     )
 
 
-def list_tickets(ctx: Any, *, status: str | None = None) -> list[dict]:
-    """List generic tickets; abuse reports are excluded from every non-root view."""
+_TICKET_STATUS_GROUPS: dict[str, tuple[str, ...] | None] = {
+    "all": None,
+    "open": ("unseen", "escalated"),
+    "answered": ("answered",),
+    "closed": ("closed",),
+}
+
+
+def _status_filter(status: str | None, statuses: tuple[str, ...] | None) -> tuple[str, list[Any]]:
+    """Build the status predicate; a named group expands, ``all`` matches everything."""
+    if statuses is None and isinstance(status, str) and status in _TICKET_STATUS_GROUPS:
+        statuses = _TICKET_STATUS_GROUPS[status]
+        status = None
+    if statuses:
+        return "status IN (" + ",".join("?" for _ in statuses) + ")", list(statuses)
+    return "(? IS NULL OR status=?)", [status, status]
+
+
+def list_tickets(ctx: Any, *, status: str | None = None,
+                 statuses: tuple[str, ...] | None = None) -> list[dict]:
+    """List generic tickets; abuse reports are excluded from every view, root included.
+
+    Abuse reports live in their own root-only surface (``abuse_service``); keeping
+    them out of the support queue is what stops the two flows from colliding.
+    """
     actor_id = _actor_id(ctx)
+    clause, status_params = _status_filter(status, statuses)
     with database.get_db() as conn:
         if _is_root(ctx):
             rows = conn.execute(
                 "SELECT ticket_id,sender_tg_id,bot_id,account_id,rep_id,ticket_type,"
                 "assigned_key,status,created_at,updated_at FROM support_tickets "
-                "WHERE (? IS NULL OR status=?) ORDER BY created_at DESC,ticket_id",
-                (status, status),
+                "WHERE ticket_type<>'abuse_report' AND " + clause +
+                " ORDER BY created_at DESC,ticket_id",
+                status_params,
             ).fetchall()
         else:
             reps = _rep_ids_for_actor(conn, actor_id, _value(ctx, "rep_id"))
@@ -357,25 +412,28 @@ def list_tickets(ctx: Any, *, status: str | None = None) -> list[dict]:
             if keys:
                 clauses.append("assigned_key IN (" + ",".join("?" for _ in keys) + ")")
                 params.extend(keys)
-            params.extend([status, status])
+            params.extend(status_params)
             rows = conn.execute(
                 "SELECT ticket_id,sender_tg_id,bot_id,account_id,rep_id,ticket_type,"
                 "assigned_key,status,created_at,updated_at FROM support_tickets "
                 "WHERE ticket_type<>'abuse_report' AND (" + " OR ".join(clauses) + ") "
-                "AND (? IS NULL OR status=?) ORDER BY created_at DESC,ticket_id",
+                "AND " + clause + " ORDER BY created_at DESC,ticket_id",
                 params,
             ).fetchall()
         return [dict(row) for row in rows]
 
 
-def count_tickets(ctx: Any, *, status: str | None = None) -> int:
+def count_tickets(ctx: Any, *, status: str | None = None,
+                  statuses: tuple[str, ...] | None = None) -> int:
     """Count visible generic tickets without leaking abuse-report volume."""
     actor_id = _actor_id(ctx)
+    clause, status_params = _status_filter(status, statuses)
     with database.get_db() as conn:
         if _is_root(ctx):
             row = conn.execute(
-                "SELECT COUNT(*) FROM support_tickets WHERE (? IS NULL OR status=?)",
-                (status, status),
+                "SELECT COUNT(*) FROM support_tickets WHERE ticket_type<>'abuse_report' "
+                "AND " + clause,
+                status_params,
             ).fetchone()
         else:
             reps = _rep_ids_for_actor(conn, actor_id, _value(ctx, "rep_id"))
@@ -385,10 +443,10 @@ def count_tickets(ctx: Any, *, status: str | None = None) -> int:
             if keys:
                 clauses.append("assigned_key IN (" + ",".join("?" for _ in keys) + ")")
                 params.extend(keys)
-            params.extend([status, status])
+            params.extend(status_params)
             row = conn.execute(
                 "SELECT COUNT(*) FROM support_tickets WHERE ticket_type<>'abuse_report' "
-                "AND (" + " OR ".join(clauses) + ") AND (? IS NULL OR status=?)",
+                "AND (" + " OR ".join(clauses) + ") AND " + clause,
                 params,
             ).fetchone()
         return int(row[0])
@@ -506,10 +564,21 @@ def reply_ticket(
             attachment_bot_id=attachment_bot_id or _bot_id(ctx),
             now=timestamp,
         )
-        conn.execute(
-            "UPDATE support_tickets SET updated_at=? WHERE ticket_id=?",
-            (timestamp, str(ticket_id)),
-        )
+        # An operator's customer-visible answer moves the ticket out of the open
+        # queue; internal notes and customer follow-ups leave the status alone, and
+        # a closed ticket is never silently reopened by a later reply.
+        next_status = "answered" if (operator and selected_visibility == "customer") else None
+        if next_status is not None:
+            conn.execute(
+                "UPDATE support_tickets SET updated_at=?,"
+                "status=CASE WHEN status='closed' THEN status ELSE ? END WHERE ticket_id=?",
+                (timestamp, next_status, str(ticket_id)),
+            )
+        else:
+            conn.execute(
+                "UPDATE support_tickets SET updated_at=? WHERE ticket_id=?",
+                (timestamp, str(ticket_id)),
+            )
         queued = None
         if selected_visibility == "customer" and operator:
             queued = enqueue_delivery(
@@ -547,8 +616,45 @@ def escalate_ticket(ctx: Any, ticket_id: str, *, now: int | None = None) -> dict
         return {"ticket_id": exact, "assigned_key": "root", "status": "escalated"}
 
 
+def close_ticket(ctx: Any, ticket_id: str, *, reason: str | None = None,
+                 now: int | None = None) -> dict:
+    """Close a ticket. Its author, the assigned seller and root may close it."""
+    timestamp = _timestamp(now)
+    exact = str(ticket_id or "").strip()
+    if not exact or len(exact.encode("utf-8")) > 64:
+        raise SupportError("ticket_id is invalid")
+    with database.get_db() as conn, _atomic(conn):
+        ticket = conn.execute(
+            "SELECT * FROM support_tickets WHERE ticket_id=? AND ticket_type<>'abuse_report'",
+            (exact,),
+        ).fetchone()
+        if ticket is None:
+            raise SupportError("support ticket does not exist")
+        operator = _operator_for_ticket(conn, ctx, ticket)
+        sender = int(ticket["sender_tg_id"]) == _actor_id(ctx)
+        if not operator and not sender:
+            raise PermissionError("actor cannot close this support ticket")
+        if str(ticket["status"]) == "closed":
+            raise SupportError("support ticket is already closed")
+        changed = conn.execute(
+            "UPDATE support_tickets SET status='closed',updated_at=? "
+            "WHERE ticket_id=? AND ticket_type<>'abuse_report' AND status<>'closed'",
+            (timestamp, exact),
+        ).rowcount
+        if changed != 1:
+            raise SupportError("ticket close lost a concurrent update")
+        if reason is not None and str(reason).strip():
+            _insert_message(
+                conn, ticket_id=exact, actor_tg_id=_actor_id(ctx),
+                visibility="internal", body="closed: " + str(reason).strip(),
+                attachment_file_id=None, attachment_bot_id=None, now=timestamp,
+            )
+    return {"ticket_id": exact, "status": "closed",
+            "assigned_key": str(ticket["assigned_key"])}
+
+
 __all__ = [
     "SupportError", "build_diagnostic_snapshot", "create_ticket",
     "list_tickets", "count_tickets", "search_tickets", "list_ticket_messages",
-    "export_ticket", "reply_ticket", "escalate_ticket",
+    "export_ticket", "reply_ticket", "escalate_ticket", "close_ticket",
 ]

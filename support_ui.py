@@ -40,6 +40,44 @@ def _persona(ctx: Any) -> str:
     return "admin" if _root(ctx) or role in {"admin", "root"} else "rep" if role in {"rep", "representative"} else "user"
 
 
+_TICKET_GROUPS = (("open", "🟡 باز"), ("answered", "🟢 پاسخ‌داده"),
+                  ("closed", "⚪️ بسته"), ("all", "📚 همه"))
+
+
+def tickets_page(
+    ctx: Any,
+    *,
+    group: str = "open",
+    service=None,
+    parent_callback: str | None = None,
+):
+    """Render the support queue with an explicit new-ticket entry and status filters."""
+    try:
+        if service is None:
+            import support_service as service
+        selected = str(group or "open").strip().lower()
+        if selected not in {key for key, _ in _TICKET_GROUPS}:
+            selected = "open"
+        tickets = service.list_tickets(ctx, status=selected)
+        rows = [[button(f"{str(item['ticket_id'])[:8]} · {item['status']}",
+                        "v52:ticket:" + str(item["ticket_id"]))]
+                for item in tickets[:12]]
+        rows.append([button("➕ ارسال تیکت جدید", "v52:newticket")])
+        marks = [(("• " if key == selected else "") + label, f"v52:tickets:{key}")
+                 for key, label in _TICKET_GROUPS]
+        rows.append([button(label, callback) for label, callback in marks[:2]])
+        rows.append([button(label, callback) for label, callback in marks[2:]])
+        body = (
+            f"وضعیت نمایش: {selected}\n"
+            f"تعداد تیکت‌های قابل مشاهده: {len(tickets)}\n"
+            "گزارش‌های تخلف مسیر جداگانه‌ای دارند و در این صف نمایش داده نمی‌شوند."
+        )
+        return render_page("تیکت‌های پشتیبانی", body, persona=_persona(ctx), rows=rows,
+                           parent_callback=parent_callback)
+    except (TypeError, ValueError, PermissionError, KeyError) as exc:
+        return render_error(str(exc), persona=_persona(ctx), parent_callback=parent_callback)
+
+
 def begin_ticket(
     ctx: Any,
     account_id: int = 0,
@@ -68,9 +106,9 @@ def begin_ticket(
                 detail += "\nاین درخواست فقط تیکت می‌سازد؛ حذف خودکار حساب انجام نمی‌شود."
             return render_page("پشتیبانی", detail, persona=_persona(ctx), page_kind="form",
                                parent_callback=parent_callback,
-                               rows=[[button("ارسال تخلف محرمانه", "v52:abuse")]])
-        if aid == 0:
-            raise ValueError("برای ثبت تیکت عادی، account_id معتبر لازم است؛ برای abuse از مسیر خصوصی استفاده کنید.")
+                               rows=[[button("🚨 ارسال گزارش تخلف", "v52:abuse")]])
+        if aid == 0 and selected == "delete_request":
+            raise ValueError("درخواست حذف حساب به یک حساب مشخص نیاز دارد.")
         if service is None:
             import support_service as service
         result = service.create_ticket(
@@ -167,8 +205,18 @@ def reply_or_escalate(
             )
         if not exact or len(exact.encode("utf-8")) > 64:
             raise ValueError("ticket_id is invalid")
-        if mode not in {"reply", "escalate", "transfer", "suspend"}:
+        if mode not in {"reply", "escalate", "transfer", "suspend", "close"}:
             raise ValueError("unsupported support action")
+        if mode == "close":
+            if service is None:
+                import support_service as service
+            result = service.close_ticket(ctx, exact, reason=reason, now=now)
+            return render_page(
+                "تیکت بسته شد",
+                f"تیکت: {exact}\nوضعیت: {result['status']}\n"
+                "پاسخ‌های بعدی این تیکت وضعیت آن را بازنمی‌گردانند.",
+                persona=_persona(ctx), page_kind="result", parent_callback=parent_callback,
+            )
         if mode in {"transfer", "suspend"}:
             if not _root(ctx):
                 raise PermissionError("transfer/suspend preview is root-only")
@@ -210,4 +258,4 @@ def reply_or_escalate(
         return render_error(str(exc), persona=_persona(ctx), parent_callback=parent_callback)
 
 
-__all__ = ["begin_ticket", "begin_abuse", "reply_or_escalate"]
+__all__ = ["begin_ticket", "begin_abuse", "reply_or_escalate", "tickets_page"]

@@ -71,7 +71,15 @@ def render_page(
         content += "\n\n" + escape(str(body), quote=True)
     keyboard = [list(row) for row in rows if row]
     if not root:
-        keyboard.append(navigation_row(selected, parent_callback or f"v52:back:{selected}"))
+        # A page without an explicit parent gets the persona home button only.
+        # The previous ``v52:back:{persona}`` placeholder was never registered in
+        # ``v52_router._CALLBACK_PATTERNS``, so every back press on such a page
+        # resolved to no Route and surfaced the "W18 bridge" error page instead of
+        # navigating. Never emit an unregistered callback from a navigation row.
+        if parent_callback:
+            keyboard.append(navigation_row(selected, parent_callback))
+        else:
+            keyboard.append([button("⌂ خانه", f"v52:home:{selected}")])
     return RenderedPage(content, InlineKeyboardMarkup(keyboard) if keyboard else None,
                          kind=page_kind)
 

@@ -123,7 +123,8 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🏷 تعرفه‌ها", callback_data="v52:plans"),
              InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
             [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets"),
-             InlineKeyboardButton("🧩 همگام‌سازی فروم", callback_data="v52:forums:root")],
+             InlineKeyboardButton("🚨 گزارش‌های تخلف", callback_data="v52:abuse:list")],
+            [InlineKeyboardButton("🧩 همگام‌سازی فروم", callback_data="v52:forums:root")],
             # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
             [InlineKeyboardButton("👥 مدیریت نماینده‌ها", callback_data="admin:reps"),
              InlineKeyboardButton("👤 مدیریت کاربران", callback_data="admin:users")],
@@ -140,7 +141,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🧑‍💼 میزکار نماینده (root_admin_rep)", callback_data="v52:persona:rep")],
             [InlineKeyboardButton("👤 پورتال کاربری", callback_data="v52:persona:user")],
         ])
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("👥 مدیریت نماینده‌ها", callback_data="admin:reps"),
          InlineKeyboardButton("👤 مدیریت کاربران", callback_data="admin:users")],
         [InlineKeyboardButton("📦 تخصیص و اسکوپ", callback_data="admin:scope"),
@@ -152,7 +153,13 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📦 بسته‌های رزرو در انتظار", callback_data="admin:reserves"),
          InlineKeyboardButton("🛠 تنظیمات پیشرفته سامانه", callback_data="admin:settings")],
         [InlineKeyboardButton("💾 پشتیبان‌گیری سریع دیتابیس", callback_data="admin:backup")],
-    ])
+    ]
+    # The persona switcher is a navigation guarantee, not a v5.2-only feature: the
+    # super-admin must always be able to reach the lower workspaces.
+    rows.append([InlineKeyboardButton("🧑‍💼 میزکار نماینده (root_admin_rep)",
+                                      callback_data="v52:persona:rep")])
+    rows.append([InlineKeyboardButton("👤 پورتال کاربری", callback_data="v52:persona:user")])
+    return InlineKeyboardMarkup(rows)
 
 def build_back_to_admin_keyboard(
     extra_buttons=None,

@@ -62,8 +62,8 @@ def patch_role(monkeypatch, role, rep=None, blocked=False):
     monkeypatch.setattr(rep_bot.database, "is_user_blocked", lambda _uid: blocked)
 
 
-@pytest.mark.parametrize("role", ["rep", "super_admin"])
-def test_user_portal_callback_namespace_rejects_non_end_user_roles(monkeypatch, role):
+@pytest.mark.parametrize("role", ["unauthorized_group", "blocked"])
+def test_user_portal_callback_namespace_rejects_foreign_roles(monkeypatch, role):
     update, query, _ = make_update("user:wallet", role=role)
     patch_role(monkeypatch, role)
     called = []
@@ -75,7 +75,22 @@ def test_user_portal_callback_namespace_rejects_non_end_user_roles(monkeypatch, 
 
     assert not called
     assert query.answers and query.answers[0][1] is True
-    assert "کاربر نهایی" in query.answers[0][0]
+
+
+@pytest.mark.parametrize("role", ["rep", "super_admin"])
+def test_user_portal_callback_namespace_admits_higher_roles_viewing_as_end_user(monkeypatch, role):
+    """BUG-RBAC-001: switching down into the end-user view must not lock the actor out."""
+    update, query, _ = make_update("user:wallet", role=role)
+    patch_role(monkeypatch, role)
+    called = []
+    async def allowed(_update, _context):
+        called.append(True)
+    monkeypatch.setattr(rep_bot.user_portal, "handle_user_callbacks", allowed)
+
+    asyncio.run(rep_bot.handle_callback(update, SimpleNamespace(user_data={})))
+
+    assert called == [True]
+    assert not query.answers
 
 
 def test_user_portal_callback_namespace_allows_resolved_end_user_in_sandbox(monkeypatch):
@@ -94,29 +109,42 @@ def test_user_portal_callback_namespace_allows_resolved_end_user_in_sandbox(monk
     assert not query.answers
 
 
-def test_user_portal_handler_has_its_own_role_guard(monkeypatch):
+def test_user_portal_handler_admits_a_representative_viewing_as_end_user(monkeypatch):
+    """BUG-RBAC-001: the portal's own guard must not reject a representative."""
     update, query, _ = make_update("user:wallet")
     monkeypatch.setattr(user_portal.database, "is_user_blocked", lambda _uid: False)
     monkeypatch.setattr(user_portal.database, "get_user_role", lambda *args, **kwargs: ("rep", {"id": 5}))
+    monkeypatch.setattr(user_portal.database, "get_user_wallet_balance", lambda _uid: 0)
+    monkeypatch.setattr(user_portal.database, "get_card_info", lambda: {})
+    monkeypatch.setattr(user_portal.database, "get_user_receipts", lambda *args, **kwargs: [])
 
     asyncio.run(user_portal.handle_user_callbacks(update, SimpleNamespace(user_data={})))
 
-    assert query.answers and query.answers[0][1] is True
-    assert "کاربر نهایی" in query.answers[0][0]
+    assert query.edits
+    # No rejection alert: the only answers allowed here are informational toasts.
+    assert all(show_alert is False for _text, show_alert in query.answers)
 
 
-def test_show_user_portal_does_not_create_user_record_for_other_roles(monkeypatch):
+def test_show_user_portal_admits_super_admin_and_guarantees_customer_rows(monkeypatch):
+    """BUG-RBAC-001: a super-admin entering the end-user view keeps a way back out."""
     update, query, message = make_update(role="super_admin")
     monkeypatch.setattr(user_portal.database, "get_user_role", lambda *args, **kwargs: ("super_admin", None))
-    monkeypatch.setattr(
-        user_portal.database, "ensure_bot_user",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not provision an end-user record")),
-    )
+    monkeypatch.setattr(user_portal.database, "is_user_blocked", lambda _uid: False)
+    monkeypatch.setattr(user_portal.database, "get_user_wallet_balance", lambda _uid: 0)
+    monkeypatch.setattr(user_portal.database, "get_user_linked_accounts", lambda _uid: [])
+    guaranteed = []
+    monkeypatch.setattr(user_portal, "ensure_portal_customer_rows",
+                        lambda user: guaranteed.append(user.id))
 
     asyncio.run(user_portal.show_user_portal(update, SimpleNamespace()))
 
-    assert not message.replies
-    assert query.answers and query.answers[0][1] is True
+    assert guaranteed == [71001]
+    assert message.replies
+    assert not query.answers
+    keyboard = message.replies[0][1]["reply_markup"]
+    callbacks = [item.callback_data for row in keyboard.inline_keyboard for item in row]
+    assert "v52:persona:rep" in callbacks
+    assert "v52:persona:admin" in callbacks
 
 
 @pytest.mark.parametrize(
