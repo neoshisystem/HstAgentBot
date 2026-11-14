@@ -9,8 +9,8 @@ REPO_REF="${HSTAGENTBOT_GIT_REF:-recovery/scope-1}"
 readonly LOCK_FILE="/run/lock/hstagentbot-installer.lock"
 readonly LOG_FILE="/var/log/hstagentbot-installer.log"
 SERVICE_NAME="${HSTAGENTBOT_SERVICE_NAME:-hstagentbot}"
-readonly SERVICE_USER="hstagentbot"
-readonly SERVICE_GROUP="hstagentbot"
+SERVICE_USER="${HSTAGENTBOT_SERVICE_USER:-hstagentbot}"
+SERVICE_GROUP="${HSTAGENTBOT_SERVICE_GROUP:-hstagentbot}"
 readonly DEFAULT_INSTALL_DIR="/opt/hstagentbot"
 INSTALL_DIR="${HSTAGENTBOT_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 VENV_DIR=""
@@ -56,12 +56,15 @@ Options:
   --update               Approve a safe update of an existing clean checkout without prompting.
   --ref REF              Install a branch, tag, or commit reference (default: recovery/scope-1).
   --service-name NAME    Install the systemd service under NAME.
+  --service-user NAME    Run the service as NAME (default: hstagentbot).
   --advanced             Ask for optional legacy topic and subscription settings.
 
 Environment:
   HSTAGENTBOT_INSTALL_DIR  Installation directory (default: /opt/hstagentbot)
   HSTAGENTBOT_GIT_REF      Default Git ref; overridden by --ref.
   HSTAGENTBOT_SERVICE_NAME Default service name; overridden by --service-name.
+  HSTAGENTBOT_SERVICE_USER Default service user; overridden by --service-user.
+  HSTAGENTBOT_SERVICE_GROUP Service group; defaults to the service user name.
 
 Fresh installs ask only for install path, bot token, numeric admin ID and report group
 ID (default 0). v5.2 migrations and UI are enabled automatically.
@@ -93,6 +96,15 @@ parse_args() {
                 SERVICE_NAME="${2%.service}"
                 shift 2
                 ;;
+            --service-user)
+                (($# >= 2)) || die "--service-user requires a name"
+                [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]] ||
+                    die "Invalid service user: $2"
+                SERVICE_USER="$2"
+                # Keep the group aligned unless it was pinned explicitly.
+                [[ -n "${HSTAGENTBOT_SERVICE_GROUP:-}" ]] || SERVICE_GROUP="$2"
+                shift 2
+                ;;
             --ref)
                 (($# >= 2)) || die "--ref requires a Git reference"
                 [[ -n "$2" ]] || die "--ref cannot be empty"
@@ -104,6 +116,10 @@ parse_args() {
     done
     [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,62}$ ]] ||
         die "Invalid service name: $SERVICE_NAME"
+    [[ "$SERVICE_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]] ||
+        die "Invalid service user: $SERVICE_USER"
+    [[ "$SERVICE_GROUP" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]] ||
+        die "Invalid service group: $SERVICE_GROUP"
 }
 
 
@@ -267,6 +283,15 @@ ensure_service_account() {
     local service_shell
     service_shell="$(getent passwd "$SERVICE_USER" | cut -d: -f7)"
     [[ "$service_shell" == "/usr/sbin/nologin" ]] || die "$SERVICE_USER must use /usr/sbin/nologin"
+    # A pre-existing service user may carry a different primary group name.
+    if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+        if id -gn "$SERVICE_USER" >/dev/null 2>&1; then
+            SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
+            log "Service group resolved to the existing primary group: $SERVICE_GROUP"
+        else
+            groupadd --system "$SERVICE_GROUP"
+        fi
+    fi
     select_python
     VENV_DIR="$INSTALL_DIR/.venv"
     [[ -x "$VENV_DIR/bin/python" ]] || "$SYSTEM_PYTHON" -m venv "$VENV_DIR"
@@ -497,7 +522,7 @@ run_project_tests() {
     (
         cd "$INSTALL_DIR"
         "$VENV_DIR/bin/python" -m compileall -q .
-        env V52_MIGRATIONS_ENABLED=0 BACKUP_ENCRYPTION_KEY="" HSTAGENTBOT_INTEGRATIONS_PATH="" DB_PATH="$test_dir/test.db" BACKUP_DIR="$test_dir/backups" \
+        env V52_MIGRATIONS_ENABLED=0 V52_UI_ENABLED="" BACKUP_ENCRYPTION_KEY="" HSTAGENTBOT_INTEGRATIONS_PATH="" DB_PATH="$test_dir/test.db" BACKUP_DIR="$test_dir/backups" \
             "$VENV_DIR/bin/python" -m pytest -p no:cacheprovider -q .
     )
     rm -rf "$test_dir"

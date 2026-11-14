@@ -365,6 +365,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     else:
         role, rep = database.get_user_role(user.id, chat.id, thread_id)
+        if chat and chat.type == "private" and _runtime_flag("v52_persona_switcher_enabled"):
+            role, rep = _resolve_active_persona_role(user, base_role=role, base_rep=rep)
 
     if await _submit_v52_order_receipt(update, context, role):
         return
@@ -391,6 +393,550 @@ def _v52_actor_context(update, context, persona=None, rep=None):
             "is_root": bool(getattr(user, "id", None) == ADMIN_TELEGRAM_ID)}
 
 
+_V52_TECHNICAL_ERRORS = (TypeError, AttributeError, NameError, ModuleNotFoundError,
+                         ImportError, IndexError, KeyError, NotImplementedError)
+
+_V52_ERROR_MESSAGES = {
+    "a verified canonical subscription host is unavailable":
+        "دامنهٔ اشتراک تأییدشده برای این بات ثبت نشده است؛ ابتدا دامنه را در «مدیریت دامنه‌ها» ثبت و تأیید کنید.",
+    "the default profile cannot be deleted": "پروفایل پیش‌فرض قابل حذف نیست.",
+    "panel URL must be a non-empty trimmed string":
+        "اتصال این پنل هنوز تنظیم نشده است؛ ابتدا از «جزئیات پنل → ویرایش اتصال» نشانی و توکن را ثبت کنید.",
+    "actor cannot view this account": "این اکانت برای حساب شما قابل مشاهده نیست.",
+    "actor cannot view this account configuration": "پیکربندی این اکانت برای حساب شما قابل مشاهده نیست.",
+    "support ticket does not exist": "تیکت موردنظر وجود ندارد.",
+    "پنل وجود ندارد.": "پنل موردنظر وجود ندارد.",
+}
+
+
+def _v52_error_page(exc, persona: str, data: str):
+    """Render a user-facing error page; programming errors keep their technical text."""
+    from ui_v52 import render_error
+    parent = "v52:home:" + persona
+    if isinstance(exc, _V52_TECHNICAL_ERRORS):
+        return render_error(f"اجرای صفحهٔ v5.2 ممکن نشد: {exc}", persona=persona,
+                            parent_callback=parent)
+    if isinstance(exc, PermissionError) or type(exc).__name__.endswith("Denied"):
+        return render_error("دسترسی به این مورد برای حساب شما مجاز نیست.", persona=persona,
+                            parent_callback=parent)
+    raw = str(exc).strip()
+    message = _V52_ERROR_MESSAGES.get(raw) or raw or "این عملیات در وضعیت فعلی قابل انجام نیست."
+    return render_error(message, persona=persona, parent_callback=parent)
+
+
+def _resolve_active_persona_role(user, *, base_role, base_rep):
+    """Honour ``user_settings.active_persona`` for private-chat routing.
+
+    Mirrors ``_onboard_v52_start``'s resolution without its onboarding writes.
+    Only consulted while the ``v52_persona_switcher_enabled`` flag is on, so the
+    legacy role routing stays byte-identical when the feature is off.
+    """
+    if base_role in {"unauthorized_group", "blocked"}:
+        return base_role, base_rep
+    actor_id = getattr(user, "id", None)
+    if actor_id is None:
+        return base_role, base_rep
+    actor_id = int(actor_id)
+    try:
+        import identity_service
+        with database.get_db() as conn:
+            actor = identity_service.resolve_actor(conn, actor_id)
+            setting = conn.execute(
+                "SELECT active_persona FROM user_settings WHERE user_id=?", (actor_id,)
+            ).fetchone()
+            selected = str(setting["active_persona"] if setting else "end_user").strip().lower()
+            if actor.is_root:
+                if selected in {"rep", "representative"} and actor.rep_id is not None:
+                    row = conn.execute(
+                        "SELECT * FROM representatives WHERE id=? AND is_active=1 "
+                        "AND deleted_at IS NULL", (int(actor.rep_id),)).fetchone()
+                    if row is not None:
+                        return "rep", dict(row)
+                if selected in {"end_user", "user"}:
+                    return "end_user", None
+                return "super_admin", None
+            if selected in {"rep", "representative"} and actor.persona == "rep" \
+                    and actor.rep_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM representatives WHERE id=? AND is_active=1 "
+                    "AND deleted_at IS NULL", (int(actor.rep_id),)).fetchone()
+                if row is not None:
+                    return "rep", dict(row)
+            return "end_user", None
+    except Exception:
+        logger.debug("persona resolution fell back to the legacy role", exc_info=True)
+        return base_role, base_rep
+
+
+def _resolve_persona_rep(user, rep=None) -> dict | None:
+    """Return the representative workspace row for the acting user, if any.
+
+    The configured root always owns the personal ``root_admin_rep`` row created
+    by ``identity_service.ensure_personal_identity``, so the super-admin can open
+    the representative workspace instead of hitting ``KeyError: 'id'``.
+    """
+    if isinstance(rep, dict) and rep.get("id"):
+        return rep
+    actor_id = getattr(user, "id", None)
+    if actor_id is None:
+        return None
+    actor_id = int(actor_id)
+    try:
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM representatives WHERE telegram_id=? AND is_active=1 "
+                "AND deleted_at IS NULL ORDER BY id LIMIT 1", (actor_id,)
+            ).fetchone()
+            if row is None and actor_id == int(ADMIN_TELEGRAM_ID):
+                import identity_service
+                identity_service.ensure_personal_identity(conn, actor_id)
+                row = conn.execute(
+                    "SELECT * FROM representatives WHERE rep_code='root_admin_rep' "
+                    "AND is_active=1 AND deleted_at IS NULL"
+                ).fetchone()
+    except Exception:
+        logger.exception("v5.2 persona representative resolution failed")
+        return None
+    return dict(row) if row is not None else None
+
+
+def _begin_ownership_transfer(ctx, account_id: int, persona: str):
+    """W17.19 root transfer: show the account card and ask for the new owner id."""
+    from ui_v52 import render_page, render_error
+    if not ctx.get("is_root"):
+        return render_error("انتقال مالکیت فقط در اختیار root است.", persona=persona,
+                            parent_callback=f"v52:sub:{account_id}")
+    with database.get_db() as conn:
+        account = conn.execute(
+            "SELECT id,account_code,email,owner_tg_id,revision,deleted_at FROM accounts WHERE id=?",
+            (int(account_id),),
+        ).fetchone()
+    if account is None or account["deleted_at"] is not None:
+        return render_error("اکانت موردنظر وجود ندارد.", persona=persona,
+                            parent_callback="v52:home:admin")
+    v52_router.DEFAULT_FSM.set(
+        ctx, "ownership_transfer", payload={"account_id": int(account_id)},
+        parent_callback=f"v52:sub:{account_id}", now=int(time.time()),
+    )
+    owner = account["owner_tg_id"]
+    return render_page(
+        "انتقال مالکیت اکانت",
+        f"اکانت: {account['account_code'] or account['email']}\n"
+        f"مالک فعلی: {owner if owner else 'ثبت نشده'}\n"
+        f"revision: {int(account['revision'])}\n\n"
+        "شناسه عددی تلگرام مالک جدید را در پیام بعدی ارسال کنید. "
+        "هیچ تغییری تا تأیید نهایی اعمال نمی‌شود.",
+        persona=persona, page_kind="form", parent_callback=f"v52:sub:{account_id}",
+    )
+
+
+def _load_digital_products() -> list[dict]:
+    """Read the active digital catalogue for the v5.2 shop renderer."""
+    with database.get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM digital_products WHERE is_active=1 ORDER BY sort_order, id"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _load_digital_product(product_id: int) -> dict | None:
+    """Read one digital product row; None when it does not exist."""
+    with database.get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM digital_products WHERE id=?", (int(product_id),)
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _load_v52_order(order_id: str) -> dict | None:
+    """Load a payment order plus its product/delivery facts for the v5.2 delivery UI."""
+    with database.get_db() as conn:
+        row = conn.execute(
+            "SELECT order_id,actor_tg_id,bot_id,merchant_key,purpose,payment_rail,amount_toman,"
+            "status,received_toman,created_at,expires_at,revision FROM payment_orders WHERE order_id=?",
+            (str(order_id),)).fetchone()
+        if row is None:
+            return None
+        order = {"order_id": str(row[0]), "actor_tg_id": int(row[1]), "bot_id": int(row[2]),
+                 "merchant_key": str(row[3]), "purpose": str(row[4]), "payment_rail": str(row[5]),
+                 "amount_toman": int(row[6]), "status": str(row[7]), "received_toman": int(row[8]),
+                 "created_at": int(row[9]), "expires_at": int(row[10]), "revision": int(row[11])}
+        product = conn.execute(
+            "SELECT p.id,p.title,p.delivery_type FROM digital_products p "
+            "JOIN quotes q ON q.product_id=p.id "
+            "JOIN payment_orders o ON o.quote_id=q.quote_id WHERE o.order_id=?",
+            (str(order_id),)).fetchone()
+        if product is not None:
+            order["product_id"] = int(product["id"])
+            order["product_title"] = str(product["title"])
+            order["delivery_type"] = str(product["delivery_type"])
+    return order
+
+
+def _load_plan(plan_code: str) -> dict | None:
+    """Read one pricing plan row; None when it does not exist."""
+    with database.get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM pricing_plans WHERE plan_code=?", (str(plan_code),)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _plan_panel_scope(plan: dict) -> tuple[str, list[int], list[dict]]:
+    """Resolve a plan's real panel bindings so edit_plan never raises on scope."""
+    with database.get_db() as conn:
+        ids = [int(r["panel_id"]) for r in conn.execute(
+            "SELECT panel_id FROM plan_panels WHERE plan_code=? AND allowed=1 ORDER BY panel_id",
+            (str(plan.get("plan_code")),)).fetchall()]
+        panels = [dict(r) for r in conn.execute(
+            "SELECT id,name,lifecycle FROM panels ORDER BY is_default DESC,id").fetchall()]
+    declared = str(plan.get("panel_scope") or "selected").strip().lower()
+    if declared == "selected" and not ids:
+        # Nothing is bound yet: show the unscoped view instead of raising.
+        declared = "legacy"
+    return declared, ids, panels
+
+
+def _v52_edit_plan(ctx, persona: str, plan_code: str, *, confirm_all: bool):
+    """Render the plan editor for one plan (optionally across every panel)."""
+    import finance_admin_ui
+    from ui_v52 import render_error
+    plan = _load_plan(plan_code)
+    if plan is None:
+        return render_error("تعرفهٔ موردنظر یافت نشد.", persona=persona, parent_callback="v52:plans")
+    scope, ids, panels = _plan_panel_scope(plan)
+    if confirm_all:
+        scope = "all_explicit"
+    return finance_admin_ui.edit_plan(
+        ctx, plan, panel_scope=scope, selected_panel_ids=ids, current_panels=panels,
+        confirm_all_explicit=bool(confirm_all), parent_callback="v52:plans")
+
+
+def _v52_quote_page(ctx, persona: str, *, plan_code: str, account_id: int | None):
+    """Build a real immutable quote and render the checkout preview for buy/renew."""
+    import checkout_ui
+    import pricing_service
+    import quote_service
+    from ui_v52 import render_error
+    actor_id = int(ctx.get("actor_tg_id") or 0)
+    bot_id = int(ctx.get("bot_id") or 0)
+    now = int(time.time())
+    purpose = "vpn_renew" if account_id else "vpn_buy"
+    if account_id:
+        with database.get_db() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM accounts WHERE id=? AND deleted_at IS NULL", (int(account_id),)
+            ).fetchone()
+        if exists is None:
+            return render_error("اکانت موردنظر برای تمدید یافت نشد.", persona=persona,
+                                parent_callback="v52:home:" + persona)
+    try:
+        with database.get_db() as conn:
+            chain = pricing_service.price_chain(
+                conn, plan_code=str(plan_code), seller_key="root",
+                buyer_tg_id=actor_id, purpose="sale", now=now)
+            quote = quote_service.create_quote(
+                conn, actor_tg_id=actor_id, bot_id=bot_id,
+                merchant_key=str(chain.get("merchant_key") or "root"), purpose=purpose,
+                amount_toman=int(chain["amount_toman"]), spec={"plan_code": str(plan_code)},
+                price_edges=list(chain.get("price_edges") or []), account_id=account_id,
+                plan_code=str(plan_code), now=now)
+    except Exception as exc:
+        return render_error(f"ساخت پیشنهاد قیمت ممکن نشد: {exc}", persona=persona,
+                            parent_callback="v52:shop")
+    if account_id:
+        return checkout_ui.preview_renew(ctx, int(account_id), str(plan_code), quote=quote)
+    return checkout_ui.preview_buy(ctx, str(plan_code), quote=quote)
+
+
+def _v52_begin_order(ctx, persona: str, quote_id: str):
+    """Create (or reuse) the payment order for a locked quote and offer the enabled rail."""
+    import order_service
+    from ui_v52 import render_page, button, render_error
+    actor_id = int(ctx.get("actor_tg_id") or 0)
+    bot_id = int(ctx.get("bot_id") or 0)
+    now = int(time.time())
+    try:
+        with database.get_db() as conn:
+            existing = conn.execute(
+                "SELECT order_id,status FROM payment_orders WHERE quote_id=?", (str(quote_id),)
+            ).fetchone()
+            if existing is not None:
+                order_id, status = str(existing["order_id"]), str(existing["status"])
+            else:
+                created = order_service.create_order(
+                    conn, quote_id=str(quote_id), actor_tg_id=actor_id, bot_id=bot_id,
+                    payment_rail="card_to_card", now=now)
+                order_id = str(created["order_id"])
+                status = str(created.get("status") or "awaiting_payment")
+    except Exception as exc:
+        return render_error(f"ایجاد سفارش پرداخت ممکن نشد: {exc}", persona=persona,
+                            parent_callback="v52:shop")
+    return render_page(
+        "انتخاب روش پرداخت", f"سفارش {order_id}\nوضعیت: {status}",
+        persona=persona, page_kind="preview", parent_callback="v52:shop",
+        rows=[[button("کارت به کارت", f"v52:pay:{order_id}:card")]],
+    )
+
+
+def _v52_receipt_review_page(ctx, persona: str, receipt_id: str):
+    """Render the receipt/attempt/order preview for a reviewer or the payer."""
+    import checkout_ui
+    import payment_service
+    from ui_v52 import render_error
+    with database.get_db() as conn:
+        receipt = conn.execute(
+            "SELECT id,order_id,payment_attempt_id FROM payment_receipts "
+            "WHERE CAST(id AS TEXT)=? OR tracking_code=?", (str(receipt_id), str(receipt_id))
+        ).fetchone()
+        if receipt is None or not receipt["payment_attempt_id"]:
+            return render_error("رسید موردنظر یافت نشد.", persona=persona, parent_callback="v52:shop")
+        attempt_row = conn.execute(
+            "SELECT attempt_id,order_id,assigned_card_id,state,evidence_cipher,created_at "
+            "FROM payment_attempts WHERE attempt_id=?", (str(receipt["payment_attempt_id"]),)
+        ).fetchone()
+        if attempt_row is None:
+            return render_error("درخواست پرداخت این رسید یافت نشد.", persona=persona,
+                                parent_callback="v52:shop")
+        attempt = payment_service._open_attempt_result(conn, attempt_row)
+        order_row = conn.execute(
+            "SELECT order_id,actor_tg_id,bot_id,merchant_key,purpose,payment_rail,amount_toman,"
+            "status,received_toman,created_at,expires_at,revision FROM payment_orders WHERE order_id=?",
+            (str(attempt_row["order_id"]),)).fetchone()
+    if order_row is None:
+        return render_error("سفارش این رسید یافت نشد.", persona=persona, parent_callback="v52:shop")
+    order = {"order_id": str(order_row[0]), "actor_tg_id": int(order_row[1]), "bot_id": int(order_row[2]),
+             "merchant_key": str(order_row[3]), "purpose": str(order_row[4]), "payment_rail": str(order_row[5]),
+             "amount_toman": int(order_row[6]), "status": str(order_row[7]), "received_toman": int(order_row[8]),
+             "created_at": int(order_row[9]), "expires_at": int(order_row[10]), "revision": int(order_row[11])}
+    return checkout_ui.preview_receipt(ctx, attempt, order=order)
+
+
+def _v52_manual_delivery_page(ctx, persona: str, order_id: str):
+    """Two-step manual fulfilment: preview first, then confirm with the DM secret."""
+    import goods_ui
+    from ui_v52 import render_error
+    order = _load_v52_order(order_id)
+    if order is None:
+        return render_error("سفارش موردنظر یافت نشد.", persona=persona, parent_callback="v52:shop")
+    now = int(time.time())
+    entry = v52_router.DEFAULT_FSM.peek(ctx, now=now)
+    secret = None
+    if entry is not None and entry.state == "goods_manual_secret":
+        secret = str(entry.payload.get("secret") or "") or None
+    if secret:
+        return goods_ui.prepare_manual_delivery(ctx, order, secret_payload=secret, confirm=True)
+    v52_router.DEFAULT_FSM.set(
+        ctx, "goods_manual_secret", payload={"order_id": str(order_id)},
+        parent_callback="v52:shop", now=now)
+    return goods_ui.prepare_manual_delivery(ctx, order, confirm=False)
+
+
+def _load_panel_operations(ctx, operation_id=None) -> list[dict]:
+    """Load the reconciliation queue for the acting bot (optionally one operation)."""
+    bot_id = int(ctx.get("bot_id") or 0)
+    sql = ("SELECT operation_id,order_id,actor_tg_id,bot_id,account_id,panel_id,kind,state,"
+           "created_at,updated_at FROM panel_operations WHERE bot_id=?")
+    args: list = [bot_id]
+    if operation_id:
+        sql += " AND operation_id=?"
+        args.append(str(operation_id))
+    sql += " ORDER BY updated_at DESC LIMIT 20"
+    with database.get_db() as conn:
+        rows = conn.execute(sql, tuple(args)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _load_refund(refund_id: str) -> dict | None:
+    """Read one refund request row; None when it does not exist."""
+    with database.get_db() as conn:
+        row = conn.execute(
+            "SELECT refund_id,order_id,merchant_key,user_tg_id,amount_toman,state,created_at,settled_at "
+            "FROM refund_requests WHERE refund_id=?", (str(refund_id),)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _v52_begin_manual_import(ctx, panel_id: int):
+    """Ask for the manual pool batch in private DM (root only)."""
+    from ui_v52 import render_page, render_error
+    if not ctx.get("is_root"):
+        return render_error("ورود دستی استخر فقط در اختیار root است.", persona="admin",
+                            parent_callback="v52:panels")
+    with database.get_db() as conn:
+        panel = conn.execute("SELECT id,name FROM panels WHERE id=?", (int(panel_id),)).fetchone()
+    if panel is None:
+        return render_error("پنل موردنظر یافت نشد.", persona="admin", parent_callback="v52:panels")
+    v52_router.DEFAULT_FSM.set(
+        ctx, "inventory_manual_batch", payload={"panel_id": int(panel_id)},
+        parent_callback="v52:panels", now=int(time.time()))
+    return render_page(
+        "ورود دستی استخر",
+        f"پنل: {int(panel_id)} · {panel['name']}\n\n"
+        "در پیام بعدی، شناسه خارجی و کانفیگ‌ها را در قالب زیر ارسال کنید:\n"
+        "<code>identifier | uri1 | uri2</code>\n"
+        "مقادیر در دیتابیس رمزنگاری می‌شوند و در لاگ نمایش داده نمی‌شوند.",
+        persona="admin", page_kind="form", parent_callback="v52:panels",
+    )
+
+
+def _v52_begin_digital_import(ctx, product_id: int):
+    """Ask for the digital inventory batch in private DM (root only)."""
+    from ui_v52 import render_page, render_error
+    if not ctx.get("is_root"):
+        return render_error("ورود موجودی دیجیتال فقط در اختیار root است.", persona="admin",
+                            parent_callback="v52:shop")
+    with database.get_db() as conn:
+        product = conn.execute(
+            "SELECT id,title FROM digital_products WHERE id=?", (int(product_id),)).fetchone()
+    if product is None:
+        return render_error("کالای موردنظر یافت نشد.", persona="admin", parent_callback="v52:shop")
+    v52_router.DEFAULT_FSM.set(
+        ctx, "inventory_digital_batch", payload={"product_id": int(product_id)},
+        parent_callback="v52:shop", now=int(time.time()))
+    return render_page(
+        "ورود موجودی دیجیتال",
+        f"محصول: {int(product_id)} · {product['title']}\n\n"
+        "هر قلم محرمانه را در یک خط جداگانه در پیام بعدی ارسال کنید. "
+        "مقادیر رمزنگاری می‌شوند و در لاگ نمایش داده نمی‌شوند.",
+        persona="admin", page_kind="form", parent_callback="v52:shop",
+    )
+
+
+def _load_confirmation(nonce: str):
+    """Read one action confirmation row by nonce."""
+    with database.get_db() as conn:
+        return conn.execute(
+            "SELECT nonce,actor_tg_id,bot_id,action,target_type,target_id,expected_revision,"
+            "expires_at,consumed_at,operation_id FROM action_confirmations WHERE nonce=?",
+            (str(nonce),)).fetchone()
+
+
+def _v52_confirmation_page(ctx, persona: str, nonce: str):
+    """Preview a pending confirmation without consuming it."""
+    from ui_v52 import render_page, render_error
+    row = _load_confirmation(nonce)
+    if row is None:
+        return render_error("این درخواست تأیید وجود ندارد یا منقضی شده است.", persona=persona,
+                            parent_callback="v52:home:" + persona)
+    if row["consumed_at"] is not None:
+        return render_error("این درخواست تأیید قبلاً مصرف شده است.", persona=persona,
+                            parent_callback="v52:home:" + persona)
+    if int(row["actor_tg_id"]) != int(ctx.get("actor_tg_id") or 0) \
+            or int(row["bot_id"]) != int(ctx.get("bot_id") or 0):
+        return render_error("این درخواست تأیید متعلق به این کاربر/بات نیست.", persona=persona,
+                            parent_callback="v52:home:" + persona)
+    if int(row["expires_at"]) <= int(time.time()):
+        return render_error("مهلت این درخواست تأیید به پایان رسیده است.", persona=persona,
+                            parent_callback="v52:home:" + persona)
+    return render_page(
+        "پیش‌نمایش درخواست تأیید",
+        f"عملیات: {row['action']}\nهدف: {row['target_type']} · {row['target_id']}\n"
+        f"revision: {int(row['expected_revision'])}\nانقضا: {int(row['expires_at'])}\n\n"
+        "هیچ تغییری تا زدن دکمهٔ تأیید اعمال نمی‌شود.",
+        persona=persona, page_kind="preview", parent_callback="v52:home:" + persona,
+    )
+
+
+def _v52_consume_confirmation(ctx, persona: str, nonce: str):
+    """CAS-consume a confirmation and report the bound operation id."""
+    import confirmation_service
+    from ui_v52 import render_page, render_error
+    row = _load_confirmation(nonce)
+    if row is None:
+        return render_error("این درخواست تأیید وجود ندارد یا منقضی شده است.", persona=persona,
+                            parent_callback="v52:home:" + persona)
+    try:
+        with database.get_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = confirmation_service.consume_confirmation(
+                    conn, nonce=str(nonce), actor_tg_id=int(row["actor_tg_id"]),
+                    bot_id=int(row["bot_id"]), action=str(row["action"]),
+                    target_type=str(row["target_type"]), target_id=str(row["target_id"]),
+                    expected_revision=int(row["expected_revision"]), now=int(time.time()))
+                conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+    except Exception as exc:
+        return render_error(f"تأیید انجام نشد: {exc}", persona=persona,
+                            parent_callback="v52:home:" + persona)
+    notice = "این تأیید قبلاً مصرف شده بود." if result.get("replayed") else "تأیید ثبت شد."
+    return render_page(
+        "نتیجهٔ تأیید",
+        f"{notice}\nشناسه عملیات: {result.get('operation_id')}\n"
+        "پیشرفت واقعی عملیات از صف تطبیق قابل پیگیری است.",
+        persona=persona, page_kind="result", parent_callback="v52:home:" + persona,
+    )
+
+
+def _v52_cancel_confirmation(ctx, persona: str, nonce: str):
+    """Report a discarded confirmation; the row is left to expire untouched."""
+    from ui_v52 import render_page, render_error
+    row = _load_confirmation(nonce)
+    if row is None:
+        return render_error("این درخواست تأیید وجود ندارد یا منقضی شده است.", persona=persona,
+                            parent_callback="v52:home:" + persona)
+    if row["consumed_at"] is not None:
+        return render_error("این درخواست تأیید قبلاً مصرف شده است.", persona=persona,
+                            parent_callback="v52:home:" + persona)
+    return render_page(
+        "لغو شد",
+        f"عملیات «{row['action']}» لغو شد؛ هیچ تغییری اعمال نشد.\n"
+        "این درخواست تأیید تا انقضای طبیعی خود مصرف نمی‌شود.",
+        persona=persona, page_kind="result", parent_callback="v52:home:" + persona,
+    )
+
+
+async def _switch_v52_persona(update, context, target: str, role, rep):
+    """Persist the requested persona and render the matching workspace."""
+    import identity_service
+    from ui_v52 import render_error
+    query, user = update.callback_query, update.effective_user
+    selected = {"admin": "admin", "rep": "rep", "user": "end_user"}.get(str(target))
+    if selected is None:
+        await _send_v52_page(query, render_error("نقش درخواستی نامعتبر است.",
+                                                 parent_callback="v52:home:user"))
+        return True
+    actor_id = int(user.id)
+    is_root = actor_id == int(ADMIN_TELEGRAM_ID)
+    try:
+        with database.get_db() as conn:
+            actor = identity_service.resolve_actor(conn, actor_id)
+    except Exception:
+        await _send_v52_page(query, render_error(
+            "هویت شما برای تغییر نقش ثبت نشده است؛ ابتدا /start را بزنید.",
+            parent_callback="v52:home:user"))
+        return True
+    allowed = {"end_user"}
+    if actor.is_root:
+        allowed.update({"admin", "rep"})
+    if actor.persona == "rep" and actor.rep_id is not None:
+        allowed.add("rep")
+    if selected not in allowed:
+        await _send_v52_page(query, render_error(
+            "این نقش برای حساب شما مجاز نیست.", parent_callback="v52:home:user"))
+        return True
+    with database.get_db() as conn:
+        conn.execute(
+            "INSERT INTO user_settings(user_id,first_connect_mode,active_persona) VALUES(?,0,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET active_persona=excluded.active_persona",
+            (actor_id, selected))
+    if selected == "admin":
+        await admin_panel.show_admin_dashboard(update, context, edit_message=True)
+    elif selected == "rep":
+        active_rep = _resolve_persona_rep(user, rep)
+        if active_rep is None:
+            await _send_v52_page(query, render_error("میزکار نمایندگی برای شما موجود نیست.",
+                                                     parent_callback="v52:home:user"))
+            return True
+        await rep_panel.show_rep_dashboard(update, context, active_rep, edit_message=True)
+    else:
+        await user_portal.show_user_portal(update, context, edit_message=True)
+    await query.answer("نقش فعال تغییر کرد")
+    return True
+
+
 async def _send_v52_page(query, page, notice=""):
     if page is None:
         from ui_v52 import render_error
@@ -402,7 +948,14 @@ async def _send_v52_page(query, page, notice=""):
         from ui_v52 import render_error
         fallback = render_error("پاسخ UI قابل نمایش نیست.", parent_callback="v52:home:user")
         text_value, markup = fallback.text, fallback.reply_markup
-    await query.edit_message_text(text_value, reply_markup=markup, parse_mode="HTML")
+    try:
+        await query.edit_message_text(text_value, reply_markup=markup, parse_mode="HTML")
+    except BadRequest as exc:
+        # Telegram rejects an edit whose text+markup are byte-identical to the
+        # current message ("Message is not modified"). That is an idempotent
+        # re-render, not a failure: the user already sees the wanted page.
+        if "not modified" not in str(exc).lower():
+            raise
     await query.answer(notice or "صفحهٔ v5.2")
 
 
@@ -527,9 +1080,21 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         row = conn.execute("SELECT * FROM bank_cards WHERE id=?", (int(match.group(1)),)).fetchone()
                     page = finance_admin_ui.edit_bank_card(ctx, None if row is None else dict(row))
                 elif data == "v52:plans":
-                    import finance_admin_ui
+                    from ui_v52 import render_page, button
                     plans = database.get_pricing_plans(active_only=True)
-                    page = finance_admin_ui.edit_plan(ctx, plans[0]) if plans else None
+                    if not plans:
+                        page = render_page("تعرفه‌ها", "هیچ تعرفهٔ فعالی ثبت نشده است.",
+                                           persona="admin", parent_callback="v52:home:admin")
+                    else:
+                        rows = [[button(
+                            f"{item.get('name') or item['plan_code']} · "
+                            f"{float(item.get('gb') or 0):g}GB/{int(item.get('days') or 0)}d",
+                            f"v52:plan:{item['plan_code']}")] for item in plans]
+                        page = render_page(
+                            "تعرفه‌ها",
+                            f"تعداد تعرفه‌های فعال: {len(plans)}\n"
+                            "برای ویرایش، تعرفهٔ موردنظر را انتخاب کنید.",
+                            persona="admin", rows=rows)
                 else:
                     match = re.fullmatch(r"v52:settle:([1-9][0-9]{0,17})", data)
                     if match:
@@ -671,13 +1236,16 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
             elif name == "reply_or_escalate":
                 import support_service
                 from ui_v52 import render_page, button
-                ticket_id = str(params["ticket_id"])
-                if params.get("action") == "escalate":
+                if params.get("action") == "transfer":
+                    page = _begin_ownership_transfer(ctx, int(params["account_id"]), persona)
+                elif params.get("action") == "escalate":
+                    ticket_id = str(params["ticket_id"])
                     import support_ui
                     page = support_ui.reply_or_escalate(
                         ctx, ticket_id, action="escalate", confirm=True, parent_callback="v52:tickets",
                     )
                 else:
+                    ticket_id = str(params["ticket_id"])
                     messages = support_service.list_ticket_messages(ctx, ticket_id)
                     summary = "\n".join(
                         f"{item.get('visibility', 'customer')}: {str(item.get('body') or '')[:180]}"
@@ -716,7 +1284,14 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 if target == "admin":
                     await admin_panel.show_admin_dashboard(update, context, edit_message=True)
                 elif target == "rep":
-                    await rep_panel.show_rep_dashboard(update, context, rep or {}, edit_message=True)
+                    active_rep = _resolve_persona_rep(user, rep)
+                    if active_rep is None:
+                        from ui_v52 import render_error
+                        await _send_v52_page(query, render_error(
+                            "این نقش برای حساب شما فعال نیست.", persona="rep",
+                            parent_callback="v52:home:user"))
+                        return True
+                    await rep_panel.show_rep_dashboard(update, context, active_rep, edit_message=True)
                 else:
                     await user_portal.show_user_portal(update, context, edit_message=True)
                 await query.answer("منوی اصلی")
@@ -782,26 +1357,120 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                     ctx, params["account_id"], adapter_factory=admin_panel._get_admin_panel_adapter_factory(context))
                 page = type("V52Page", (), {"text": card.text, "reply_markup": card.reply_markup})()
             elif name == "list_profiles":
-                import profile_list_ui
-                page = profile_list_ui.list_profiles(ctx)
+                import subscription_ui
+                page = subscription_ui.list_profiles(ctx)
             elif name == "show_profile":
-                import profile_actions_ui
-                page = profile_actions_ui.show_profile(ctx, params["profile_id"])
+                import subscription_ui
+                page = subscription_ui.show_profile(ctx, params["profile_id"])
             elif name == "show_catalog":
                 import goods_ui
-                page = goods_ui.show_catalog(ctx)
+                page = goods_ui.show_catalog(ctx, _load_digital_products())
             elif name == "preview_product":
                 import goods_ui
-                page = goods_ui.preview_product(ctx, params["product_id"])
+                from ui_v52 import render_error
+                product = _load_digital_product(int(params["product_id"]))
+                if product is None:
+                    page = render_error("کالای موردنظر یافت نشد.", persona=persona,
+                                        parent_callback="v52:shop")
+                else:
+                    page = goods_ui.preview_product(ctx, product)
+            elif name == "add_member":
+                import subscription_ui
+                page = subscription_ui.add_member(ctx, int(params["profile_id"]), int(params["account_id"]))
+            elif name == "preview_remove":
+                import subscription_ui
+                page = subscription_ui.preview_remove(
+                    ctx, int(params["profile_id"]), int(params["account_id"]), now=int(time.time()))
+            elif name == "begin_create":
+                import subscription_ui
+                page = subscription_ui.begin_create(ctx, int(params.get("account_id") or 0))
+            elif name == "show_link":
+                import subscription_ui
+                page = subscription_ui.show_link(ctx, int(params["profile_id"]))
+            elif name == "show_qr":
+                import subscription_ui
+                page = subscription_ui.show_qr(ctx, int(params["profile_id"]))
+            elif name in {"preview_rotate", "preview_delete", "preview_clear", "preview_enabled"}:
+                import subscription_ui
+                actions = {"preview_rotate": "rotate", "preview_delete": "delete", "preview_clear": "clear"}
+                if name == "preview_enabled":
+                    action = "resume" if params.get("enabled") else "pause"
+                else:
+                    action = actions[name]
+                page = subscription_ui.preview_profile_action(
+                    ctx, int(params["profile_id"]), action,
+                    now=int(time.time()), chat_type=ctx.get("chat_type"))
+            elif name == "begin_rename":
+                import subscription_ui
+                page = subscription_ui.begin_rename(
+                    ctx, int(params["profile_id"]), chat_type=ctx.get("chat_type"))
+            elif name == "begin_traffic":
+                import account_actions_ui
+                page = account_actions_ui.begin_traffic(
+                    ctx, int(params["account_id"]),
+                    parent_callback=f"v52:sub:{int(params['account_id'])}")
+            elif name == "begin_expiry":
+                import account_actions_ui
+                page = account_actions_ui.begin_expiry(
+                    ctx, int(params["account_id"]),
+                    parent_callback=f"v52:sub:{int(params['account_id'])}")
+            elif name == "begin_grant":
+                import access_ui
+                page = access_ui.begin_grant(
+                    ctx, int(params["account_id"]),
+                    access_level=str(params.get("level") or "viewer"), persona=persona)
+            elif name == "preview_buy":
+                page = _v52_quote_page(ctx, persona, plan_code=str(params["plan_code"]), account_id=None)
+            elif name == "preview_renew":
+                page = _v52_quote_page(ctx, persona, plan_code=str(params["plan_code"]),
+                                       account_id=int(params["account_id"]))
+            elif name == "begin_order":
+                page = _v52_begin_order(ctx, persona, str(params["quote_id"]))
+            elif name == "begin_addon":
+                import checkout_ui
+                page = checkout_ui.begin_addon(
+                    ctx, int(params["account_id"]), str(params.get("addon_type") or "gib"))
+            elif name == "preview_receipt":
+                page = _v52_receipt_review_page(ctx, persona, str(params.get("receipt_id") or ""))
+            elif name == "prepare_manual_delivery":
+                page = _v52_manual_delivery_page(ctx, persona, str(params["order_id"]))
+            elif name == "show_operations":
+                import operations_ui
+                page = operations_ui.show_operations(
+                    ctx, _load_panel_operations(ctx, params.get("operation_id")))
+            elif name == "preview_refund":
+                import operations_ui
+                from ui_v52 import render_error
+                refund = _load_refund(str(params["refund_id"]))
+                if refund is None:
+                    page = render_error("درخواست بازگشت وجه یافت نشد.", persona=persona,
+                                        parent_callback="v52:ops")
+                else:
+                    page = operations_ui.preview_refund(ctx, refund)
+            elif name == "begin_manual_import":
+                page = _v52_begin_manual_import(ctx, int(params["panel_id"]))
+            elif name == "begin_digital_import":
+                page = _v52_begin_digital_import(ctx, int(params["product_id"]))
+            elif name == "resolve_quote_preview":
+                page = _v52_confirmation_page(ctx, persona, str(params["nonce"]))
+            elif name == "consume_and_dispatch":
+                page = _v52_consume_confirmation(ctx, persona, str(params["nonce"]))
+            elif name == "cancel_confirmation":
+                page = _v52_cancel_confirmation(ctx, persona, str(params["nonce"]))
+            elif name == "edit_plan":
+                page = _v52_edit_plan(ctx, persona, str(params["plan_code"]), confirm_all=False)
+            elif name == "edit_plan_all_explicit":
+                page = _v52_edit_plan(ctx, persona, str(params["plan_code"]), confirm_all=True)
+            elif name == "switch_persona":
+                return await _switch_v52_persona(update, context, str(params["persona"]), role, rep)
             else:
                 from ui_v52 import render_error
-                page = render_error(f"مسیر {name} handler اجرایی مستقل ندارد؛ عملیات انجام نشد.",
-                                    persona=persona, parent_callback="v52:home:" + persona)
+                page = render_error(
+                    f"مسیر «{name}» در این نسخه به Bridge متصل نیست؛ عملیات انجام نشد.",
+                    persona=persona, parent_callback="v52:home:" + persona)
         except Exception as exc:
             logger.exception("v5.2 bridge dispatch failed for %s", data)
-            from ui_v52 import render_error
-            page = render_error(f"اجرای صفحهٔ v5.2 ممکن نشد: {exc}",
-                                persona=persona, parent_callback="v52:home:" + persona)
+            page = _v52_error_page(exc, persona, data)
     if page is None:
         from ui_v52 import render_error
         page = render_error("callback در registry یا Bridge مجاز W18 شناخته نشد؛ عملیات قدیمی اجرا نشد.",
@@ -880,10 +1549,10 @@ async def _route_v52_fsm_text(update, context):
     ctx = _v52_actor_context(update, context, persona, rep_actor)
     text_value = str(route.params.get("text") or "").strip()
     try:
-        if route.state in {"panel_connection_url", "panel_connection_token"}:
+        if route.name in {"panel_connection_url", "panel_connection_token"}:
             if persona != "admin" or not ctx.get("is_root") or chat.type != "private":
                 raise PermissionError("تنظیم اتصال پنل فقط در پیوی root مجاز است.")
-        if route.state == "panel_connection_url":
+        if route.name == "panel_connection_url":
             from panel_adapters.url_parser import parse_panel_url
             endpoint = parse_panel_url(text_value)
             v52_router.DEFAULT_FSM.set(
@@ -893,7 +1562,7 @@ async def _route_v52_fsm_text(update, context):
             )
             await message.reply_text("آدرس معتبر است؛ اکنون توکن API پنل را ارسال کنید.")
             return True
-        if route.state == "panel_connection_token":
+        if route.name == "panel_connection_token":
             try:
                 await message.delete()
             except Exception:
@@ -906,7 +1575,7 @@ async def _route_v52_fsm_text(update, context):
                 f"{result['lifecycle']} است. ابتدا اتصال را آزمایش کنید."
             )
             return True
-        if route.state == "support_ticket_body":
+        if route.name == "support_ticket_body":
             import support_ui
             if payload.get("kind") == "abuse":
                 page = support_ui.begin_abuse(ctx, text_value, chat_type=chat.type, parent_callback="v52:tickets")
@@ -918,7 +1587,7 @@ async def _route_v52_fsm_text(update, context):
                 )
             await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
             return True
-        if route.state == "support_reply":
+        if route.name == "support_reply":
             import support_service
             result = support_service.reply_ticket(
                 ctx, str(payload["ticket_id"]), text_value,
@@ -928,9 +1597,63 @@ async def _route_v52_fsm_text(update, context):
                 f"✅ پاسخ ثبت شد. شناسه پیام: {result['message_id']} · نمایش: {result['visibility']}"
             )
             return True
+        if route.name == "ownership_transfer":
+            import ownership_service
+            from ui_v52 import render_page, button
+            target = text_value.strip()
+            if not target.isdigit() or int(target) <= 0:
+                raise ValueError("شناسه تلگرام مالک جدید باید یک عدد مثبت باشد.")
+            account_id = int(payload.get("account_id", 0))
+            result = ownership_service.preview_transfer(
+                ctx, account_id, int(target), reason="v52 root transfer",
+                bot_id=ctx.get("bot_id"),
+            )
+            preview = render_page(
+                "پیش‌نمایش انتقال مالکیت",
+                f"اکانت {result['account_id']} → مالک {int(target)}\n"
+                f"مالک فعلی: {result['before'].get('owner_tg_id')}\n"
+                f"انقضا: {result['expires_at']}",
+                persona=persona, page_kind="preview",
+                parent_callback=f"v52:sub:{account_id}",
+                rows=[[button("تأیید انتقال", result["callback_ok"]),
+                       button("لغو", result["callback_no"])]],
+            )
+            await message.reply_text(preview.text, reply_markup=preview.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "goods_manual_secret":
+            import goods_ui
+            order = _load_v52_order(str(payload.get("order_id") or ""))
+            if order is None:
+                raise ValueError("سفارش موردنظر یافت نشد.")
+            v52_router.DEFAULT_FSM.set(
+                ctx, "goods_manual_secret",
+                payload={"order_id": str(payload.get("order_id")), "secret": text_value},
+                parent_callback="v52:shop", now=int(time.time()))
+            page = goods_ui.prepare_manual_delivery(ctx, order, confirm=False)
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "inventory_manual_batch":
+            import inventory_admin_ui
+            parts = [chunk.strip() for chunk in text_value.split("|") if chunk.strip()]
+            if len(parts) < 2:
+                raise ValueError("قالب نامعتبر است؛ «identifier | uri1 | uri2» را ارسال کنید.")
+            page = inventory_admin_ui.begin_manual_import(
+                ctx, int(payload.get("panel_id", 0)), parts[0], parts[1:],
+                parent_callback="v52:panels")
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "inventory_digital_batch":
+            import inventory_admin_ui
+            items = [line.strip() for line in text_value.splitlines() if line.strip()]
+            if not items:
+                raise ValueError("هیچ قلمی ارسال نشد.")
+            page = inventory_admin_ui.begin_digital_import(
+                ctx, int(payload.get("product_id", 0)), items, parent_callback="v52:shop")
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
         await message.reply_text("متن draft دریافت شد؛ مسیر قدیمی NLP آن را دوباره مصرف نمی‌کند.")
     except Exception as exc:
-        logger.exception("v5.2 text workflow failed for state=%s", route.state)
+        logger.exception("v5.2 text workflow failed for state=%s", route.name)
         await message.reply_text(f"❌ عملیات v5.2 انجام نشد: {exc}")
     return True
 
@@ -2947,6 +3670,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.effective_message.message_thread_id if update.effective_message else None
     
     role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    if chat and chat.type == "private" and _runtime_flag("v52_persona_switcher_enabled"):
+        role, rep = _resolve_active_persona_role(user, base_role=role, base_rep=rep)
     if role == "unauthorized_group":
         await query.answer("⛔️ دسترسی غیرمجاز در این تاپیک.", show_alert=True)
         return

@@ -124,6 +124,21 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
              InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
             [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets"),
              InlineKeyboardButton("🧩 همگام‌سازی فروم", callback_data="v52:forums:root")],
+            # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
+            [InlineKeyboardButton("👥 مدیریت نماینده‌ها", callback_data="admin:reps"),
+             InlineKeyboardButton("👤 مدیریت کاربران", callback_data="admin:users")],
+            [InlineKeyboardButton("📦 تخصیص و اسکوپ", callback_data="admin:scope"),
+             InlineKeyboardButton("💰 امور مالی و تسویه‌ها", callback_data="admin:finance")],
+            [InlineKeyboardButton("⚙️ تعرفه‌ها و پلن‌ها", callback_data="admin:plans"),
+             InlineKeyboardButton("🔄 همگام‌سازی و آمار", callback_data="admin:sync")],
+            [InlineKeyboardButton("⚠️ مانیتورینگ اکانت‌های بحرانی", callback_data="admin:audit"),
+             InlineKeyboardButton("🏊 استخر آزاد", callback_data="admin:pool")],
+            [InlineKeyboardButton("📦 بسته‌های رزرو در انتظار", callback_data="admin:reserves"),
+             InlineKeyboardButton("🛠 تنظیمات پیشرفته سامانه", callback_data="admin:settings")],
+            [InlineKeyboardButton("💾 پشتیبان‌گیری سریع دیتابیس", callback_data="admin:backup")],
+            # --- Persona Switcher ---
+            [InlineKeyboardButton("🧑‍💼 میزکار نماینده (root_admin_rep)", callback_data="v52:persona:rep")],
+            [InlineKeyboardButton("👤 پورتال کاربری", callback_data="v52:persona:user")],
         ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 مدیریت نماینده‌ها", callback_data="admin:reps"),
@@ -991,12 +1006,24 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("همگام‌سازی تکمیل شد.")
 
-    # 8. Critical Accounts Audit
+    # 8. Critical Accounts Audit — read-only through the selected root-scoped adapter.
     elif action == "audit":
-        audit_res = await asyncio.to_thread(xui_manager.audit_clients_overview, scope="all")
+        try:
+            adapter = _get_admin_panel_adapter(context=context)
+            clients = await adapter.list_clients(scope_filter="all")
+            audit_res = [
+                {"action": str(getattr(client, "email", "") or "panel_client"),
+                 "result_status": "enabled" if getattr(client, "enable", False) else "disabled"}
+                for client in clients
+            ]
+        except Exception:
+            logger.exception("Scoped panel adapter read failed in admin audit view")
+            audit_res = []
         report_text = xui_manager.format_audit_report(audit_res)
         keyboard = build_back_to_admin_keyboard()
-        await query.edit_message_text(f"⚠️ **گزارش اکانت‌های بحرانی و روبه‌اتمام:**\n\n{report_text}", parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await query.edit_message_text(
+            f"⚠️ <b>گزارش اکانت‌های بحرانی و روبه‌اتمام:</b>\n\n{report_text}",
+            parse_mode=ParseMode.HTML, reply_markup=keyboard)
         await query.answer("گزارش اکانت‌های بحرانی")
 
     # 9. Free Pool Accounts Watchdog — read-only through the selected root-scoped adapter.

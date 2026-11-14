@@ -67,6 +67,14 @@ def build_rep_main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("👤 پروفایل‌ها", callback_data="v52:profiles"),
              InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
             [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets")],
+            # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
+            [InlineKeyboardButton("🔍 جستجو و استعلام اکانت", callback_data="rep:prompt_search"),
+             InlineKeyboardButton("💰 کیف پول و صورت‌حساب", callback_data="rep:wallet")],
+            [InlineKeyboardButton("⏳ صف بسته‌های رزرو من", callback_data="rep:reserves"),
+             InlineKeyboardButton("📊 آمار کلی اکانت‌ها", callback_data="rep:stats")],
+            [InlineKeyboardButton("🏷 تعرفه‌های همکاری", callback_data="rep:pricing")],
+            # --- Persona Switcher ---
+            [InlineKeyboardButton("👤 پورتال کاربری", callback_data="v52:persona:user")],
         ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🆕 صدور اکانت جدید", callback_data="rep:new_acc_plans"),

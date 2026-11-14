@@ -32,14 +32,14 @@ def test_installer_help_exits_successfully():
     )
     assert result.returncode == 0, result.stderr
     for option in ("--check-only", "--skip-tests", "--update", "--ref REF",
-                   "--service-name NAME", "--advanced"):
+                   "--service-name NAME", "--service-user NAME", "--advanced"):
         assert option in result.stdout
 
 
 def test_base_tests_and_migration_smoke_use_opposite_flags():
     source = _installer_text()
     assert re.search(
-        r'env\s+V52_MIGRATIONS_ENABLED=0\s+BACKUP_ENCRYPTION_KEY=""'
+        r'env\s+V52_MIGRATIONS_ENABLED=0\s+V52_UI_ENABLED=""\s+BACKUP_ENCRYPTION_KEY=""'
         r'\s+HSTAGENTBOT_INTEGRATIONS_PATH=""\s+DB_PATH=', source
     )
     smoke = re.search(

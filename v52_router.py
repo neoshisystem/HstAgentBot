@@ -67,8 +67,12 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:life:([1-9][0-9]{0,17}):(active|sold_out|hidden|drain|maintenance)$"), "preview_lifecycle", "root", lambda m: {"panel_id": int(m[1]), "lifecycle": m[2]}),
     (re.compile(r"^v52:life-confirm:([1-9][0-9]{0,17}):(active|sold_out|hidden|drain|maintenance)$"), "confirm_lifecycle", "root", lambda m: {"panel_id": int(m[1]), "lifecycle": m[2]}),
     (re.compile(r"^v52:buy:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "preview_buy", "seller route", lambda m: {"plan_code": m[1]}),
+    (re.compile(r"^v52:plan:([A-Za-z0-9][A-Za-z0-9._-]{0,47}):all_explicit$"), "edit_plan_all_explicit", "root", lambda m: {"plan_code": m[1]}),
+    (re.compile(r"^v52:plan:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "edit_plan", "root", lambda m: {"plan_code": m[1]}),
+    (re.compile(r"^v52:persona:(admin|rep|user)$"), "switch_persona", "actor", lambda m: {"persona": m[1]}),
     (re.compile(r"^v52:renew:([1-9][0-9]{0,17}):([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "preview_renew", "manager/owner/seller/root", lambda m: {"account_id": int(m[1]), "plan_code": m[2]}),
     (re.compile(r"^v52:addon:([1-9][0-9]{0,17}):(gib|day)$"), "begin_addon", "owner/seller/root", lambda m: {"account_id": int(m[1]), "addon_type": m[2]}),
+    (re.compile(r"^v52:order:([A-Za-z0-9._:-]{1,36})$"), "begin_order", "payer", lambda m: {"quote_id": m[1]}),
     (re.compile(r"^v52:pay:([A-Za-z0-9._:-]{1,36}):(wallet|card)$"), "choose_rail", "payer", lambda m: {"order_id": m[1], "rail": m[2]}),
     (re.compile(r"^v52:receipt:(approve|reject):([A-Za-z0-9._:-]{1,36})$"), "preview_receipt", "reviewer/root", lambda m: {"decision": m[1], "receipt_id": m[2]}),
     (re.compile(r"^v52:shop$"), "show_catalog", "actor", lambda m: {}),
@@ -139,7 +143,8 @@ class DraftFSM:
         selected = str(state or "")
         if selected not in {"goods_manual_secret", "support_ticket_body", "support_reply",
                             "panel_connection_url", "panel_connection_token",
-                            "inventory_manual_batch", "inventory_digital_batch"}:
+                            "inventory_manual_batch", "inventory_digital_batch",
+                            "ownership_transfer"}:
             raise ValueError("unknown v5.2 FSM state")
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:
             raise ValueError("now must be non-negative epoch seconds")
@@ -164,7 +169,8 @@ class DraftFSM:
             return None
         accepted = {"text": {"goods_manual_secret", "support_ticket_body", "support_reply",
                              "panel_connection_url", "panel_connection_token",
-                             "inventory_manual_batch", "inventory_digital_batch"},
+                             "inventory_manual_batch", "inventory_digital_batch",
+                             "ownership_transfer"},
                     "photo": {"support_ticket_body", "support_reply"}}
         if event not in accepted or entry.state not in accepted[event]:
             return None

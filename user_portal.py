@@ -76,6 +76,10 @@ def build_user_portal_keyboard() -> InlineKeyboardMarkup:
              InlineKeyboardButton("💳 کیف پول", callback_data="user:wallet")],
             [InlineKeyboardButton("🎫 تیکت‌های من", callback_data="v52:tickets"),
              InlineKeyboardButton("🔐 گزارش محرمانه", callback_data="v52:abuse")],
+            # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
+            [InlineKeyboardButton("🛒 خرید سرویس جدید", callback_data="user:buy_service"),
+             InlineKeyboardButton("🔗 اتصال اکانت به تلگرام", callback_data="user:prompt_link")],
+            [InlineKeyboardButton("📋 تعرفه‌ها و قیمت‌ها", callback_data="user:pricing")],
         ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📱 سرویس‌های من", callback_data="user:services"),
