@@ -14,7 +14,9 @@ ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
 # Bot & Admin Settings
-VERSION = "v4.0.0-beta.3"
+VERSION = "v5.2.0"
+BUILD_BRANCH = "v5.2-release"
+BUILD_COMMIT = os.getenv("BUILD_COMMIT", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", os.getenv("HST_AGENT_BOT_TOKEN", ""))
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 

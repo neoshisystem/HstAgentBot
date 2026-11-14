@@ -550,7 +550,168 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
     if page is None and isinstance(route, v52_router.Route):
         name, params = route.handler, route.params
         try:
-            if name == "route_home":
+            if name == "show_panel":
+                from ui_v52 import render_page, button, render_error
+                panel_id = int(params["panel_id"])
+                with database.get_db() as conn:
+                    row = conn.execute("SELECT * FROM panels WHERE id=?", (panel_id,)).fetchone()
+                if row is None:
+                    page = render_error("پنل موردنظر وجود ندارد.", persona="admin", parent_callback="v52:panels")
+                else:
+                    panel = dict(row)
+                    url = panel.get("raw_url") or panel.get("base_url") or "تنظیم نشده"
+                    has_secret = bool(panel.get("auth_cipher") or panel.get("api_token_cipher"))
+                    body = (f"کد: {panel.get('panel_code', panel_id)}\nنام: {panel.get('name', '')}\n"
+                            f"نوع: {panel.get('panel_type', '')}\nوضعیت: {panel.get('lifecycle', '')}\n"
+                            f"نشانی: {url}\nاعتبارنامه: {'ثبت شده (محرمانه)' if has_secret else 'ثبت نشده'}")
+                    page = render_page("جزئیات پنل", body, persona="admin", rows=[
+                        [button("ویرایش اتصال", f"v52:panelconfig:{panel_id}")],
+                        [button("آزمایش اتصال", f"v52:paneltest:{panel_id}")],
+                        [button("فعال‌سازی پس از آزمایش", f"v52:life:{panel_id}:active")],
+                        [button("بازگشت به فهرست", "v52:panels")],
+                    ])
+            elif name == "begin_panel_config":
+                if persona != "admin" or not ctx.get("is_root") or getattr(update.effective_chat, "type", "") != "private":
+                    raise PermissionError("تنظیم اتصال پنل فقط در پیوی root مجاز است.")
+                from ui_v52 import render_page
+                panel_id = int(params["panel_id"])
+                with database.get_db() as conn:
+                    exists = conn.execute("SELECT 1 FROM panels WHERE id=?", (panel_id,)).fetchone()
+                if exists is None:
+                    raise ValueError("پنل موردنظر وجود ندارد.")
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "panel_connection_url", payload={"panel_id": panel_id},
+                    parent_callback=data, now=int(time.time()),
+                )
+                page = render_page(
+                    "تنظیم اتصال پنل",
+                    "آدرس کامل پنل 3X-UI را بدون نام کاربری/رمز، query یا fragment ارسال کنید. "
+                    "در مرحله بعد توکن API به‌صورت رمزنگاری‌شده ذخیره می‌شود.",
+                    persona="admin", page_kind="form", parent_callback="v52:panels",
+                )
+            elif name == "test_panel_connection":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("آزمایش اتصال پنل فقط در اختیار root است.")
+                panel_id = int(params["panel_id"])
+                with database.get_db() as conn:
+                    row = conn.execute("SELECT * FROM panels WHERE id=?", (panel_id,)).fetchone()
+                if row is None:
+                    raise ValueError("پنل وجود ندارد.")
+                panel_record = dict(row)
+                kind = str(panel_record.get("panel_type") or "").lower().replace("_", "-")
+                if kind not in {"3x-ui", "3xui", "xui"}:
+                    raise ValueError("آزمایش آفلاین/آنلاین این نصب فعلاً برای پنل 3X-UI فعال است.")
+                import requests
+                from panel_adapters.xui_openapi import XUIOpenAPIAdapter
+                adapter = XUIOpenAPIAdapter(panel_record, requests.Session(), transaction_probe=lambda: False)
+                status = await adapter.verify_connection()
+                reachable = bool(getattr(status, "reachable", False))
+                body = "اتصال پنل موفق و پاسخ معتبر دریافت شد." if reachable else "پاسخ قابل‌اتکا دریافت نشد؛ وضعیت پنل تغییر نکرد."
+                from ui_v52 import render_page, button
+                rows = [[button("فعال‌سازی پنل", f"v52:life:{panel_id}:active")]] if reachable else []
+                rows.append([button("بازگشت به جزئیات", f"v52:panel:{panel_id}")])
+                page = render_page("نتیجه آزمایش اتصال", body, persona="admin", page_kind="result", rows=rows)
+            elif name == "confirm_lifecycle":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("تغییر چرخه عمر پنل فقط در اختیار root است.")
+                panel_id, state = int(params["panel_id"]), str(params["lifecycle"])
+                if state == "active":
+                    with database.get_db() as conn:
+                        row = conn.execute("SELECT * FROM panels WHERE id=?", (panel_id,)).fetchone()
+                    if row is None:
+                        raise ValueError("پنل وجود ندارد.")
+                    panel_record = dict(row)
+                    kind = str(panel_record.get("panel_type") or "").lower().replace("_", "-")
+                    if kind not in {"3x-ui", "3xui", "xui"}:
+                        raise ValueError("آزمایش اتصال پیش از فعال‌سازی در این نسخه فقط برای 3X-UI پشتیبانی می‌شود.")
+                    import requests
+                    from panel_adapters.xui_openapi import XUIOpenAPIAdapter
+                    adapter = XUIOpenAPIAdapter(panel_record, requests.Session(), transaction_probe=lambda: False)
+                    status = await adapter.verify_connection()
+                    if not bool(getattr(status, "reachable", False)):
+                        raise RuntimeError("آزمایش اتصال موفق نبود؛ پنل در وضعیت قبلی باقی ماند.")
+                result = database.set_panel_lifecycle(panel_id, state)
+                from ui_v52 import render_page
+                page = render_page(
+                    "وضعیت پنل به‌روزرسانی شد",
+                    f"پنل {panel_id} · وضعیت جدید: {result['lifecycle']}",
+                    persona="admin", page_kind="result", parent_callback=f"v52:panel:{panel_id}",
+                )
+            elif name == "list_tickets":
+                import support_service
+                from ui_v52 import render_page, button
+                tickets = support_service.list_tickets(ctx)
+                rows = [[button(
+                    f"{item['ticket_id'][:8]} · {item['status']}",
+                    "v52:ticket:" + str(item["ticket_id"])
+                )] for item in tickets[:12]]
+                rows.append([button("گزارش محرمانه", "v52:abuse")])
+                page = render_page(
+                    "تیکت‌های پشتیبانی",
+                    f"تعداد تیکت‌های قابل مشاهده: {len(tickets)}\n"
+                    "گزارش‌های محرمانه فقط در پیوی root قابل مشاهده‌اند.",
+                    persona=persona, rows=rows,
+                )
+            elif name == "begin_ticket":
+                import support_ui
+                account_id = int(params["account_id"])
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "support_ticket_body",
+                    payload={"kind": "ticket", "account_id": account_id, "ticket_type": "general"},
+                    parent_callback=data, now=int(time.time()),
+                )
+                page = support_ui.begin_ticket(ctx, account_id, submit=False, parent_callback="v52:tickets")
+            elif name == "begin_abuse":
+                import support_ui
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "support_ticket_body", payload={"kind": "abuse"},
+                    parent_callback=data, now=int(time.time()),
+                )
+                page = support_ui.begin_abuse(ctx, chat_type=ctx.get("chat_type"), parent_callback="v52:tickets")
+            elif name == "reply_or_escalate":
+                import support_service
+                from ui_v52 import render_page, button
+                ticket_id = str(params["ticket_id"])
+                if params.get("action") == "escalate":
+                    import support_ui
+                    page = support_ui.reply_or_escalate(
+                        ctx, ticket_id, action="escalate", confirm=True, parent_callback="v52:tickets",
+                    )
+                else:
+                    messages = support_service.list_ticket_messages(ctx, ticket_id)
+                    summary = "\n".join(
+                        f"{item.get('visibility', 'customer')}: {str(item.get('body') or '')[:180]}"
+                        for item in messages[-4:]
+                    ) or "هنوز پیامی برای این تیکت ثبت نشده است."
+                    v52_router.DEFAULT_FSM.set(
+                        ctx, "support_reply", payload={"ticket_id": ticket_id},
+                        parent_callback=data, now=int(time.time()),
+                    )
+                    page = render_page(
+                        "پاسخ به تیکت",
+                        f"شناسه: {ticket_id}\n{summary}\n\nپاسخ خود را در پیام بعدی ارسال کنید.",
+                        persona=persona, page_kind="form",
+                        rows=[[button("ارجاع به root", "v52:escalate:" + ticket_id)],
+                              [button("بازگشت به تیکت‌ها", "v52:tickets")]],
+                    )
+            elif name == "sync_topics":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("همگام‌سازی تاپیک‌ها فقط در اختیار root است.")
+                if not MAIN_GROUP_ID:
+                    raise ValueError("MAIN_GROUP_ID روی صفر تنظیم شده است.")
+                result = await _sync_v52_forum_topics(
+                    context.bot, int(context.bot.id), int(MAIN_GROUP_ID),
+                    owner_key=str(params.get("owner_key") or "root"),
+                )
+                from ui_v52 import render_page
+                page = render_page(
+                    "همگام‌سازی فروم",
+                    f"وضعیت: {result.get('state')}\n"
+                    f"تاپیک‌های فعال: {result.get('active', 0)}\n"
+                    f"جزئیات: {result.get('reason', 'ثبت شد')}",
+                    persona="admin", page_kind="result", parent_callback="v52:panels",
+                )
+            elif name == "route_home":
                 target = params.get("persona")
                 if target == "admin":
                     await admin_panel.show_admin_dashboard(update, context, edit_message=True)
@@ -703,16 +864,75 @@ async def _submit_v52_order_receipt(update, context, role):
 
 
 async def _route_v52_fsm_text(update, context):
-    user, chat, bot = update.effective_user, update.effective_chat, getattr(context, "bot", None)
-    if not all((user, chat, getattr(bot, "id", None))):
+    user, chat, message = update.effective_user, update.effective_chat, update.message
+    bot_api = getattr(context, "bot", None)
+    if not all((user, chat, getattr(bot_api, "id", None), message)):
         return False
-    route = v52_router.route_text({"bot_id": int(bot.id), "actor_tg_id": int(user.id), "chat_id": int(chat.id)},
-                                  update.message.text or "", now=int(time.time()))
+    identity = {"bot_id": int(bot_api.id), "actor_tg_id": int(user.id), "chat_id": int(chat.id)}
+    route = v52_router.route_text(identity, message.text or "", now=int(time.time()))
     if route is False:
         return False
-    await update.message.reply_text("متن در draft ثبت‌شدهٔ v5.2 دریافت شد؛ مسیر قدیمی NLP آن را دوباره مصرف نمی‌کند.")
+    payload = dict(route.params.get("payload") or {})
+    role, rep_actor = database.get_user_role(
+        int(user.id), int(chat.id), getattr(message, "message_thread_id", None),
+    )
+    persona = "admin" if role == "super_admin" else "rep" if role == "rep" else "user"
+    ctx = _v52_actor_context(update, context, persona, rep_actor)
+    text_value = str(route.params.get("text") or "").strip()
+    try:
+        if route.state in {"panel_connection_url", "panel_connection_token"}:
+            if persona != "admin" or not ctx.get("is_root") or chat.type != "private":
+                raise PermissionError("تنظیم اتصال پنل فقط در پیوی root مجاز است.")
+        if route.state == "panel_connection_url":
+            from panel_adapters.url_parser import parse_panel_url
+            endpoint = parse_panel_url(text_value)
+            v52_router.DEFAULT_FSM.set(
+                ctx, "panel_connection_token",
+                payload={"panel_id": int(payload["panel_id"]), "normalized_url": endpoint.normalized_url},
+                parent_callback=route.params.get("parent_callback"), now=int(time.time()),
+            )
+            await message.reply_text("آدرس معتبر است؛ اکنون توکن API پنل را ارسال کنید.")
+            return True
+        if route.state == "panel_connection_token":
+            try:
+                await message.delete()
+            except Exception:
+                logger.debug("Could not delete the private panel credential message")
+            result = database.update_panel_connection(
+                int(payload["panel_id"]), str(payload["normalized_url"]), text_value,
+            )
+            await message.reply_text(
+                f"✅ اتصال پنل {result['panel_id']} ذخیره شد. توکن رمزنگاری شد؛ وضعیت پنل همچنان "
+                f"{result['lifecycle']} است. ابتدا اتصال را آزمایش کنید."
+            )
+            return True
+        if route.state == "support_ticket_body":
+            import support_ui
+            if payload.get("kind") == "abuse":
+                page = support_ui.begin_abuse(ctx, text_value, chat_type=chat.type, parent_callback="v52:tickets")
+            else:
+                page = support_ui.begin_ticket(
+                    ctx, int(payload.get("account_id", 0)), body=text_value,
+                    ticket_type=str(payload.get("ticket_type", "general")),
+                    submit=True, parent_callback="v52:tickets",
+                )
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.state == "support_reply":
+            import support_service
+            result = support_service.reply_ticket(
+                ctx, str(payload["ticket_id"]), text_value,
+                visibility="customer", now=int(time.time()),
+            )
+            await message.reply_text(
+                f"✅ پاسخ ثبت شد. شناسه پیام: {result['message_id']} · نمایش: {result['visibility']}"
+            )
+            return True
+        await message.reply_text("متن draft دریافت شد؛ مسیر قدیمی NLP آن را دوباره مصرف نمی‌کند.")
+    except Exception as exc:
+        logger.exception("v5.2 text workflow failed for state=%s", route.state)
+        await message.reply_text(f"❌ عملیات v5.2 انجام نشد: {exc}")
     return True
-
 
 async def _route_v52_fsm_photo(update, context):
     user, chat, bot, message = update.effective_user, update.effective_chat, getattr(context, "bot", None), update.message
@@ -3842,6 +4062,57 @@ async def receipt_notification_worker(application: Application):
 
 
 
+async def _sync_v52_forum_topics(bot_api, bot_id: int, group_chat_id: int, *, owner_key: str = "root") -> dict:
+    """Bridge synchronous forum_manager calls to the async Telegram Bot API."""
+    import forum_manager
+    loop = asyncio.get_running_loop()
+
+    class TelegramSyncBridge:
+        def _call(self, method_name, **kwargs):
+            future = asyncio.run_coroutine_threadsafe(getattr(bot_api, method_name)(**kwargs), loop)
+            return future.result(timeout=45)
+        def get_chat(self, **kwargs): return self._call("get_chat", **kwargs)
+        def get_me(self, **kwargs): return self._call("get_me", **kwargs)
+        def get_chat_member(self, **kwargs): return self._call("get_chat_member", **kwargs)
+        def create_forum_topic(self, **kwargs): return self._call("create_forum_topic", **kwargs)
+        def edit_forum_topic(self, **kwargs): return self._call("edit_forum_topic", **kwargs)
+
+    def sync():
+        api = TelegramSyncBridge()
+        permission = forum_manager.check_forum_permissions(api, int(group_chat_id), bot_id=int(bot_id))
+        if not permission.get("allowed"):
+            return {"state": "skipped", "reason": permission.get("reason"), "active": 0}
+        with database.get_db() as conn:
+            outcomes = forum_manager.sync_report_topics(
+                conn, api, bot_id=int(bot_id), group_chat_id=int(group_chat_id),
+                now=int(time.time()), owner_key=owner_key,
+            )
+        return {"state": "completed", "topics": len(outcomes),
+                "active": sum(1 for item in outcomes if item.get("state") == "active")}
+
+    return await asyncio.to_thread(sync)
+
+
+async def _bootstrap_v52_startup(application: Application) -> None:
+    """Verify Telegram getMe then seed the v5.2 installation and synchronize report topics."""
+    if not config.read_v52_settings().migrations_enabled:
+        return
+    me = await application.bot.get_me()
+    result = await asyncio.to_thread(
+        database.bootstrap_v52_installation,
+        bot_id=int(me.id), username=str(getattr(me, "username", "") or ""), token=BOT_TOKEN,
+    )
+    logger.info("v5.2 bootstrap completed: %s", result)
+    if MAIN_GROUP_ID:
+        try:
+            topic_result = await _sync_v52_forum_topics(
+                application.bot, int(me.id), int(MAIN_GROUP_ID), owner_key="root",
+            )
+            logger.info("v5.2 startup forum synchronization: %s", topic_result)
+        except Exception:
+            logger.exception("Forum synchronization deferred; the sales bot will continue startup")
+
+
 def main():
     database.init_db()
     if _runtime_flag("v52_multi_bot_enabled"):
@@ -3859,6 +4130,7 @@ def main():
         logger.error("Initial panel-scoped database sync failed: %s", startup_sync.get("message"))
 
     async def post_init(application: Application):
+        await _bootstrap_v52_startup(application)
         # Single-bot compatibility mode keeps exactly one watchdog/outbox worker.
         asyncio.create_task(watchdog_worker(application))
         asyncio.create_task(receipt_notification_worker(application))

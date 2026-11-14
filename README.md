@@ -48,9 +48,9 @@ An asynchronous, high-performance Telegram Bot built with Python (`python-telegr
    python rep_bot.py
    ```
 
-## Pre-production automatic installation (v1.1.0)
+## Plug-and-Play installation (v1.2.0)
 
-For Ubuntu 24.04+ and Debian 12+, the repository includes a hardened pre-production installer. It verifies the checkout and the exact 18 SQL migration files, runs the base test suite with versioned migrations disabled, runs an isolated migration smoke test with migrations enabled, backs up an existing SQLite database through the SQLite Backup API, and installs the restricted hstagentbot.service.
+For Ubuntu 24.04+ and Debian 12+, the repository includes a hardened Plug-and-Play installer. It verifies the checkout and the exact 18 SQL migration files, runs the base test suite with migration and integration secrets isolated, runs an isolated migration smoke test, bootstraps the primary v5.2 identity/panel/profile records, backs up an existing SQLite database through the SQLite Backup API, and installs a restricted systemd service. New installations ask only for the install path, bot token, numeric admin ID, and report group ID.
 
 **Quick Install:**
 
@@ -64,7 +64,7 @@ To choose a different branch, tag, or commit:
 curl -fsSL https://raw.githubusercontent.com/neoshisystem/HstAgentBot/recovery/scope-1/scripts/hstagentbot-installer.sh | sudo bash -s -- --ref recovery/scope-1
 ```
 
-Full Persian deployment instructions, CLI options, migration/test behavior, service management, and security guidance are available in [docs/INSTALLER_FA.md](docs/INSTALLER_FA.md).
+Full Persian deployment instructions, CLI options (including `--service-name` and `--advanced`), migration/test behavior, service management, and security guidance are available in [docs/INSTALLER_FA.md](docs/INSTALLER_FA.md).
 
 ## External integrations
 

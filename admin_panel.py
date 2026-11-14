@@ -24,11 +24,13 @@ _V52_ADMIN_ADAPTER_FACTORY = None
 
 
 def _v52_admin_enabled() -> bool:
+    enabled = {"1", "true", "yes", "on", "enabled"}
     try:
         value = database.get_setting("v52_ui_enabled", "0")
     except Exception:
         value = "0"
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    environment = os.getenv("V52_UI_ENABLED", os.getenv("V52_MIGRATIONS_ENABLED", "0"))
+    return str(value).strip().lower() in enabled or str(environment).strip().lower() in enabled
 
 
 def _get_admin_panel_adapter_factory(context=None):
@@ -111,38 +113,31 @@ async def _dispatch_v52_from_admin(update, context):
 # --- Keyboards ---
 
 def build_admin_main_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [
-            InlineKeyboardButton("👥 مدیریت نماینده‌ها", callback_data="admin:reps"),
-            InlineKeyboardButton("👤 مدیریت کاربران", callback_data="admin:users")
-        ],
-        [
-            InlineKeyboardButton("📦 تخصیص و اسکوپ", callback_data="admin:scope"),
-            InlineKeyboardButton("💰 امور مالی و تسویه‌ها", callback_data="admin:finance")
-        ],
-        [
-            InlineKeyboardButton("⚙️ تعرفه‌ها و پلن‌ها", callback_data="admin:plans"),
-            InlineKeyboardButton("🔄 همگام‌سازی و آمار", callback_data="admin:sync")
-        ],
-        [
-            InlineKeyboardButton("⚠️ مانیتورینگ اکانت‌های بحرانی", callback_data="admin:audit"),
-            InlineKeyboardButton("🏊 استخر آزاد", callback_data="admin:pool")
-        ],
-        [
-            InlineKeyboardButton("📦 بسته‌های رزرو در انتظار", callback_data="admin:reserves"),
-            InlineKeyboardButton("🛠 تنظیمات پیشرفته سامانه", callback_data="admin:settings")
-        ],
-        [
-            InlineKeyboardButton("💾 پشتیبان‌گیری سریع دیتابیس", callback_data="admin:backup")
-        ]
-    ]
+    """Return the focused v5.2 admin workspace after rollout."""
     if _v52_admin_enabled():
-        keyboard.extend([
-            [InlineKeyboardButton("🖥 پنل‌ها", callback_data="v52:panels"), InlineKeyboardButton("🤖 بات‌ها", callback_data="v52:bots")],
-            [InlineKeyboardButton("🌐 دامنه‌ها", callback_data="v52:domains"), InlineKeyboardButton("💳 کارت‌ها", callback_data="v52:cards")],
-            [InlineKeyboardButton("🏷 تعرفه‌ها", callback_data="v52:plans"), InlineKeyboardButton("🧾 عملیات", callback_data="v52:ops")],
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🖥 مدیریت پنل‌ها", callback_data="v52:panels"),
+             InlineKeyboardButton("🤖 مدیریت بات‌ها", callback_data="v52:bots")],
+            [InlineKeyboardButton("🌐 مدیریت دامنه‌ها", callback_data="v52:domains"),
+             InlineKeyboardButton("💳 کارت‌های پرداخت", callback_data="v52:cards")],
+            [InlineKeyboardButton("🏷 تعرفه‌ها", callback_data="v52:plans"),
+             InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
+            [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets"),
+             InlineKeyboardButton("🧩 همگام‌سازی فروم", callback_data="v52:forums:root")],
         ])
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 مدیریت نماینده‌ها", callback_data="admin:reps"),
+         InlineKeyboardButton("👤 مدیریت کاربران", callback_data="admin:users")],
+        [InlineKeyboardButton("📦 تخصیص و اسکوپ", callback_data="admin:scope"),
+         InlineKeyboardButton("💰 امور مالی و تسویه‌ها", callback_data="admin:finance")],
+        [InlineKeyboardButton("⚙️ تعرفه‌ها و پلن‌ها", callback_data="admin:plans"),
+         InlineKeyboardButton("🔄 همگام‌سازی و آمار", callback_data="admin:sync")],
+        [InlineKeyboardButton("⚠️ مانیتورینگ اکانت‌های بحرانی", callback_data="admin:audit"),
+         InlineKeyboardButton("🏊 استخر آزاد", callback_data="admin:pool")],
+        [InlineKeyboardButton("📦 بسته‌های رزرو در انتظار", callback_data="admin:reserves"),
+         InlineKeyboardButton("🛠 تنظیمات پیشرفته سامانه", callback_data="admin:settings")],
+        [InlineKeyboardButton("💾 پشتیبان‌گیری سریع دیتابیس", callback_data="admin:backup")],
+    ])
 
 def build_back_to_admin_keyboard(
     extra_buttons=None,
@@ -175,47 +170,54 @@ def escape_markdown_code(value) -> str:
 # --- Admin Views & Logic ---
 
 def get_build_info() -> dict:
-    """
-    Dynamically extracts live build metadata (version, branch, short commit hash, commit date).
-    """
+    """Resolve release metadata without requiring the service user to read .git."""
+    import re
     import subprocess
+    from pathlib import Path
     import config
-    
-    version = getattr(config, "VERSION", "v4.0.0-beta.3")
-    branch = "beta"
-    short_hash = "unknown"
+
+    version = getattr(config, "VERSION", "v5.2.0")
+    branch = getattr(config, "BUILD_BRANCH", "v5.2-release")
+    short_hash = ""
     commit_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
     try:
-        repo_dir = os.path.dirname(os.path.abspath(__file__))
-        r_branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=repo_dir, capture_output=True, text=True, timeout=2
-        )
-        if r_branch.returncode == 0 and r_branch.stdout.strip():
-            branch = r_branch.stdout.strip()
-            
-        r_hash = subprocess.run(
+        result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=repo_dir, capture_output=True, text=True, timeout=2
         )
-        if r_hash.returncode == 0 and r_hash.stdout.strip():
-            short_hash = r_hash.stdout.strip()
-            
-        r_date = subprocess.run(
+        candidate = result.stdout.strip() if result.returncode == 0 else ""
+        if re.fullmatch(r"[0-9a-fA-F]{7,40}", candidate):
+            short_hash = candidate[:7]
+        date_result = subprocess.run(
             ["git", "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M"],
             cwd=repo_dir, capture_output=True, text=True, timeout=2
         )
-        if r_date.returncode == 0 and r_date.stdout.strip():
-            commit_date = r_date.stdout.strip()
-    except Exception as e:
-        logger.warning(f"Error fetching dynamic git build info: {e}")
-        
+        if date_result.returncode == 0 and date_result.stdout.strip():
+            commit_date = date_result.stdout.strip()
+    except Exception as exc:
+        logger.debug("Git metadata unavailable; using installer metadata (%s)", type(exc).__name__)
+
+    if not short_hash:
+        candidates = [getattr(config, "BUILD_COMMIT", ""), os.getenv("BUILD_COMMIT", "")]
+        try:
+            build_info = Path(repo_dir, ".build_info").read_text(encoding="utf-8")
+            candidates.extend(re.findall(
+                r"(?im)^(?:commit|build_commit)\s*[=:]\s*([0-9a-f]{7,40})\s*$", build_info
+            ))
+            candidates.extend(re.findall(r"(?m)^([0-9a-f]{7,40})\s*$", build_info))
+        except OSError:
+            pass
+        for value in candidates:
+            candidate = str(value or "").strip()
+            if re.fullmatch(r"[0-9a-fA-F]{7,40}", candidate):
+                short_hash = candidate[:7]
+                break
+    if not short_hash:
+        short_hash = "not-recorded"
     return {
-        "version": version,
-        "branch": branch,
-        "short_hash": short_hash,
-        "commit_date": commit_date
+        "version": version, "branch": branch,
+        "short_hash": short_hash, "commit_date": commit_date,
     }
 
 async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message=False):

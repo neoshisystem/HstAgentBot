@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# HstAgentBot pre-production installer v1.1.0
+# HstAgentBot Plug-and-Play installer v1.2.0
 set -Eeuo pipefail
 umask 027
 
-readonly INSTALLER_VERSION="1.1.0"
+readonly INSTALLER_VERSION="1.2.0"
 readonly REPO_URL="https://github.com/neoshisystem/HstAgentBot.git"
 REPO_REF="${HSTAGENTBOT_GIT_REF:-recovery/scope-1}"
 readonly LOCK_FILE="/run/lock/hstagentbot-installer.lock"
 readonly LOG_FILE="/var/log/hstagentbot-installer.log"
-readonly SERVICE_NAME="hstagentbot"
+SERVICE_NAME="${HSTAGENTBOT_SERVICE_NAME:-hstagentbot}"
 readonly SERVICE_USER="hstagentbot"
 readonly SERVICE_GROUP="hstagentbot"
 readonly DEFAULT_INSTALL_DIR="/opt/hstagentbot"
 INSTALL_DIR="${HSTAGENTBOT_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 VENV_DIR=""
+SYSTEM_PYTHON=""
+FRESH_INSTALL=0
+ADVANCED=0
 SKIP_TESTS=0
 CHECK_ONLY=0
 UPDATE_APPROVED=0
@@ -41,31 +44,39 @@ print_banner() {
 
 usage() {
     cat <<'USAGE'
-HstAgentBot installer v1.1.0
+HstAgentBot installer v1.2.0
 
 Usage:
   sudo bash hstagentbot-installer.sh [options]
 
 Options:
-  --help          Show help and exit.
-  --check-only    Verify host prerequisites and an existing checkout without installing.
-  --skip-tests    Skip compileall, base pytest, and migration smoke test.
-  --update        Approve a safe update of an existing clean checkout without prompting.
-  --ref REF       Install a branch, tag, or commit reference (default: recovery/scope-1).
+  --help                 Show help and exit.
+  --check-only           Verify host prerequisites and an existing checkout without installing.
+  --skip-tests           Skip compileall, base pytest, and migration smoke test.
+  --update               Approve a safe update of an existing clean checkout without prompting.
+  --ref REF              Install a branch, tag, or commit reference (default: recovery/scope-1).
+  --service-name NAME    Install the systemd service under NAME.
+  --advanced             Ask for optional legacy topic and subscription settings.
 
 Environment:
   HSTAGENTBOT_INSTALL_DIR  Installation directory (default: /opt/hstagentbot)
   HSTAGENTBOT_GIT_REF      Default Git ref; overridden by --ref.
+  HSTAGENTBOT_SERVICE_NAME Default service name; overridden by --service-name.
+
+Fresh installs ask only for install path, bot token, numeric admin ID and report group
+ID (default 0). v5.2 migrations and UI are enabled automatically.
 
 Examples:
   sudo bash scripts/hstagentbot-installer.sh
-  sudo bash scripts/hstagentbot-installer.sh --ref recovery/scope-1
+  sudo bash scripts/hstagentbot-installer.sh --service-name hstagentbot-v52
+  sudo bash scripts/hstagentbot-installer.sh --advanced --ref recovery/scope-1
   curl -fsSL https://raw.githubusercontent.com/neoshisystem/HstAgentBot/recovery/scope-1/scripts/hstagentbot-installer.sh | sudo bash
 
-Interactive input is read from /dev/tty where available, so curl | sudo bash
-can still request confirmation and configuration values.
+Interactive input is read from /dev/tty where available, including curl | sudo bash.
 USAGE
 }
+
+
 
 parse_args() {
     while (($#)); do
@@ -74,6 +85,14 @@ parse_args() {
             --check-only) CHECK_ONLY=1; shift ;;
             --skip-tests) SKIP_TESTS=1; shift ;;
             --update) UPDATE_APPROVED=1; shift ;;
+            --advanced) ADVANCED=1; shift ;;
+            --service-name)
+                (($# >= 2)) || die "--service-name requires a name"
+                [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,62}$ ]] ||
+                    die "Invalid service name: $2"
+                SERVICE_NAME="${2%.service}"
+                shift 2
+                ;;
             --ref)
                 (($# >= 2)) || die "--ref requires a Git reference"
                 [[ -n "$2" ]] || die "--ref cannot be empty"
@@ -83,7 +102,11 @@ parse_args() {
             *) die "Unknown option: $1 (use --help)" ;;
         esac
     done
+    [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,62}$ ]] ||
+        die "Invalid service name: $SERVICE_NAME"
 }
+
+
 
 read_input() {
     local target="$1" prompt="$2" value=""
@@ -168,6 +191,7 @@ prompt_install_paths() {
 }
 verify_existing_checkout_is_safe() {
     [[ -d "$INSTALL_DIR/.git" ]] || die "Target exists but is not a Git checkout: $INSTALL_DIR"
+    git config --system --add safe.directory "$INSTALL_DIR" || true
     local origin dirty
     origin="$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
     case "$origin" in
@@ -190,12 +214,16 @@ checkout_source() {
         git -C "$INSTALL_DIR" checkout --detach --force FETCH_HEAD
         git -C "$INSTALL_DIR" reset --hard FETCH_HEAD
     else
+        FRESH_INSTALL=1
         install -d -m 0755 "$(dirname "$INSTALL_DIR")"
         git clone --no-checkout "$REPO_URL" "$INSTALL_DIR"
         git -C "$INSTALL_DIR" fetch --depth 1 origin "$REPO_REF"
         git -C "$INSTALL_DIR" checkout --detach FETCH_HEAD
     fi
+    git config --system --add safe.directory "$INSTALL_DIR" || true
     REPO_HEAD="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
+    printf '%s\n' "$REPO_HEAD" > "$INSTALL_DIR/.build_info"
+    chmod 0644 "$INSTALL_DIR/.build_info"
     REPO_TREE="$(git -C "$INSTALL_DIR" rev-parse 'HEAD^{tree}')"
     log "Resolved HEAD=$REPO_HEAD"
     log "Resolved tree=$REPO_TREE"
@@ -214,6 +242,22 @@ verify_source_contract() {
     [[ "$count" -eq 18 ]] || die "Expected exactly 18 SQL migrations, found $count"
     log "Required paths PASS; migrations=$count/18"
 }
+select_python() {
+    local candidate resolved
+    if [[ -x /usr/bin/python3 ]]; then
+        candidate="/usr/bin/python3"
+    else
+        candidate="$(command -v python3 2>/dev/null || true)"
+    fi
+    [[ -n "$candidate" && -x "$candidate" ]] || die "No usable Python 3 interpreter found"
+    resolved="$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")"
+    case "$resolved" in
+        /root/*|/home/*) die "Refusing Python interpreter inside a protected home directory: $resolved" ;;
+    esac
+    [[ "$resolved" = /* && -x "$resolved" ]] || die "Selected Python interpreter is not executable"
+    SYSTEM_PYTHON="$resolved"
+    log "Selected system Python: $SYSTEM_PYTHON"
+}
 ensure_service_account() {
     step 4 "Create restricted service account and Python environment"
     if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -223,11 +267,16 @@ ensure_service_account() {
     local service_shell
     service_shell="$(getent passwd "$SERVICE_USER" | cut -d: -f7)"
     [[ "$service_shell" == "/usr/sbin/nologin" ]] || die "$SERVICE_USER must use /usr/sbin/nologin"
+    select_python
     VENV_DIR="$INSTALL_DIR/.venv"
-    [[ -x "$VENV_DIR/bin/python" ]] || python3 -m venv "$VENV_DIR"
+    [[ -x "$VENV_DIR/bin/python" ]] || "$SYSTEM_PYTHON" -m venv "$VENV_DIR"
     "$VENV_DIR/bin/python" -m pip install --upgrade pip
     "$VENV_DIR/bin/python" -m pip install -r "$INSTALL_DIR/requirements.txt" pytest
+    chmod -R a+rX "$VENV_DIR"
 }
+
+
+
 get_env_value() {
     local key="$1" file="$2"
     [[ -f "$file" ]] || return 0
@@ -268,8 +317,8 @@ validate_telegram_token() {
     return 1
 }
 configure_environment() {
-    step 5 "Create or preserve protected environment settings"
-    local env_file="$INSTALL_DIR/.env" encryption_key admin_id
+    step 5 "Configure Telegram credentials and v5.2 Plug-and-Play defaults"
+    local env_file="$INSTALL_DIR/.env" encryption_key admin_id main_group_id selected key current
     if [[ ! -f "$env_file" ]]; then
         if [[ -f "$INSTALL_DIR/.env.example" ]]; then install -m 0640 "$INSTALL_DIR/.env.example" "$env_file"
         else install -m 0640 /dev/null "$env_file"
@@ -283,6 +332,7 @@ configure_environment() {
     else
         log "Preserving existing BACKUP_ENCRYPTION_KEY"
     fi
+
     BOT_TOKEN="$(get_env_value BOT_TOKEN "$env_file")"
     if [[ -n "$BOT_TOKEN" ]] && validate_token_format "$BOT_TOKEN"; then
         validate_telegram_token "$BOT_TOKEN" || BOT_TOKEN=""
@@ -302,16 +352,73 @@ configure_environment() {
         fi
     done
     set_env_value BOT_TOKEN "$BOT_TOKEN" "$env_file"
+
     admin_id="$(get_env_value ADMIN_TELEGRAM_ID "$env_file")"
-    if [[ -z "$admin_id" || "$admin_id" == "123456789" ]]; then
+    if [[ ! "$admin_id" =~ ^[1-9][0-9]{0,17}$ || "$admin_id" == "123456789" ]]; then
         read_input admin_id "Super Admin Telegram numeric ID: "
-        [[ "$admin_id" =~ ^-?[0-9]+$ ]] || die "ADMIN_TELEGRAM_ID must be numeric"
-        set_env_value ADMIN_TELEGRAM_ID "$admin_id" "$env_file"
+        [[ "$admin_id" =~ ^[1-9][0-9]{0,17}$ ]] || die "ADMIN_TELEGRAM_ID must be a positive numeric Telegram ID"
     fi
+    set_env_value ADMIN_TELEGRAM_ID "$admin_id" "$env_file"
+
+    main_group_id="$(get_env_value MAIN_GROUP_ID "$env_file")"
+    [[ "$main_group_id" =~ ^-?[0-9]+$ ]] || main_group_id="0"
+    selected=""
+    read_input selected "Report supergroup ID [$main_group_id; 0 to disable]: "
+    [[ -n "$selected" ]] && main_group_id="$selected"
+    [[ "$main_group_id" =~ ^-?[0-9]+$ ]] || die "MAIN_GROUP_ID must be numeric"
+    set_env_value MAIN_GROUP_ID "$main_group_id" "$env_file"
+
+    if ((ADVANCED == 1)); then
+        for key in OPERATIONAL_LOGS_TOPIC_ID BACKUPS_TOPIC_ID ADMIN_DM_LOGS_TOPIC_ID REP_LOGS_TOPIC_ID SANDBOX_GROUP_ID; do
+            current="$(get_env_value "$key" "$env_file")"
+            [[ "$current" =~ ^-?[0-9]+$ ]] || current="0"
+            selected=""
+            read_input selected "$key [$current]: "
+            [[ -n "$selected" ]] && current="$selected"
+            [[ "$current" =~ ^-?[0-9]+$ ]] || die "$key must be numeric"
+            set_env_value "$key" "$current" "$env_file"
+        done
+        local sub_domain sub_port sub_path
+        sub_domain="$(get_env_value SUB_DOMAIN "$env_file")"
+        sub_port="$(get_env_value SUB_PORT "$env_file")"
+        sub_path="$(get_env_value SUB_PATH "$env_file")"
+        [[ -n "$sub_port" ]] || sub_port="443"
+        [[ -n "$sub_path" ]] || sub_path="sub"
+        selected=""
+        read_input selected "SUB_DOMAIN [$sub_domain]: "
+        [[ -n "$selected" ]] && sub_domain="$selected"
+        set_env_value SUB_DOMAIN "$sub_domain" "$env_file"
+        selected=""
+        read_input selected "SUB_PORT [$sub_port]: "
+        [[ -n "$selected" ]] && sub_port="$selected"
+        [[ "$sub_port" =~ ^[0-9]+$ ]] || die "SUB_PORT must be numeric"
+        set_env_value SUB_PORT "$sub_port" "$env_file"
+        selected=""
+        read_input selected "SUB_PATH [$sub_path]: "
+        [[ -n "$selected" ]] && sub_path="$selected"
+        set_env_value SUB_PATH "$sub_path" "$env_file"
+    elif ((FRESH_INSTALL == 1)); then
+        # Do not carry project-specific v4 IDs or subscription settings into a clean install.
+        set_env_value OPERATIONAL_LOGS_TOPIC_ID "0" "$env_file"
+        set_env_value BACKUPS_TOPIC_ID "0" "$env_file"
+        set_env_value ADMIN_DM_LOGS_TOPIC_ID "0" "$env_file"
+        set_env_value REP_LOGS_TOPIC_ID "0" "$env_file"
+        set_env_value SANDBOX_GROUP_ID "0" "$env_file"
+        set_env_value SUB_DOMAIN "" "$env_file"
+        set_env_value SUB_PORT "443" "$env_file"
+        set_env_value SUB_PATH "sub" "$env_file"
+    fi
+
+    set_env_value V52_MIGRATIONS_ENABLED "1" "$env_file"
+    set_env_value V52_UI_ENABLED "1" "$env_file"
+    set_env_value BUILD_COMMIT "$REPO_HEAD" "$env_file"
     chmod 0640 "$env_file"
     chown root:"$SERVICE_GROUP" "$env_file"
-    log ".env mode=0640 owner=root:$SERVICE_GROUP"
+    log ".env mode=0640 owner=root:$SERVICE_GROUP; v5.2 migrations/UI enabled"
 }
+
+
+
 run_migration_smoke_test() {
     local smoke_dir smoke_db smoke_backups
     smoke_dir="$(mktemp -d /tmp/hstagentbot-migration-smoke.XXXXXX)"
@@ -390,7 +497,7 @@ run_project_tests() {
     (
         cd "$INSTALL_DIR"
         "$VENV_DIR/bin/python" -m compileall -q .
-        env V52_MIGRATIONS_ENABLED=0 DB_PATH="$test_dir/test.db" BACKUP_DIR="$test_dir/backups" \
+        env V52_MIGRATIONS_ENABLED=0 BACKUP_ENCRYPTION_KEY="" HSTAGENTBOT_INTEGRATIONS_PATH="" DB_PATH="$test_dir/test.db" BACKUP_DIR="$test_dir/backups" \
             "$VENV_DIR/bin/python" -m pytest -p no:cacheprovider -q .
     )
     rm -rf "$test_dir"
@@ -402,7 +509,7 @@ resolve_database_path() {
     (cd "$INSTALL_DIR" && "$VENV_DIR/bin/python" -c "import database; print(database.DB_PATH)")
 }
 backup_existing_database() {
-    step 9 "Back up existing SQLite database and apply migrations"
+    step 9 "Back up existing SQLite database, apply migrations and seed v5.2"
     local db_path backup_file
     db_path="$(resolve_database_path)"
     if [[ -f "$db_path" ]]; then
@@ -436,10 +543,33 @@ PY
     install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$INSTALL_DIR/backups"
     (
         cd "$INSTALL_DIR"
-        env V52_MIGRATIONS_ENABLED=1 "$VENV_DIR/bin/python" -c \
-            "import database; database.init_db(); print('database.init_db(): migrations enabled')"
+        env V52_MIGRATIONS_ENABLED=1 V52_UI_ENABLED=1 "$VENV_DIR/bin/python" - <<'PY'
+import asyncio
+import config
+import database
+from telegram import Bot
+
+async def bootstrap():
+    bot = Bot(token=config.BOT_TOKEN)
+    await bot.initialize()
+    try:
+        me = await bot.get_me()
+        result = database.bootstrap_v52_installation(
+            bot_id=int(me.id), username=str(getattr(me, "username", "") or ""),
+            token=config.BOT_TOKEN,
+        )
+        print("v5.2 installation bootstrap PASS", result)
+    finally:
+        await bot.shutdown()
+
+database.init_db()
+asyncio.run(bootstrap())
+PY
     )
 }
+
+
+
 write_systemd_unit() {
     local unit="/etc/systemd/system/$SERVICE_NAME.service"
     cat > "$unit" <<UNIT
@@ -492,6 +622,7 @@ apply_permissions() {
     chown -R root:root "$VENV_DIR"
     find "$VENV_DIR" -type d -exec chmod 0755 {} +
     find "$VENV_DIR" -type f -exec chmod go-w {} +
+    chmod -R a+rX "$VENV_DIR"
 
     # Existing database, backup, and log files must remain writable by the
     # restricted service account, not merely their parent directories.

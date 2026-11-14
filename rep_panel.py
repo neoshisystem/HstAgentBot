@@ -32,11 +32,13 @@ logger = logging.getLogger("RepPanel")
 
 
 def _v52_ui_enabled() -> bool:
+    enabled = {"1", "true", "yes", "on", "enabled"}
     try:
         value = database.get_setting("v52_ui_enabled", "0")
     except Exception:
         value = "0"
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    environment = os.getenv("V52_UI_ENABLED", os.getenv("V52_MIGRATIONS_ENABLED", "0"))
+    return str(value).strip().lower() in enabled or str(environment).strip().lower() in enabled
 
 
 async def _dispatch_v52_from_rep(update, context, rep):
@@ -57,30 +59,24 @@ def _build_account_keyboard(account_code: str, user_id: int, **kwargs):
 
 
 def build_rep_main_keyboard() -> InlineKeyboardMarkup:
-    """Builds the main interactive dashboard for a representative."""
-    keyboard = [
-        [
-            InlineKeyboardButton("🆕 صدور اکانت جدید", callback_data="rep:new_acc_plans"),
-            InlineKeyboardButton("📋 لیست اکانت‌های من", callback_data="rep:acc_list:all:1"),
-        ],
-        [
-            InlineKeyboardButton("🔍 جستجو و استعلام اکانت", callback_data="rep:prompt_search"),
-            InlineKeyboardButton("💰 کیف پول و صورت‌حساب", callback_data="rep:wallet"),
-        ],
-        [
-            InlineKeyboardButton("⏳ صف بسته‌های رزرو من", callback_data="rep:reserves"),
-            InlineKeyboardButton("📊 آمار کلی اکانت‌ها", callback_data="rep:stats"),
-        ],
-        [
-            InlineKeyboardButton("🏷 تعرفه‌های همکاری", callback_data="rep:pricing"),
-        ]
-    ]
+    """Build the representative workspace with v5.2 sales, profiles and support."""
     if _v52_ui_enabled():
-        keyboard.extend([[InlineKeyboardButton("👥 زیرنمایندگان", callback_data="v52:subreps:1"),
-                          InlineKeyboardButton("👤 پروفایل‌ها", callback_data="v52:profiles")],
-                         [InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")]])
-    return InlineKeyboardMarkup(keyboard)
-
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 سرویس‌های من", callback_data="rep:acc_list:all:1"),
+             InlineKeyboardButton("🆕 صدور سرویس", callback_data="rep:new_acc_plans")],
+            [InlineKeyboardButton("👤 پروفایل‌ها", callback_data="v52:profiles"),
+             InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
+            [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets")],
+        ])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 صدور اکانت جدید", callback_data="rep:new_acc_plans"),
+         InlineKeyboardButton("📋 لیست اکانت‌های من", callback_data="rep:acc_list:all:1")],
+        [InlineKeyboardButton("🔍 جستجو و استعلام اکانت", callback_data="rep:prompt_search"),
+         InlineKeyboardButton("💰 کیف پول و صورت‌حساب", callback_data="rep:wallet")],
+        [InlineKeyboardButton("⏳ صف بسته‌های رزرو من", callback_data="rep:reserves"),
+         InlineKeyboardButton("📊 آمار کلی اکانت‌ها", callback_data="rep:stats")],
+        [InlineKeyboardButton("🏷 تعرفه‌های همکاری", callback_data="rep:pricing")],
+    ])
 
 def build_back_to_rep_keyboard(extra_buttons=None, back_callback="rep:main") -> InlineKeyboardMarkup:
     """Builds two-tier navigation back button returning to previous step or representative dashboard."""

@@ -62,7 +62,10 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:bot:([1-9][0-9]{0,17})$"), "begin_register_bot", "root", lambda m: {"rep_id": int(m[1])}),
     (re.compile(r"^v52:domain:([1-9][0-9]{0,17})$"), "begin_register", "same rep/root", lambda m: {"rep_id": int(m[1])}),
     (re.compile(r"^v52:panel:([1-9][0-9]{0,17})$"), "show_panel", "root", lambda m: {"panel_id": int(m[1])}),
-    (re.compile(r"^v52:life:([1-9][0-9]{0,17}):(active|capacity|drain|maintenance)$"), "preview_lifecycle", "root", lambda m: {"panel_id": int(m[1]), "lifecycle": m[2]}),
+    (re.compile(r"^v52:panelconfig:([1-9][0-9]{0,17})$"), "begin_panel_config", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:paneltest:([1-9][0-9]{0,17})$"), "test_panel_connection", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:life:([1-9][0-9]{0,17}):(active|sold_out|hidden|drain|maintenance)$"), "preview_lifecycle", "root", lambda m: {"panel_id": int(m[1]), "lifecycle": m[2]}),
+    (re.compile(r"^v52:life-confirm:([1-9][0-9]{0,17}):(active|sold_out|hidden|drain|maintenance)$"), "confirm_lifecycle", "root", lambda m: {"panel_id": int(m[1]), "lifecycle": m[2]}),
     (re.compile(r"^v52:buy:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "preview_buy", "seller route", lambda m: {"plan_code": m[1]}),
     (re.compile(r"^v52:renew:([1-9][0-9]{0,17}):([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "preview_renew", "manager/owner/seller/root", lambda m: {"account_id": int(m[1]), "plan_code": m[2]}),
     (re.compile(r"^v52:addon:([1-9][0-9]{0,17}):(gib|day)$"), "begin_addon", "owner/seller/root", lambda m: {"account_id": int(m[1]), "addon_type": m[2]}),
@@ -71,6 +74,7 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:shop$"), "show_catalog", "actor", lambda m: {}),
     (re.compile(r"^v52:goods:([1-9][0-9]{0,17})$"), "preview_product", "actor+seller", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:fulfill:([A-Za-z0-9._:-]{1,36})$"), "prepare_manual_delivery", "assigned seller/root", lambda m: {"order_id": m[1]}),
+    (re.compile(r"^v52:tickets$"), "list_tickets", "actor", lambda m: {}),
     (re.compile(r"^v52:support:([0-9]{1,18})$"), "begin_ticket", "view authorized", lambda m: {"account_id": int(m[1])}),
     (re.compile(r"^v52:abuse$"), "begin_abuse", "all actors; private root destination", lambda m: {}),
     (re.compile(r"^v52:ticket:([A-Za-z0-9_-]{1,32})$"), "reply_or_escalate", "ticket scope", lambda m: {"ticket_id": m[1]}),
@@ -134,6 +138,7 @@ class DraftFSM:
         bot_id, tg_id, chat_id = _identity(context)
         selected = str(state or "")
         if selected not in {"goods_manual_secret", "support_ticket_body", "support_reply",
+                            "panel_connection_url", "panel_connection_token",
                             "inventory_manual_batch", "inventory_digital_batch"}:
             raise ValueError("unknown v5.2 FSM state")
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:
@@ -158,6 +163,7 @@ class DraftFSM:
         if entry is None:
             return None
         accepted = {"text": {"goods_manual_secret", "support_ticket_body", "support_reply",
+                             "panel_connection_url", "panel_connection_token",
                              "inventory_manual_batch", "inventory_digital_batch"},
                     "photo": {"support_ticket_body", "support_reply"}}
         if event not in accepted or entry.state not in accepted[event]:

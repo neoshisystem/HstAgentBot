@@ -32,11 +32,13 @@ logger = logging.getLogger("UserPortal")
 
 
 def _v52_ui_enabled() -> bool:
+    enabled = {"1", "true", "yes", "on", "enabled"}
     try:
         value = database.get_setting("v52_ui_enabled", "0")
     except Exception:
         value = "0"
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    environment = os.getenv("V52_UI_ENABLED", os.getenv("V52_MIGRATIONS_ENABLED", "0"))
+    return str(value).strip().lower() in enabled or str(environment).strip().lower() in enabled
 
 
 async def _dispatch_v52_from_portal(update, context, role="end_user", rep=None):
@@ -65,25 +67,23 @@ async def _show_legacy_reset_preview(update, context, owned_account):
 
 
 def build_user_portal_keyboard() -> InlineKeyboardMarkup:
-    """Builds the main interactive portal keyboard for an end-user."""
-    keyboard = [
-        [
-            InlineKeyboardButton("📱 سرویس‌های من", callback_data="user:services"),
-            InlineKeyboardButton("🛒 خرید سرویس جدید", callback_data="user:buy_service"),
-        ],
-        [
-            InlineKeyboardButton("💳 کیف پول و شارژ حساب", callback_data="user:wallet"),
-            InlineKeyboardButton("🔗 اتصال اکانت به تلگرام", callback_data="user:prompt_link"),
-        ],
-        [
-            InlineKeyboardButton("📋 تعرفه‌ها و قیمت‌ها", callback_data="user:pricing"),
-        ]
-    ]
+    """Build a focused consumer workspace after the v5.2 rollout."""
     if _v52_ui_enabled():
-        keyboard.append([InlineKeyboardButton("👥 پروفایل‌های من", callback_data="v52:profiles"),
-                         InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")])
-    return InlineKeyboardMarkup(keyboard)
-
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 سرویس‌های من", callback_data="user:services"),
+             InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
+            [InlineKeyboardButton("👤 پروفایل‌های اشتراک", callback_data="v52:profiles"),
+             InlineKeyboardButton("💳 کیف پول", callback_data="user:wallet")],
+            [InlineKeyboardButton("🎫 تیکت‌های من", callback_data="v52:tickets"),
+             InlineKeyboardButton("🔐 گزارش محرمانه", callback_data="v52:abuse")],
+        ])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📱 سرویس‌های من", callback_data="user:services"),
+         InlineKeyboardButton("🛒 خرید سرویس جدید", callback_data="user:buy_service")],
+        [InlineKeyboardButton("💳 کیف پول و شارژ حساب", callback_data="user:wallet"),
+         InlineKeyboardButton("🔗 اتصال اکانت به تلگرام", callback_data="user:prompt_link")],
+        [InlineKeyboardButton("📋 تعرفه‌ها و قیمت‌ها", callback_data="user:pricing")],
+    ])
 
 def build_back_to_user_keyboard(extra_buttons=None, back_callback="user:main") -> InlineKeyboardMarkup:
     """Builds two-tier navigation back button returning to previous step or user portal."""
@@ -138,6 +138,14 @@ async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         "👇 لطفاً بخش مورد نظر خود را انتخاب نمایید:"
     )
     keyboard = build_user_portal_keyboard()
+    if _v52_ui_enabled():
+        for account in linked_accs:
+            account_id = account.get("id") if isinstance(account, dict) else None
+            if isinstance(account_id, int) and account_id > 0:
+                label = str(account.get("account_code") or f"سرویس {account_id}")[:20]
+                keyboard.inline_keyboard.append([
+                    InlineKeyboardButton(f"🎫 تیکت {label}", callback_data=f"v52:support:{account_id}")
+                ])
 
     if edit_message and update.callback_query:
         try:

@@ -213,6 +213,7 @@ def preview_lifecycle(
             for label, value in (("فعال", "active"), ("فروش‌متوقف", "sold_out"),
                                  ("پنهان", "hidden"), ("Drain", "drain"),
                                  ("تعمیرات", "maintenance"))]
+    rows.append([button("تأیید تغییر وضعیت", f"v52:life-confirm:{exact_id}:{state}")])
     return render_page("پیش‌نمایش چرخهٔ عمر پنل", body, persona=persona,
                        page_kind="preview", parent_callback=parent_callback, rows=rows)
 

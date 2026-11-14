@@ -3,6 +3,7 @@ import sys
 import sqlite3
 import asyncio
 import inspect
+import hmac
 from concurrent.futures import ThreadPoolExecutor
 import json
 import secrets
@@ -678,6 +679,240 @@ def init_db():
                 os.path.dirname(os.path.abspath(__file__)), "migrations"
             )
             apply_migrations(conn, migration_dir, now=int(time.time()))
+
+def bootstrap_v52_installation(*, bot_id: int, username: str, token: str) -> dict:
+    """Idempotently seed v5.2 policies, the primary bot, root identity and default panel."""
+    if isinstance(bot_id, bool) or not isinstance(bot_id, int) or bot_id <= 0:
+        raise ValueError("Telegram getMe bot_id must be a positive integer")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("BOT_TOKEN is required for v5.2 bootstrap")
+    if str(os.getenv("V52_MIGRATIONS_ENABLED", "")).strip().lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        raise RuntimeError("v5.2 migrations must be enabled before installation bootstrap")
+
+    from crypto_store import encrypt_secret, decrypt_secret
+    from policy_registry import seed_approved_policies, seed_tier_defaults, seed_feature_defaults
+    import identity_service
+    import bootstrap_profiles
+
+    root_id = int(ADMIN_TELEGRAM_ID or 0)
+    if root_id <= 0:
+        raise RuntimeError("ADMIN_TELEGRAM_ID must be configured before v5.2 bootstrap")
+    token_value = token.strip()
+    token_cipher = encrypt_secret(token_value, "hstagent/columns/v1")
+    now = int(time.time())
+
+    def fill_required(columns, defaults):
+        values = dict(defaults)
+        for column in columns:
+            name = str(column["name"])
+            if name in values or bool(column["pk"]):
+                continue
+            if bool(column["notnull"]) and column["dflt_value"] is None:
+                kind = str(column["type"] or "").upper()
+                if name in {"created_at", "updated_at", "verified_at"}:
+                    values[name] = now
+                elif name.endswith("_json") or name.endswith("_json_text"):
+                    values[name] = "{}"
+                elif "INT" in kind or "REAL" in kind or "NUM" in kind:
+                    values[name] = 0
+                else:
+                    values[name] = ""
+        return values
+
+    with get_db() as conn:
+        seed_approved_policies(conn)
+        seed_tier_defaults(conn)
+        seed_feature_defaults(conn)
+
+        panels_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='panels'"
+        ).fetchone()
+        if panels_exists is None:
+            raise RuntimeError("panels table is missing after v5.2 migrations")
+        panel_count = int(conn.execute("SELECT COUNT(*) FROM panels").fetchone()[0])
+        if panel_count == 0:
+            columns = conn.execute("PRAGMA table_info(panels)").fetchall()
+            defaults = {
+                "panel_code": "default-panel",
+                "name": "پنل اصلی (نیازمند تنظیم اتصال)",
+                "panel_type": "3x-ui",
+                "lifecycle": "maintenance",
+                "is_default": 1,
+                "raw_url": "",
+                "base_url": "",
+                "base_path": "",
+                "auth_cipher": "",
+                "api_token_cipher": "",
+                "adapter_version": "xui-openapi-v1",
+                "revision": 1,
+                "is_active": 0,
+                "enabled": 0,
+                "deleted_at": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            values = fill_required(columns, defaults)
+            names = [str(c["name"]) for c in columns if str(c["name"]) in values]
+            required = {"panel_code", "name", "panel_type", "lifecycle", "is_default"}
+            if not required.issubset(names):
+                raise RuntimeError("panels schema cannot store the approved default-panel record")
+            conn.execute(
+                f"INSERT INTO panels({','.join(names)}) VALUES({','.join('?' for _ in names)})",
+                tuple(values[name] for name in names),
+            )
+
+        default_panel = conn.execute(
+            "SELECT id FROM panels WHERE panel_code='default-panel' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if default_panel is None:
+            default_panel = conn.execute(
+                "SELECT id FROM panels WHERE is_default=1 ORDER BY id LIMIT 1"
+            ).fetchone()
+        if default_panel is None:
+            raise RuntimeError("the installation has no resolvable default panel")
+        default_panel_id = int(default_panel["id"])
+
+        relation_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='plan_panels'"
+        ).fetchone()
+        if relation_exists is None:
+            raise RuntimeError("plan_panels table is missing after v5.2 migrations")
+        relation_columns = conn.execute("PRAGMA table_info(plan_panels)").fetchall()
+        relation_defaults = fill_required(relation_columns, {
+            "panel_id": default_panel_id, "plan_code": "",
+            "active": 1, "is_active": 1, "enabled": 1, "sale_enabled": 1,
+            "revision": 1, "created_at": now, "updated_at": now,
+        })
+        relation_names = [str(c["name"]) for c in relation_columns
+                          if str(c["name"]) in relation_defaults]
+        if not {"panel_id", "plan_code"}.issubset(relation_names):
+            raise RuntimeError("plan_panels schema is missing panel_id/plan_code")
+        plans = conn.execute(
+            "SELECT plan_code FROM pricing_plans ORDER BY sort_order,plan_code"
+        ).fetchall()
+        for plan in plans:
+            relation_values = dict(relation_defaults)
+            relation_values["plan_code"] = str(plan["plan_code"])
+            conn.execute(
+                f"INSERT OR IGNORE INTO plan_panels({','.join(relation_names)}) "
+                f"VALUES({','.join('?' for _ in relation_names)})",
+                tuple(relation_values[name] for name in relation_names),
+            )
+
+        existing = conn.execute(
+            "SELECT bot_id,is_primary,token_cipher,status FROM bot_registry WHERE bot_id=?",
+            (bot_id,),
+        ).fetchone()
+        if existing is None:
+            primary = conn.execute(
+                "SELECT bot_id FROM bot_registry WHERE is_primary=1 ORDER BY bot_id LIMIT 1"
+            ).fetchone()
+            if primary is not None:
+                raise RuntimeError("a different primary bot is already registered; refusing to replace it")
+            conn.execute(
+                "INSERT INTO bot_registry(bot_id,rep_id,is_primary,token_cipher,username,status,verified_at,revision) "
+                "VALUES(?,NULL,1,?,?,'active',?,1)",
+                (bot_id, token_cipher, str(username or "").strip(), now),
+            )
+        else:
+            if not bool(existing["is_primary"]) or str(existing["status"]).lower() != "active":
+                raise RuntimeError("Telegram getMe identity conflicts with an existing non-active primary record")
+            try:
+                saved_token = decrypt_secret(str(existing["token_cipher"]), "hstagent/columns/v1")
+            except Exception:
+                raise RuntimeError("the existing primary bot credential cannot be verified") from None
+            if not hmac.compare_digest(token_value, saved_token):
+                raise RuntimeError("BOT_TOKEN does not match the registered primary bot")
+
+        identity = identity_service.ensure_personal_identity(conn, root_id)
+        profiles = bootstrap_profiles.backfill_profiles(conn)
+        conn.execute(
+            "INSERT INTO system_settings(key,value) VALUES('v52_ui_enabled','1') "
+            "ON CONFLICT(key) DO UPDATE SET value='1'"
+        )
+        conn.commit()
+
+    return {
+        "bot_id": bot_id, "primary_registered": True,
+        "root_rep_id": int(identity["root_rep_id"]),
+        "profiles_created": int(profiles["profiles_created"]),
+        "default_panel_id": default_panel_id,
+    }
+
+
+def update_panel_connection(panel_id: int, raw_url: str, api_token: str) -> dict:
+    """Store a normalized panel URL and its encrypted API credential."""
+    from crypto_store import encrypt_secret
+    from panel_adapters.url_parser import parse_panel_url
+
+    if isinstance(panel_id, bool) or not isinstance(panel_id, int) or panel_id <= 0:
+        raise ValueError("panel_id must be a positive integer")
+    if not isinstance(api_token, str) or not api_token.strip():
+        raise ValueError("panel API token is required")
+    endpoint = parse_panel_url(raw_url)
+    cipher = encrypt_secret(api_token.strip(), "hstagent/columns/v1")
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM panels WHERE id=?", (panel_id,)).fetchone()
+        if row is None:
+            raise ValueError("panel does not exist")
+        available = {str(c["name"]) for c in conn.execute("PRAGMA table_info(panels)").fetchall()}
+        updates = {}
+        if "raw_url" in available:
+            updates["raw_url"] = endpoint.normalized_url
+        if "base_url" in available:
+            updates["base_url"] = endpoint.normalized_url
+        if "base_path" in available:
+            updates["base_path"] = endpoint.base_path
+        if "auth_cipher" in available:
+            updates["auth_cipher"] = cipher
+        if "api_token_cipher" in available:
+            updates["api_token_cipher"] = cipher
+        if not ({"raw_url", "base_url"} & available) or not ({"auth_cipher", "api_token_cipher"} & available):
+            raise RuntimeError("panel schema has no supported URL/encrypted-token columns")
+        if "revision" in available:
+            updates["revision"] = int(row["id"])  # overwritten atomically below
+            conn.execute("UPDATE panels SET revision=revision+1 WHERE id=?", (panel_id,))
+            updates.pop("revision", None)
+        if "updated_at" in available:
+            updates["updated_at"] = int(time.time())
+        assignments = ",".join(f"{column}=?" for column in updates)
+        conn.execute(f"UPDATE panels SET {assignments} WHERE id=?", (*updates.values(), panel_id))
+        lifecycle = conn.execute("SELECT lifecycle FROM panels WHERE id=?", (panel_id,)).fetchone()
+    return {"panel_id": panel_id, "url": endpoint.normalized_url,
+            "lifecycle": str(lifecycle["lifecycle"]), "credential_saved": True}
+
+
+def set_panel_lifecycle(panel_id: int, lifecycle: str) -> dict:
+    """Set the canonical lifecycle; activation requires saved connection details."""
+    allowed = {"active", "sold_out", "hidden", "drain", "maintenance"}
+    if isinstance(panel_id, bool) or not isinstance(panel_id, int) or panel_id <= 0:
+        raise ValueError("panel_id must be a positive integer")
+    state = str(lifecycle or "").strip().lower()
+    if state not in allowed:
+        raise ValueError("unsupported panel lifecycle")
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM panels WHERE id=?", (panel_id,)).fetchone()
+        if row is None:
+            raise ValueError("panel does not exist")
+        keys = set(row.keys())
+        if state == "active":
+            raw_url = row["raw_url"] if "raw_url" in keys else row["base_url"] if "base_url" in keys else ""
+            cipher = row["auth_cipher"] if "auth_cipher" in keys else row["api_token_cipher"] if "api_token_cipher" in keys else ""
+            if not raw_url or not cipher:
+                raise ValueError("configure the panel URL and encrypted API token before activation")
+        updates = ["lifecycle=?"]
+        values = [state]
+        if "revision" in keys:
+            updates.append("revision=revision+1")
+        if "updated_at" in keys:
+            updates.append("updated_at=?")
+            values.append(int(time.time()))
+        values.append(panel_id)
+        conn.execute(f"UPDATE panels SET {','.join(updates)} WHERE id=?", tuple(values))
+    return {"panel_id": panel_id, "lifecycle": state}
+
 
 # --- Dynamic System Settings Management ---
 
