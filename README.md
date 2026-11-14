@@ -5,14 +5,19 @@ An asynchronous, high-performance Telegram Bot built with Python (`python-telegr
 ## Features
 
 - **Multi-tier Role Architecture**:
-  - **Super Admin**: Full operational control, balance adjustments, database and client audits, plan pricing management.
-  - **Representatives (Resellers)**: Dedicated topic/DM management, client isolation, credit limits, automated invoicing.
-  - **End-Users**: Self-service subscription lookup, direct link access, usage status reporting.
-- **Smart Queue & Reservation**:
+  - **Super Admin**: Full operational control, balance adjustments, database and client audits, plan pricing management, card-to-card receipt review (`[✅ Approve]` / `[❌ Reject]`).
+  - **Representatives (Resellers)**: Dedicated topic/DM management, client isolation, credit limits, automated invoicing, debt settlement via receipt submission.
+  - **End-Users**: Self-service subscription lookup, direct link access, usage status reporting, personal wallet top-up, and one-click subscription URL reset.
+- **Financial & Dual-Wallet Subsystem**:
+  - Card-to-card payment workflow with tracking codes and admin verification cards.
+  - Dual-wallet accounting: Representative balance/settlement & End-User personal wallet.
+  - Representative credit limit (`credit_limit_toman`) enforcement.
+- **Queue & Reservation**:
   - Direct renewal vs. queued reserve packages.
-  - Asynchronous background watchdog activating reserved plans when accounts hit traffic/time thresholds.
-- **Atomic Financial Ledger**:
-  - Full audit trail of credit/debit operations with transaction logging.
+  - The active background worker checks pending reservations and serializes activation against manual cancellation/activation.
+  - The separate early-warning monitor for expiring accounts is not implemented yet.
+- **Subscription Security & Identity Utilities**:
+  - Real-time subId regeneration to revoke compromised subscription links instantly.
 - **Zero Hardcoded Secrets**:
   - 100% generic codebase dynamically configured via `.env` and SQLite database tables.
 
@@ -42,6 +47,50 @@ An asynchronous, high-performance Telegram Bot built with Python (`python-telegr
    python database.py
    python rep_bot.py
    ```
+
+## Plug-and-Play installation (v1.2.0)
+
+For Ubuntu 24.04+ and Debian 12+, the repository includes a hardened Plug-and-Play installer. It verifies the checkout and the exact 18 SQL migration files, runs the base test suite with migration and integration secrets isolated, runs an isolated migration smoke test, bootstraps the primary v5.2 identity/panel/profile records, backs up an existing SQLite database through the SQLite Backup API, and installs a restricted systemd service. New installations ask only for the install path, bot token, numeric admin ID, and report group ID.
+
+**Quick Install:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/neoshisystem/HstAgentBot/recovery/scope-1/scripts/hstagentbot-installer.sh | sudo bash
+```
+
+To choose a different branch, tag, or commit:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/neoshisystem/HstAgentBot/recovery/scope-1/scripts/hstagentbot-installer.sh | sudo bash -s -- --ref recovery/scope-1
+```
+
+Full Persian deployment instructions, CLI options (including `--service-name` and `--advanced`), migration/test behavior, service management, and security guidance are available in [docs/INSTALLER_FA.md](docs/INSTALLER_FA.md).
+
+## External integrations
+
+The X-UI and backup helpers are server-side integrations and are not included in this repository. Set `HSTAGENTBOT_INTEGRATIONS_PATH` in `.env` to the trusted directory containing those modules. The application can start without the optional integration files being importable, but any operation that needs a missing integration will fail clearly.
+
+Set `SUB_DOMAIN`, `SUB_PORT` and `SUB_PATH` to the public subscription endpoint. The application does not invent a default public subscription domain.
+
+## Validation and operation recovery
+
+Run the automated checks locally with:
+
+```bash
+python -m compileall -q .
+python -m pytest -q
+```
+
+GitHub Actions runs the same compilation and test checks for pushes to the main, beta and recovery branches and for pull requests targeting main/beta.
+
+Some X-UI actions can time out after the external panel has already applied the request. In that case, the bot retains a persistent operation lock rather than blindly retrying and risking a duplicate change:
+
+- Super Admin: use `/operations` to inspect unresolved operation locks.
+- Inspect the exact client state in X-UI and reconcile local account/financial/reservation state.
+- Only after verifying the result, use `/unlock <operation-key> VERIFIED_NOT_APPLIED: <evidence>` or `/unlock <operation-key> RECONCILED: <evidence>`.
+- The unlock command only removes the bot-side hold and writes an audit record. It does not modify X-UI, balances or reservation state.
+
+Do not release an operation lock based only on elapsed time or a missing Telegram response.
 
 ## License
 MIT

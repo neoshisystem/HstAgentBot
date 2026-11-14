@@ -28,6 +28,10 @@ backups/
 *.zip
 *.bak
 
+# Runtime reports and logs
+INSTALL_REPORT.txt
+logs/
+
 # IDE & OS
 .vscode/
 .idea/
