@@ -67,6 +67,7 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:panel:([1-9][0-9]{0,17})$"), "show_panel", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:panelconfig:([1-9][0-9]{0,17})$"), "begin_panel_config", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:paneltest:([1-9][0-9]{0,17})$"), "test_panel_connection", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:panelauto:([1-9][0-9]{0,17})$"), "auto_activate_panel", "root", lambda m: {"panel_id": int(m[1])}),
     # Admin navigation surfaces emitted by the merged menus and the panel/bot
     # wizards. Every one of them must resolve to a bridge handler, otherwise the
     # button dead-ends in the "W18 bridge" error page.

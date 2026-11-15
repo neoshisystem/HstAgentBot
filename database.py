@@ -843,16 +843,23 @@ def bootstrap_v52_installation(*, bot_id: int, username: str, token: str) -> dic
 
 
 def update_panel_connection(panel_id: int, raw_url: str, api_token: str) -> dict:
-    """Store a normalized panel URL and its encrypted API credential."""
+    """Store a normalized panel URL and its encrypted credential.
+
+    The credential is classified first (API token, ``username:password`` or a
+    JSON object) so ``panels.auth_type`` always names the scheme the adapter must
+    use. The raw secret is never echoed back in the result.
+    """
     from crypto_store import encrypt_secret
+    from panel_adapters.credentials import classify_panel_credential
     from panel_adapters.url_parser import parse_panel_url
 
     if isinstance(panel_id, bool) or not isinstance(panel_id, int) or panel_id <= 0:
         raise ValueError("panel_id must be a positive integer")
     if not isinstance(api_token, str) or not api_token.strip():
         raise ValueError("panel API token is required")
+    credential = classify_panel_credential(api_token)
     endpoint = parse_panel_url(raw_url)
-    cipher = encrypt_secret(api_token.strip(), "hstagent/columns/v1")
+    cipher = encrypt_secret(credential.secret, "hstagent/columns/v1")
     with get_db() as conn:
         row = conn.execute("SELECT id FROM panels WHERE id=?", (panel_id,)).fetchone()
         if row is None:
@@ -869,6 +876,8 @@ def update_panel_connection(panel_id: int, raw_url: str, api_token: str) -> dict
             updates["auth_cipher"] = cipher
         if "api_token_cipher" in available:
             updates["api_token_cipher"] = cipher
+        if "auth_type" in available:
+            updates["auth_type"] = credential.kind
         if not ({"raw_url", "base_url"} & available) or not ({"auth_cipher", "api_token_cipher"} & available):
             raise RuntimeError("panel schema has no supported URL/encrypted-token columns")
         if "revision" in available:
@@ -881,7 +890,8 @@ def update_panel_connection(panel_id: int, raw_url: str, api_token: str) -> dict
         conn.execute(f"UPDATE panels SET {assignments} WHERE id=?", (*updates.values(), panel_id))
         lifecycle = conn.execute("SELECT lifecycle FROM panels WHERE id=?", (panel_id,)).fetchone()
     return {"panel_id": panel_id, "url": endpoint.normalized_url,
-            "lifecycle": str(lifecycle["lifecycle"]), "credential_saved": True}
+            "lifecycle": str(lifecycle["lifecycle"]), "credential_saved": True,
+            "auth_type": credential.kind}
 
 
 def set_panel_lifecycle(panel_id: int, lifecycle: str) -> dict:

@@ -243,6 +243,7 @@ def get_build_info() -> dict:
     }
 
 async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message=False):
+    from rep_bot import build_actor_navigation_keyboard
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat or chat.type != "private":
@@ -258,7 +259,10 @@ async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYP
         if update.callback_query:
             await update.callback_query.answer(notice, show_alert=True)
         elif update.message:
-            await update.message.reply_text(notice)
+            await update.message.reply_text(
+                notice,
+                reply_markup=build_actor_navigation_keyboard(role),
+            )
         return
 
     with database.get_db() as conn:
@@ -1968,7 +1972,10 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
         rep_code = admin_state.get("rep_code")
         rep_info = database.get_rep_by_code(rep_code)
         if not rep_info:
-            await update.message.reply_text("❌ نماینده یافت نشد.")
+            await update.message.reply_text(
+                "❌ نماینده یافت نشد.",
+                reply_markup=build_admin_main_keyboard(),
+            )
             context.user_data.pop("admin_state", None)
             return True
             

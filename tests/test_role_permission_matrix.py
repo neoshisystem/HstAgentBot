@@ -173,6 +173,11 @@ def test_global_billing_aggregate_is_not_disclosed_in_group(monkeypatch):
 
 
 def test_super_admin_cannot_open_end_user_or_rep_deposit_command(monkeypatch):
+    """The admin workspace has no payable wallet, and the refusal is never silent.
+
+    S49: the root actor must be told where the wallet lives and given the buttons
+    to get there, instead of being dropped into a dead-end chat.
+    """
     update, _, message = make_update(chat_type="private", text="/deposit 500000")
     context = SimpleNamespace(args=["500000"], user_data={})
     monkeypatch.setattr(rep_bot.database, "get_user_role", lambda *args, **kwargs: ("super_admin", None))
@@ -183,7 +188,10 @@ def test_super_admin_cannot_open_end_user_or_rep_deposit_command(monkeypatch):
 
     asyncio.run(rep_bot.deposit_cmd(update, context))
 
-    assert message.replies == []
+    assert len(message.replies) == 1
+    text, kwargs = message.replies[0]
+    assert "شارژ کیف پول" in text
+    assert kwargs.get("reply_markup") is not None
     assert context.user_data == {}
 
 

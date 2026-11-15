@@ -279,10 +279,46 @@ def test_photo_receipt_fsm_rejects_non_wallet_roles_before_persistence(monkeypat
     assert message.replies and "نقش" in message.replies[0][0]
 
 
-def test_amount_entry_fsm_rejects_role_changed_after_deposit_start(monkeypatch):
-    update, _, message = make_update(role="super_admin")
+def test_amount_entry_fsm_accepts_root_acting_in_the_end_user_persona(monkeypatch):
+    """S49 / BUG-FIN-007: the persisted ``deposit_role`` owns the continuation.
+
+    The root actor starts the top-up in the end-user workspace, so the amount
+    entry must be attributed to that workspace instead of being rejected by the
+    actor's base role.
+    """
+    update, _, message = make_update(role="end_user", user_id=rep_bot.ADMIN_TELEGRAM_ID)
     message.text = "500000"
-    patch_role(monkeypatch, "super_admin")
+    patch_role(monkeypatch, "end_user")
+    captured = {}
+
+    def _create_payment_receipt(**kwargs):
+        captured.update(kwargs)
+        return "TR-500"
+
+    monkeypatch.setattr(rep_bot.database, "create_payment_receipt", _create_payment_receipt)
+    monkeypatch.setattr(
+        rep_bot.database, "get_card_info",
+        lambda: {"card_number": "6037-0000", "card_holder": "Holder", "bank_name": "Bank"},
+    )
+    context = SimpleNamespace(user_data={
+        "fsm_state": rep_bot.finance_manager.STATE_AWAITING_RECEIPT_AMOUNT,
+        "deposit_role": "end_user",
+    })
+
+    asyncio.run(rep_bot.handle_message(update, context))
+
+    assert captured["role"] == "end_user"
+    assert captured["amount_toman"] == 500000
+    assert captured["rep_id"] is None
+    assert context.user_data["fsm_state"] == rep_bot.finance_manager.STATE_AWAITING_RECEIPT_PHOTO
+    assert message.replies and message.replies[0][1].get("reply_markup") is not None
+
+
+def test_amount_entry_fsm_rejects_role_changed_after_deposit_start(monkeypatch):
+    """A genuine role change (a representative answering an end-user prompt) is refused."""
+    update, _, message = make_update(role="rep", user_id=71002)
+    message.text = "500000"
+    patch_role(monkeypatch, "rep", rep=None)
     monkeypatch.setattr(
         rep_bot.database, "create_payment_receipt",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("role mismatch must not create receipt")),
@@ -295,6 +331,7 @@ def test_amount_entry_fsm_rejects_role_changed_after_deposit_start(monkeypatch):
     asyncio.run(rep_bot.handle_message(update, context))
 
     assert message.replies and "نقش" in message.replies[0][0]
+    assert message.replies[0][1].get("reply_markup") is not None
     assert context.user_data["fsm_state"] == rep_bot.finance_manager.STATE_AWAITING_RECEIPT_AMOUNT
 
 

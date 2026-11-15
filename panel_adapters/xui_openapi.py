@@ -15,6 +15,7 @@ from .base import (
     AdapterUnavailable, BasePanelAdapter, CanonicalServerStatus, LookupResult,
     MutationResult, PanelCapabilities, ReconcileResult,
 )
+from .credentials import BEARER, PASSWORD, classify_panel_credential
 from .models import (
     CanonicalClient, ClientCreateSpec, NodeConfig, expiry_seconds_to_panel_ms,
     normalize_expiry, normalize_volume,
@@ -26,6 +27,28 @@ from .url_parser import parse_panel_url
 class _HttpResult:
     status_code: int
     payload: Any = field(repr=False, compare=False)
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False, compare=False)
+
+
+def _session_cookie_from(headers: Any) -> str | None:
+    """Extract the panel session cookie pair from a login response.
+
+    Only the ``name=value`` pair is returned; the remaining Set-Cookie
+    attributes (Path, HttpOnly, ...) are dropped and the value is never logged.
+    """
+    if not headers:
+        return None
+    try:
+        items = list(headers.items())
+    except AttributeError:
+        return None
+    for name, value in items:
+        if str(name).strip().lower() != "set-cookie" or not value:
+            continue
+        pair = str(value).split(";", 1)[0].strip()
+        if "=" in pair and pair.split("=", 1)[1]:
+            return pair
+    return None
 
 
 class XUIOpenAPIAdapter(BasePanelAdapter):
@@ -92,16 +115,28 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         self.endpoint = parse_panel_url(raw_url)
         cipher = panel.get("auth_cipher") or panel.get("api_token_cipher")
         if not isinstance(cipher, str) or not cipher:
-            raise ValueError("panel bearer credential is missing")
+            raise ValueError("panel credential is missing")
         if decryptor is None:
             from crypto_store import decrypt_secret
             decryptor = decrypt_secret
         try:
-            bearer = decryptor(cipher, "hstagent/columns/v1")
+            secret = decryptor(cipher, "hstagent/columns/v1")
         except Exception:
-            raise ValueError("panel bearer credential could not be decrypted") from None
-        if not isinstance(bearer, str) or not bearer.strip():
-            raise ValueError("panel bearer credential is invalid")
+            raise ValueError("panel credential could not be decrypted") from None
+        if not isinstance(secret, str) or not secret.strip():
+            raise ValueError("panel credential is invalid")
+
+        declared = str(panel.get("auth_type") or "").strip().lower()
+        credential = classify_panel_credential(secret)
+        if declared in {BEARER, PASSWORD} and credential.kind != declared:
+            # The stored secret no longer matches its declared scheme; the
+            # column is authoritative, so refuse instead of guessing.
+            raise ValueError("panel credential does not match its declared auth_type")
+        self._auth_type = credential.kind
+        self._bearer = credential.secret if credential.is_bearer else ""
+        self._username = credential.username
+        self._password = credential.password
+        self._session_cookie: str | None = None
 
         self.panel_id = int(panel.get("id") or panel.get("panel_id") or 0)
         if self.panel_id <= 0:
@@ -109,7 +144,6 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         self._account_id_resolver = account_id_resolver
         self._operation_preflight = operation_preflight
         self._session = session
-        self._bearer = bearer.strip()
         self._timeout = timeout
         self._transaction_probe = transaction_probe
         self._clock = clock
@@ -127,15 +161,48 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
     def __repr__(self) -> str:
         return (
             f"XUIOpenAPIAdapter(panel_id={self.panel_id!r}, "
-            f"endpoint={self.endpoint.normalized_url!r}, bearer=<redacted>, "
+            f"endpoint={self.endpoint.normalized_url!r}, auth_type={self._auth_type!r}, "
+            f"credential=<redacted>, "
             f"capabilities={self.capabilities.methods!r})"
         )
 
-    async def _request(
+    def _auth_headers(self) -> dict[str, str]:
+        """Return the auth header for the stored scheme; never guess one."""
+        if self._auth_type == PASSWORD:
+            if not self._session_cookie:
+                raise AdapterUnavailable("panel session cookie is not established")
+            return {"Cookie": self._session_cookie}
+        return {"Authorization": f"Bearer {self._bearer}"}
+
+    async def _login(self) -> None:
+        """Exchange ``username:password`` for a panel session cookie.
+
+        The panel's interactive login lives at ``<base_path>/login``, outside the
+        ``/panel/api`` namespace, so it is addressed from the endpoint origin. A
+        rejected login or a response without a session cookie fails closed: the
+        adapter never falls back to an unauthenticated call.
+        """
+        if self._auth_type != PASSWORD or self._session_cookie:
+            return
+        result = await self._send(
+            "POST", f"{self.endpoint.normalized_url}/login",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json_body={"username": self._username, "password": self._password},
+        )
+        payload = result.payload if isinstance(result.payload, Mapping) else {}
+        if not 200 <= result.status_code < 300 or payload.get("success") is not True:
+            raise AdapterUnavailable("panel login was rejected")
+        cookie = _session_cookie_from(result.headers)
+        if not cookie:
+            raise AdapterUnavailable("panel login returned no session cookie")
+        self._session_cookie = cookie
+
+    async def _send(
         self,
         method: str,
-        api_path: str,
+        url: str,
         *,
+        headers: Mapping[str, str],
         params: Mapping[str, Any] | None = None,
         json_body: Any = None,
     ) -> _HttpResult:
@@ -148,16 +215,8 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             raise AdapterUnavailable("database transaction state is unavailable") from None
         if in_transaction:
             raise AdapterUnavailable("panel I/O refused while a DB transaction is active")
-        if not isinstance(api_path, str) or not api_path or api_path.startswith("/"):
-            raise ValueError("API path must be relative to panel API base")
-        if "?" in api_path or "#" in api_path or ".." in api_path.split("/"):
-            raise ValueError("API path is invalid")
-        url = self.endpoint.url_for(api_path)
         kwargs = {
-            "headers": {
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self._bearer}",
-            },
+            "headers": dict(headers),
             "timeout": self._timeout,
             "allow_redirects": False,
             "verify": True,
@@ -179,13 +238,32 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
                 payload = response.json()
             except Exception:
                 payload = None
-            return _HttpResult(status, payload)
+            return _HttpResult(status, payload, getattr(response, "headers", None) or {})
         except AdapterUnavailable:
             raise
         except Exception:
             # Do not chain the raw exception: request exceptions can contain URL,
             # headers or other credentials depending on the HTTP implementation.
             raise AdapterUnavailable("panel transport failed or timed out") from None
+
+    async def _request(
+        self,
+        method: str,
+        api_path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json_body: Any = None,
+    ) -> _HttpResult:
+        """Send exactly one authenticated API request against the panel API base."""
+        if not isinstance(api_path, str) or not api_path or api_path.startswith("/"):
+            raise ValueError("API path must be relative to panel API base")
+        if "?" in api_path or "#" in api_path or ".." in api_path.split("/"):
+            raise ValueError("API path is invalid")
+        if self._auth_type == PASSWORD:
+            await self._login()
+        headers = {"Accept": "application/json", **self._auth_headers()}
+        return await self._send(method, self.endpoint.url_for(api_path), headers=headers,
+                                params=params, json_body=json_body)
 
     @staticmethod
     def _api_ok(result: _HttpResult) -> bool:

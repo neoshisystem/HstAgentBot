@@ -153,6 +153,7 @@ def build_back_to_user_keyboard(extra_buttons=None, back_callback="user:main") -
 
 
 async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message=False):
+    from rep_bot import build_actor_navigation_keyboard
     """Renders or edits the end-user interactive portal."""
     user = update.effective_user
     chat = update.effective_chat
@@ -167,7 +168,10 @@ async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         if update.callback_query:
             await update.callback_query.answer(notice, show_alert=True)
         elif update.message:
-            await update.message.reply_text(notice)
+            await update.message.reply_text(
+                notice,
+                reply_markup=build_actor_navigation_keyboard(role),
+            )
         return
     # A super-admin or representative viewing as an end user still needs personal
     # customer rows; without them every wallet/service section raises.
@@ -396,7 +400,10 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
                 f"`{sub_link}`\n\n"
                 "💡 این لینک را کپی کرده و در نرم‌افزار اتصال خود (v2rayNG, Streisand, v2box, Hiddify) وارد فرمایید."
             )
-            await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await query.message.reply_text(
+                msg, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_back_to_user_keyboard(back_callback="user:services"),
+            )
             await query.answer("لینک ارسال شد.")
         else:
             await query.answer("❌ خطا در بازیابی لینک.", show_alert=True)
@@ -415,7 +422,10 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
             try:
                 qr_bytes = sub_manager.generate_qr_code(sub_url)
                 caption = f"📱 **QR کد اشتراک اکانت {acc_code}**\n\nلینک: `{sub_url}`"
-                await query.message.reply_photo(photo=qr_bytes, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                await query.message.reply_photo(
+                    photo=qr_bytes, caption=caption, parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=build_back_to_user_keyboard(back_callback="user:services"),
+                )
             except Exception:
                 logger.exception("Could not create or deliver subscription QR for %s", acc_code)
                 await query.answer("❌ ساخت یا ارسال QR ناموفق بود؛ لینک اشتراک تغییری نکرده است.", show_alert=True)
@@ -484,7 +494,10 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
                 "لینک قبلی باطل گردید. لینک جدید را جایگزین کنید:\\n\\n"
                 f"{res['new_sub_url']}"
             )
-            await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await query.message.reply_text(
+                msg, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_back_to_user_keyboard(back_callback="user:services"),
+            )
             await query.answer("لینک ساب بازنشانی شد.")
         else:
             await query.answer(
@@ -779,7 +792,8 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
             except BadRequest:
                 pass
             await query.message.reply_text(
-                f"❌ صدور سرویس توسط پنل رد شد. مبلغ {price:,} تومان به کیف پول بازگشت داده شد."
+                f"❌ صدور سرویس توسط پنل رد شد. مبلغ {price:,} تومان به کیف پول بازگشت داده شد.",
+                reply_markup=build_back_to_user_keyboard(back_callback="user:wallet"),
             )
             await query.answer("صدور سرویس ناموفق بود.", show_alert=True)
         else:

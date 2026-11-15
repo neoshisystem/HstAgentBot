@@ -361,7 +361,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             role, rep = _onboard_v52_start(user, int(context.bot.id))
         except Exception:
             logger.exception("v5.2 start onboarding failed")
-            await update.message.reply_text("⛔️ راه‌اندازی هویت/پروفایل امن انجام نشد؛ دسترسی صادر نشد.")
+            try:
+                fallback_role, _fallback_rep = database.get_user_role(user.id, chat.id, thread_id)
+            except Exception:
+                fallback_role = "end_user"
+            await update.message.reply_text(
+                "⛔️ راه‌اندازی هویت/پروفایل امن انجام نشد؛ دسترسی صادر نشد.",
+                reply_markup=build_actor_navigation_keyboard(fallback_role),
+            )
             return
     else:
         role, rep = database.get_user_role(user.id, chat.id, thread_id)
@@ -468,6 +475,22 @@ def _resolve_active_persona_role(user, *, base_role, base_rep):
         return base_role, base_rep
 
 
+def _persona_aware_role(user, chat, thread_id):
+    """Resolve the acting role, honouring the persona switcher in private chats.
+
+    Every entry point that reads a role for routing (commands, text, photo and
+    callback handlers) must go through this helper. Resolving the base role in
+    one handler and the persona role in another is exactly what let a
+    super-admin start a wallet top-up in the end-user workspace and then have
+    the amount entry rejected by the role guard.
+    """
+    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    if chat is not None and getattr(chat, "type", None) == "private" \
+            and _runtime_flag("v52_persona_switcher_enabled"):
+        role, rep = _resolve_active_persona_role(user, base_role=role, base_rep=rep)
+    return role, rep
+
+
 def _resolve_persona_rep(user, rep=None) -> dict | None:
     """Return the representative workspace row for the acting user, if any.
 
@@ -498,6 +521,48 @@ def _resolve_persona_rep(user, rep=None) -> dict | None:
         logger.exception("v5.2 persona representative resolution failed")
         return None
     return dict(row) if row is not None else None
+
+
+def _resolve_finance_continuation(user, context, role, rep):
+    """Resolve the role/representative that owns an in-flight top-up workflow.
+
+    The persona switcher lets the root actor start a wallet top-up in the
+    end-user or representative workspace and then change persona before the
+    amount or the receipt photo is sent. The persisted ``deposit_role`` names the
+    workflow's role, so the continuation follows it; a genuine role change by a
+    non-root actor is still refused. Returns ``(role, rep)`` or ``None``.
+    """
+    dep_role = context.user_data.get("deposit_role")
+    if dep_role not in ("end_user", "rep"):
+        return role, rep
+    if dep_role == "rep":
+        rep = _resolve_persona_rep(user, rep)
+        if rep is None:
+            return None
+        return ("rep", rep) if role in ("rep", "super_admin") else None
+    return ("end_user", None) if role in ("end_user", "super_admin") else None
+
+
+def build_actor_navigation_keyboard(role: str) -> InlineKeyboardMarkup:
+    """Return the "way home" keyboard for the acting role.
+
+    Every handler branch that ends an interaction with a plain message attaches
+    this, so a refusal, an error or a completed step never strands the actor in a
+    chat with no buttons.
+    """
+    if role == "rep":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 امور مالی و فیش‌ها", callback_data="rep:finance")],
+            [InlineKeyboardButton("🏠 بازگشت به پیشخوان نماینده", callback_data="rep:main")],
+        ])
+    if role == "end_user":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 سرویس‌های من", callback_data="user:services")],
+            [InlineKeyboardButton("🏠 بازگشت به پورتال کاربری", callback_data="user:main")],
+        ])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 بازگشت به منوی مدیریت", callback_data="admin:main")],
+    ])
 
 
 def _begin_ownership_transfer(ctx, account_id: int, persona: str):
@@ -883,6 +948,7 @@ def _v52_begin_panel_draft(ctx, panel_type: str):
         "افزودن پنل جدید",
         f"نوع انتخابی: {selected}\nشناسه پنل ساخته‌شده: {panel_id}\n"
         "نشانی کامل پنل را بدون نام کاربری/رمز، query یا fragment ارسال کنید. "
+        "در مرحله بعد اعتبارنامه (توکن API یا «نام کاربری:رمز عبور») ذخیره می‌شود. "
         "پنل جدید در وضعیت maintenance است، پیش‌فرض نیست و به هیچ تعرفه‌ای متصل نمی‌شود.",
         persona="admin", page_kind="form", parent_callback="v52:panels",
     )
@@ -1257,8 +1323,9 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                             f"نشانی: {url}\nاعتبارنامه: {'ثبت شده (محرمانه)' if has_secret else 'ثبت نشده'}")
                     page = render_page("جزئیات پنل", body, persona="admin", rows=[
                         [button("ویرایش اتصال", f"v52:panelconfig:{panel_id}")],
-                        [button("آزمایش اتصال", f"v52:paneltest:{panel_id}")],
-                        [button("فعال‌سازی پس از آزمایش", f"v52:life:{panel_id}:active")],
+                        [button("🧪 آزمایش اتصال", f"v52:paneltest:{panel_id}")],
+                        [button("⚡ تست اتصال و فعال‌سازی خودکار", f"v52:panelauto:{panel_id}")],
+                        [button("🟢 فعال‌سازی پس از آزمایش", f"v52:life:{panel_id}:active")],
                         [button("بازگشت به فهرست", "v52:panels")],
                     ])
             elif name == "begin_panel_config":
@@ -1277,7 +1344,8 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 page = render_page(
                     "تنظیم اتصال پنل",
                     "آدرس کامل پنل 3X-UI را بدون نام کاربری/رمز، query یا fragment ارسال کنید. "
-                    "در مرحله بعد توکن API به‌صورت رمزنگاری‌شده ذخیره می‌شود.",
+                    "در مرحله بعد اعتبارنامه ذخیره می‌شود: توکن API، یا «نام کاربری:رمز عبور»، "
+                    "یا قالب JSON — هر سه شکل پذیرفته و رمزنگاری می‌شوند.",
                     persona="admin", page_kind="form", parent_callback="v52:panels",
                 )
             elif name == "test_panel_connection":
@@ -1299,8 +1367,13 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 reachable = bool(getattr(status, "reachable", False))
                 body = "اتصال پنل موفق و پاسخ معتبر دریافت شد." if reachable else "پاسخ قابل‌اتکا دریافت نشد؛ وضعیت پنل تغییر نکرد."
                 from ui_v52 import render_page, button
-                rows = [[button("فعال‌سازی پنل", f"v52:life:{panel_id}:active")]] if reachable else []
-                rows.append([button("بازگشت به جزئیات", f"v52:panel:{panel_id}")])
+                if reachable:
+                    rows = [[button("🟢 فعال‌سازی فوری پنل (Active)", f"v52:life:{panel_id}:active")]]
+                else:
+                    rows = [[button("🔁 آزمایش مجدد اتصال", f"v52:paneltest:{panel_id}")],
+                            [button("✏️ ویرایش اتصال", f"v52:panelconfig:{panel_id}")]]
+                rows.append([button("🖥 مشاهده کارت پنل", f"v52:panel:{panel_id}")])
+                rows.append([button("🏠 بازگشت به منوی اصلی", "v52:home:admin")])
                 page = render_page("نتیجه آزمایش اتصال", body, persona="admin", page_kind="result", rows=rows)
             elif name == "confirm_lifecycle":
                 if persona != "admin" or not ctx.get("is_root"):
@@ -1328,6 +1401,46 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                     f"پنل {panel_id} · وضعیت جدید: {result['lifecycle']}",
                     persona="admin", page_kind="result", parent_callback=f"v52:panel:{panel_id}",
                 )
+            elif name == "auto_activate_panel":
+                # One-click test-then-activate: the panel is only promoted to
+                # ``active`` after a verified read, and a failed probe leaves the
+                # stored lifecycle untouched.
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("آزمایش و فعال‌سازی پنل فقط در اختیار root است.")
+                panel_id = int(params["panel_id"])
+                with database.get_db() as conn:
+                    row = conn.execute("SELECT * FROM panels WHERE id=?", (panel_id,)).fetchone()
+                if row is None:
+                    raise ValueError("پنل وجود ندارد.")
+                panel_record = dict(row)
+                kind = str(panel_record.get("panel_type") or "").lower().replace("_", "-")
+                if kind not in {"3x-ui", "3xui", "xui"}:
+                    raise ValueError("تست اتصال و فعال‌سازی خودکار در این نسخه فقط برای 3X-UI پشتیبانی می‌شود.")
+                import requests
+                from panel_adapters.xui_openapi import XUIOpenAPIAdapter
+                from ui_v52 import render_page, button
+                adapter = XUIOpenAPIAdapter(panel_record, requests.Session(), transaction_probe=lambda: False)
+                status = await adapter.verify_connection()
+                if not bool(getattr(status, "reachable", False)):
+                    page = render_page(
+                        "آزمایش اتصال ناموفق",
+                        "پاسخ قابل‌اتکا دریافت نشد؛ وضعیت پنل تغییر نکرد و فعال‌سازی انجام نشد.",
+                        persona="admin", page_kind="result",
+                        parent_callback=f"v52:panel:{panel_id}",
+                        rows=[[button("🔁 آزمایش مجدد", f"v52:panelauto:{panel_id}")],
+                              [button("✏️ ویرایش اتصال", f"v52:panelconfig:{panel_id}")]],
+                    )
+                else:
+                    result = database.set_panel_lifecycle(panel_id, "active")
+                    page = render_page(
+                        "پنل فعال شد",
+                        f"آزمایش اتصال موفق بود و پنل {panel_id} به وضعیت "
+                        f"{result['lifecycle']} تغییر یافت.",
+                        persona="admin", page_kind="result",
+                        parent_callback=f"v52:panel:{panel_id}",
+                        rows=[[button("🖥 مشاهده کارت پنل", f"v52:panel:{panel_id}")],
+                              [button("🏠 بازگشت به منوی اصلی", "v52:home:admin")]],
+                    )
             elif name == "list_tickets":
                 import support_ui
                 page = support_ui.tickets_page(
@@ -1698,11 +1811,17 @@ async def _submit_v52_order_receipt(update, context, role):
     if not attempt_id or not state.get("v52_payment_pending") or message is None or not message.photo:
         return False
     if role not in {"end_user", "rep"} or database.is_user_blocked(user.id):
-        await message.reply_text("⛔️ ثبت رسید برای این نقش/حساب مجاز نیست.")
+        await message.reply_text(
+            "⛔️ ثبت رسید برای این نقش/حساب مجاز نیست.",
+            reply_markup=build_receipt_navigation_keyboard(role),
+        )
         return True
     amount = state.get("v52_payment_amount")
     if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
-        await message.reply_text("⚠️ مبلغ ثابت سفارش قابل تأیید نیست؛ درخواست امن متوقف شد.")
+        await message.reply_text(
+            "⚠️ مبلغ ثابت سفارش قابل تأیید نیست؛ درخواست امن متوقف شد.",
+            reply_markup=build_receipt_navigation_keyboard(role),
+        )
         return True
     try:
         import payment_service
@@ -1713,12 +1832,19 @@ async def _submit_v52_order_receipt(update, context, role):
                 media_group_id=message.media_group_id)
     except Exception:
         logger.exception("Order-bound v5.2 receipt submission failed")
-        await message.reply_text("❌ رسید سفارش ثبت نشد؛ وضعیت سفارش و درخواست پرداخت محفوظ ماند.")
+        await message.reply_text(
+            "❌ رسید سفارش ثبت نشد؛ وضعیت سفارش و درخواست پرداخت محفوظ ماند.",
+            reply_markup=build_receipt_navigation_keyboard(role),
+        )
         return True
     for key in ("v52_payment_attempt_id", "v52_payment_order_id", "v52_payment_amount", "v52_payment_pending"):
         state.pop(key, None)
     notice = "رسید قبلاً ثبت شده بود؛ ثبت تکراری انجام نشد." if result.get("replayed") else "رسید به سفارش متصل و برای بررسی ثبت شد."
-    await message.reply_text(f"✅ {notice}\nشناسه رسید: {result.get('receipt_id')}\nوضعیت سفارش: {result.get('order_status', 'pending_review')}")
+    await message.reply_text(
+        f"✅ {notice}\nشناسه رسید: {result.get('receipt_id')}\n"
+        f"وضعیت سفارش: {result.get('order_status', 'pending_review')}",
+        reply_markup=build_receipt_navigation_keyboard(role),
+    )
     try:
         await process_receipt_notification_outbox(context.bot, limit=10)
     except Exception:
@@ -1736,8 +1862,8 @@ async def _route_v52_fsm_text(update, context):
     if route is False:
         return False
     payload = dict(route.params.get("payload") or {})
-    role, rep_actor = database.get_user_role(
-        int(user.id), int(chat.id), getattr(message, "message_thread_id", None),
+    role, rep_actor = _persona_aware_role(
+        user, chat, getattr(message, "message_thread_id", None),
     )
     persona = "admin" if role == "super_admin" else "rep" if role == "rep" else "user"
     ctx = _v52_actor_context(update, context, persona, rep_actor)
@@ -1754,7 +1880,12 @@ async def _route_v52_fsm_text(update, context):
                 payload={"panel_id": int(payload["panel_id"]), "normalized_url": endpoint.normalized_url},
                 parent_callback=route.params.get("parent_callback"), now=int(time.time()),
             )
-            await message.reply_text("آدرس معتبر است؛ اکنون توکن API پنل را ارسال کنید.")
+            from panel_adapters.credentials import credential_help_text
+            await message.reply_text(
+                "✅ آدرس پنل معتبر است؛ اکنون اعتبارنامه را ارسال کنید.\n\n"
+                + credential_help_text(),
+                reply_markup=build_panel_credential_wizard_keyboard(int(payload["panel_id"])),
+            )
             return True
         if route.name == "panel_connection_token":
             try:
@@ -1765,8 +1896,10 @@ async def _route_v52_fsm_text(update, context):
                 int(payload["panel_id"]), str(payload["normalized_url"]), text_value,
             )
             await message.reply_text(
-                f"✅ اتصال پنل {result['panel_id']} ذخیره شد. توکن رمزنگاری شد؛ وضعیت پنل همچنان "
-                f"{result['lifecycle']} است. ابتدا اتصال را آزمایش کنید."
+                f"✅ اتصال پنل {result['panel_id']} ذخیره شد. اعتبارنامه "
+                f"({result['auth_type']}) رمزنگاری شد؛ وضعیت پنل همچنان "
+                f"{result['lifecycle']} است. ابتدا اتصال را آزمایش کنید.",
+                reply_markup=build_panel_wizard_keyboard(int(result["panel_id"])),
             )
             return True
         if route.name == "support_ticket_body":
@@ -1788,7 +1921,9 @@ async def _route_v52_fsm_text(update, context):
                 visibility="customer", now=int(time.time()),
             )
             await message.reply_text(
-                f"✅ پاسخ ثبت شد. شناسه پیام: {result['message_id']} · نمایش: {result['visibility']}"
+                f"✅ پاسخ ثبت شد. شناسه پیام: {result['message_id']} · نمایش: {result['visibility']}",
+                reply_markup=build_v52_fsm_error_keyboard(
+                    persona, f"v52:ticket:{payload['ticket_id']}"),
             )
             return True
         if route.name == "ownership_transfer":
@@ -1845,10 +1980,18 @@ async def _route_v52_fsm_text(update, context):
                 ctx, int(payload.get("product_id", 0)), items, parent_callback="v52:shop")
             await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
             return True
-        await message.reply_text("متن draft دریافت شد؛ مسیر قدیمی NLP آن را دوباره مصرف نمی‌کند.")
+        await message.reply_text(
+            "متن draft دریافت شد؛ مسیر قدیمی NLP آن را دوباره مصرف نمی‌کند.",
+            reply_markup=build_v52_fsm_error_keyboard(
+                persona, route.params.get("parent_callback")),
+        )
     except Exception as exc:
         logger.exception("v5.2 text workflow failed for state=%s", route.name)
-        await message.reply_text(f"❌ عملیات v5.2 انجام نشد: {exc}")
+        await message.reply_text(
+            f"❌ عملیات v5.2 انجام نشد: {exc}",
+            reply_markup=build_v52_fsm_error_keyboard(
+                persona, route.params.get("parent_callback")),
+        )
     return True
 
 async def _route_v52_fsm_photo(update, context):
@@ -1859,14 +2002,19 @@ async def _route_v52_fsm_photo(update, context):
                                    str(message.photo[-1].file_id), now=int(time.time()))
     if route is False:
         return False
-    await message.reply_text("تصویر به draft پشتیبانی v5.2 متصل شد؛ مسیر رسید legacy اجرا نشد.")
+    role, _rep_actor = _persona_aware_role(user, chat, getattr(message, "message_thread_id", None))
+    await message.reply_text(
+        "تصویر به draft پشتیبانی v5.2 متصل شد؛ مسیر رسید legacy اجرا نشد.",
+        reply_markup=build_v52_fsm_error_keyboard(
+            _persona_for_role(role), route.params.get("parent_callback")),
+    )
     return True
 
 async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    role, rep = _persona_aware_role(user, chat, thread_id)
     if role != "end_user":
         return
 
@@ -1907,7 +2055,7 @@ async def pricing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    role, rep = _persona_aware_role(user, chat, thread_id)
     if role == "unauthorized_group" or (role == "super_admin" and chat.type != "private"):
         return
         
@@ -1952,7 +2100,7 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    role, rep = _persona_aware_role(user, chat, thread_id)
     if role not in ("super_admin", "rep"):
         return
 
@@ -2049,7 +2197,7 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    role, rep = _persona_aware_role(user, chat, thread_id)
     if role == "unauthorized_group":
         return
 
@@ -2081,8 +2229,12 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    role, rep = _persona_aware_role(user, chat, thread_id)
     if role not in ("end_user", "rep") or (role == "rep" and not rep):
+        await update.message.reply_text(
+            "ℹ️ ثبت فیش و شارژ کیف پول فقط از پورتال کاربری یا میزکار نمایندگی انجام می‌شود.",
+            reply_markup=build_actor_navigation_keyboard(role),
+        )
         return
 
     args = context.args or []
@@ -2097,7 +2249,8 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt_message = await update.message.reply_text(
             "💳 **لطفاً مبلغ واریزی مورد نظر را به تومان وارد کنید:**\n"
             "مثال: `/deposit 500000` یا ارسال عدد `500000`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_finance_fsm_keyboard(role),
         )
         context.user_data["deposit_form_state"] = {
             "prompt_msg_id": getattr(prompt_message, "message_id", None)
@@ -2513,7 +2666,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     thread_id = update.message.message_thread_id if update.message else None
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    role, rep = _persona_aware_role(user, chat, thread_id)
     if role == "unauthorized_group":
         return
     if role == "super_admin" and rep is None and chat.type != "private":
@@ -3198,6 +3351,89 @@ def build_receipt_navigation_keyboard(role: str) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(buttons)
 
 
+def _active_persona_wallet_owner_id(user, role, rep):
+    """Resolve the wallet target for a persona acting on another linked identity."""
+    if role == "end_user":
+        return int(user.id)
+    if role == "rep" and rep:
+        # When a root/rep switches into the representative persona, receipts
+        # must still belong to the authenticated actor (payment_receipts.user_id)
+        # while credit/debt attribution uses the linked representative id.
+        return int(user.id)
+    return int(user.id)
+
+
+def build_finance_fsm_keyboard(role: str) -> InlineKeyboardMarkup:
+    """Navigation for the wallet-amount FSM.
+
+    Every branch of the amount-entry state returns this keyboard, so a rejected
+    amount, a role mismatch or a stale prompt never strands the actor in a chat
+    with no way back to the wallet or the dashboard.
+    """
+    if role == "rep":
+        buttons = [
+            [InlineKeyboardButton("💰 امور مالی و فیش‌ها", callback_data="rep:finance")],
+            [InlineKeyboardButton("🏠 بازگشت به پیشخوان نماینده", callback_data="rep:main")],
+        ]
+    elif role == "end_user":
+        buttons = [
+            [InlineKeyboardButton("💳 کیف پول و شارژ", callback_data="user:wallet")],
+            [InlineKeyboardButton("🏠 بازگشت به پورتال", callback_data="user:main")],
+        ]
+    else:
+        buttons = [
+            [InlineKeyboardButton("🏠 بازگشت به منوی مدیریت", callback_data="admin:main")],
+        ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def _persona_for_role(role: str) -> str:
+    """Map a resolved role to its v5.2 persona name."""
+    return "admin" if role == "super_admin" else "rep" if role == "rep" else "user"
+
+
+def build_v52_fsm_error_keyboard(persona: str, parent_callback=None) -> InlineKeyboardMarkup:
+    """Navigation for a failed or refused v5.2 text workflow.
+
+    Every answer the text router produces carries a way back, so a rejected
+    draft never leaves the actor with a message and no buttons.
+    """
+    rows = []
+    if isinstance(parent_callback, str) and parent_callback.startswith("v52:"):
+        rows.append([InlineKeyboardButton("↩ بازگشت", callback_data=parent_callback)])
+    rows.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data=f"v52:home:{persona}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_panel_credential_wizard_keyboard(panel_id: int) -> InlineKeyboardMarkup:
+    """Escape hatch while the panel credential step is awaiting input."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ انصراف از تنظیم اتصال", callback_data=f"v52:panel:{panel_id}")],
+        [InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="v52:home:admin")],
+    ])
+
+
+def build_panel_wizard_keyboard(panel_id: int, *, reachable: bool = False) -> InlineKeyboardMarkup:
+    """Next-step buttons for the panel wizard.
+
+    Saving a connection used to answer with bare text, so the admin had to hunt
+    the panel card for the test and activation buttons. Every wizard answer now
+    carries the whole next step, including a one-click test-and-activate.
+    """
+    activate_label = ("🟢 فعال‌سازی فوری پنل (Active)" if reachable
+                      else "🟢 تغییر وضعیت به فعال (Active)")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧪 آزمایش اتصال پنل " + str(panel_id),
+                              callback_data=f"v52:paneltest:{panel_id}")],
+        [InlineKeyboardButton("⚡ تست اتصال و فعال‌سازی خودکار",
+                              callback_data=f"v52:panelauto:{panel_id}")],
+        [InlineKeyboardButton(activate_label, callback_data=f"v52:life:{panel_id}:active")],
+        [InlineKeyboardButton("🖥 مشاهده کارت پنل " + str(panel_id),
+                              callback_data=f"v52:panel:{panel_id}")],
+        [InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="v52:home:admin")],
+    ])
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -3205,14 +3441,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     thread_id = update.message.message_thread_id
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    role, rep = _persona_aware_role(user, chat, thread_id)
     if role == "unauthorized_group":
         return
     if database.is_user_blocked(user.id):
         await update.message.reply_text("⛔️ دسترسی شما به این بات مسدود شده است.")
         return
+    # A root actor may have switched persona after starting the top-up; the
+    # persisted workflow role owns the continuation, so adopt it before the role
+    # guard runs instead of refusing the receipt the actor just asked for.
+    resolved = _resolve_finance_continuation(user, context, role, rep)
+    if resolved is not None:
+        role, rep = resolved
     if role not in ("end_user", "rep") or (role == "rep" and not rep):
-        await update.message.reply_text("⛔️ ارسال فیش فقط برای نقش کاربر نهایی یا نماینده مجاز است.")
+        await update.message.reply_text(
+            "⛔️ ارسال فیش فقط برای نقش کاربر نهایی یا نماینده مجاز است.",
+            reply_markup=build_receipt_navigation_keyboard(role)
+            or build_actor_navigation_keyboard(role),
+        )
         return
 
     # Order-bound attempts are handled before legacy wallet receipts.
@@ -3233,13 +3479,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (update.message.caption or "").strip()
     tr_code = context.user_data.get("active_receipt_code")
     amount = int(context.user_data.get("deposit_amount") or 0)
-    dep_role = context.user_data.get("deposit_role") or role
-    if dep_role != role:
+    # Same persona-continuation rule as the amount step: the persisted workflow
+    # role owns the receipt, so a root actor who switched persona mid-flow still
+    # completes it while a genuine role change is refused.
+    resolved = _resolve_finance_continuation(user, context, role, rep)
+    if (
+        resolved is None
+        or resolved[0] not in ("end_user", "rep")
+        or (resolved[0] == "rep" and not resolved[1])
+    ):
         await update.message.reply_text(
             "⛔️ این فرایند ارسال فیش با نقش فعلی شما آغاز نشده است؛ از پنل همان نقش دوباره اقدام کنید.",
             reply_markup=navigation_keyboard,
         )
         return
+    role, rep = resolved
+    navigation_keyboard = build_receipt_navigation_keyboard(role)
+    dep_role = role
     target_rep_id = rep["id"] if role == "rep" else None
 
     if amount <= 0 and caption:
@@ -3319,7 +3575,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id
     msg_text = update.message.text or ""
     
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    role, rep = _persona_aware_role(user, chat, thread_id)
     if role == "unauthorized_group":
         return
 
@@ -3363,22 +3619,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check Financial FSM State (Card amount or rejection reason)
     fsm_state = context.user_data.get("fsm_state")
     if fsm_state == finance_manager.STATE_AWAITING_RECEIPT_AMOUNT:
-        expected_deposit_role = context.user_data.get("deposit_role") or role
+        # The persona can change between entering the amount prompt and sending
+        # the amount. Route this continuation by the persisted workflow role,
+        # but keep the root actor's Telegram id as the receipt owner.
+        resolved = _resolve_finance_continuation(user, context, role, rep)
         if (
-            role not in ("end_user", "rep")
-            or expected_deposit_role != role
-            or (role == "rep" and not rep)
+            resolved is None
+            or resolved[0] not in ("end_user", "rep")
+            or (resolved[0] == "rep" and not resolved[1])
         ):
             await update.message.reply_text(
-                "⛔️ این فرایند شارژ متعلق به نقش فعلی شما نیست؛ از پنل همان نقش دوباره اقدام کنید."
+                "⛔️ این فرایند شارژ متعلق به نقش فعلی شما نیست؛ از پنل همان نقش دوباره اقدام کنید.",
+                reply_markup=build_finance_fsm_keyboard(role),
             )
             return
+        role, rep = resolved
         text_clean = msg_text.replace(",", "").strip()
         if text_clean.isdigit() and int(text_clean) > 0:
             amount = int(text_clean)
             context.user_data["deposit_amount"] = amount
             card_info = database.get_card_info()
-            dep_role = context.user_data.get("deposit_role", "end_user" if role == "end_user" else "rep")
+            dep_role = role
             target_rep_id = rep["id"] if (dep_role == "rep" and rep) else None
             tr_code = database.create_payment_receipt(
                 user_id=user.id,
@@ -3395,7 +3656,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cleanup_deposit_amount_prompt(context, chat.id)
             return
         else:
-            await update.message.reply_text("⚠️ لطفاً مبلغ را به صورت عدد معتبر لاتین وارد کنید (مثال: `500000`).", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                "⚠️ لطفاً مبلغ را به صورت عدد معتبر لاتین وارد کنید (مثال: `500000`).",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_finance_fsm_keyboard(role),
+            )
             return
 
     reply_to = update.message.reply_to_message
@@ -3410,7 +3675,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days = int(params.get("days", 30))
         comment = params.get("comment", "")
         if gb <= 0 or days <= 0:
-            await update.message.reply_text("❌ حجم و مدت اکانت باید مثبت باشند.")
+            await update.message.reply_text(
+                "❌ حجم و مدت اکانت باید مثبت باشند.",
+                reply_markup=build_actor_navigation_keyboard(role),
+            )
             return
 
         target_rep_id = rep["id"] if rep else None
@@ -3419,12 +3687,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan = database.get_plan(plan_code)
         if not is_exempt and not plan:
             await update.message.reply_text(
-                "❌ این ترکیب حجم/مدت، تعرفه مصوب نمایندگی ندارد. لطفاً از فهرست پلن‌های تاییدشده برای صدور استفاده کنید."
+                "❌ این ترکیب حجم/مدت، تعرفه مصوب نمایندگی ندارد. لطفاً از فهرست پلن‌های تاییدشده برای صدور استفاده کنید.",
+                reply_markup=build_actor_navigation_keyboard(role),
             )
             return
         charge = int(plan["rep_price"]) if plan else 0
         if not is_exempt and charge <= 0:
-            await update.message.reply_text("❌ قیمت صدور اکانت معتبر نیست؛ با مدیریت تماس بگیرید.")
+            await update.message.reply_text(
+                "❌ قیمت صدور اکانت معتبر نیست؛ با مدیریت تماس بگیرید.",
+                reply_markup=build_actor_navigation_keyboard(role),
+            )
             return
 
         # Representative NLP issuance is handed off to the same durable,
@@ -3442,7 +3714,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             except Exception:
                 logger.exception("Could not create durable NLP representative issuance intent")
-                await update.message.reply_text("❌ ثبت درخواست صدور ممکن نشد؛ لطفاً از پنل نمایندگی دوباره اقدام کنید.")
+                await update.message.reply_text(
+                    "❌ ثبت درخواست صدور ممکن نشد؛ لطفاً از پنل نمایندگی دوباره اقدام کنید.",
+                    reply_markup=build_actor_navigation_keyboard(role),
+                )
                 return
 
             confirm_keyboard = InlineKeyboardMarkup([
@@ -3466,7 +3741,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lock_key = f"new-account:{role}:{user.id}:{plan_code}"
         lock_token = database.acquire_operation_lock(lock_key, ttl_seconds=None)
         if not lock_token:
-            await update.message.reply_text("⏳ درخواست صدور دیگری در حال پردازش است یا نتیجه قبلی نیازمند بررسی است؛ لطفاً دوباره اجرا نکنید.")
+            await update.message.reply_text(
+                "⏳ درخواست صدور دیگری در حال پردازش است یا نتیجه قبلی نیازمند بررسی است؛ لطفاً دوباره اجرا نکنید.",
+                reply_markup=build_actor_navigation_keyboard(role),
+            )
             return
 
         new_bal = None
@@ -3480,7 +3758,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except ValueError as exc:
                 database.release_operation_lock(lock_key, lock_token)
-                await update.message.reply_text(f"⛔️ صدور اکانت انجام نشد: {exc}")
+                await update.message.reply_text(
+                    f"⛔️ صدور اکانت انجام نشد: {exc}",
+                    reply_markup=build_actor_navigation_keyboard(role),
+                )
                 return
 
         scope_for_alloc = rep["scope_filter"] if rep else "all"
@@ -3492,7 +3773,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("New account allocation outcome is unknown for %s", user.id)
             await update.message.reply_text(
-                "⚠️ پاسخ پنل نامشخص است؛ مبلغ/اعتبار در وضعیت محفوظ باقی مانده و بررسی دستی لازم است. لطفاً درخواست صدور دیگری نفرستید."
+                "⚠️ پاسخ پنل نامشخص است؛ مبلغ/اعتبار در وضعیت محفوظ باقی مانده و بررسی دستی لازم است. لطفاً درخواست صدور دیگری نفرستید.",
+                reply_markup=build_actor_navigation_keyboard(role),
             )
             return
 
@@ -3500,7 +3782,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             email = alloc_res.get("email")
             if not email:
                 logger.error("X-UI reports account allocation success without email: %r", alloc_res)
-                await update.message.reply_text("⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ مبلغ برای تطبیق محفوظ ماند.")
+                await update.message.reply_text(
+                    "⚠️ پنل موفقیت را گزارش کرد اما شناسه اکانت ناقص است؛ مبلغ برای تطبیق محفوظ ماند.",
+                    reply_markup=build_actor_navigation_keyboard(role),
+                )
                 return
             sub_id = alloc_res.get("sub_id")
             try:
@@ -3513,7 +3798,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 logger.exception("X-UI allocated %s but local account persistence failed", email)
                 await update.message.reply_text(
-                    "⚠️ اکانت در پنل ایجاد شد اما ثبت محلی کامل نشد؛ مبلغ محفوظ است و تطبیق پنل/دیتابیس لازم است."
+                    "⚠️ اکانت در پنل ایجاد شد اما ثبت محلی کامل نشد؛ مبلغ محفوظ است و تطبیق پنل/دیتابیس لازم است.",
+                    reply_markup=build_actor_navigation_keyboard(role),
                 )
                 return
 
@@ -3589,18 +3875,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception:
                     logger.exception("Failed to reverse representative account precharge")
-                    await update.message.reply_text("⚠️ پنل صدور را رد کرد اما استرداد مالی ثبت نشد؛ مدیریت باید بررسی کند.")
+                    await update.message.reply_text(
+                        "⚠️ پنل صدور را رد کرد اما استرداد مالی ثبت نشد؛ مدیریت باید بررسی کند.",
+                        reply_markup=build_actor_navigation_keyboard(role),
+                    )
                     return
             database.release_operation_lock(lock_key, lock_token)
             await update.message.reply_text(
                 f"❌ پنل صدور اکانت را رد کرد؛ {'پیش‌پرداخت مسترد شد.' if not is_exempt else 'هزینه‌ای ثبت نشد.'} "
-                f"{alloc_res.get('message', '')}"
+                f"{alloc_res.get('message', '')}",
+                reply_markup=build_actor_navigation_keyboard(role),
             )
             return
 
         logger.error("Ambiguous X-UI allocation response for %s: %r", user.id, alloc_res)
         await update.message.reply_text(
-            "⚠️ پاسخ پنل برای تأیید یا رد صدور کافی نیست؛ مبلغ/اعتبار محفوظ است و بررسی دستی لازم است."
+            "⚠️ پاسخ پنل برای تأیید یا رد صدور کافی نیست؛ مبلغ/اعتبار محفوظ است و بررسی دستی لازم است.",
+            reply_markup=build_actor_navigation_keyboard(role),
         )
         return
     # 2. Extract account code from reply or message
@@ -3611,7 +3902,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text(
             "⚠️ شناسه یا کد اکانت یافت نشد.\nلطفاً روی پیام اکانت ریپلای کنید یا کد/نام کاربری آن را بفرستید.",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_actor_navigation_keyboard(role),
         )
         return
 
@@ -3619,7 +3911,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role == "end_user":
         owned_account = database.get_user_owned_account(user.id, account_code)
         if not owned_account:
-            await update.message.reply_text("⛔️ شما به این اکانت دسترسی ندارید. ابتدا با دستور `/link <کد_اکانت>` آن را ثبت کنید.", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                "⛔️ شما به این اکانت دسترسی ندارید. ابتدا با دستور `/link <کد_اکانت>` آن را ثبت کنید.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_actor_navigation_keyboard(role),
+            )
             return
         account_code = owned_account["email"]
 
@@ -3655,12 +3951,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cands = "\n".join([f"• `{c}`" for c in search_res.get("candidates", [])[:8]])
             await update.message.reply_text(
                 f"⚠️ **چند اکانت مطابق با `{account_code}` یافت شد:**\n\n{cands}\n\nلطفاً شناسه دقیق‌تری را وارد کنید.",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_actor_navigation_keyboard(role),
             )
             return
         await update.message.reply_text(
             f"⚠️ **اکانت `{account_code}` در سرور ۳X-UI یافت نشد.**",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_actor_navigation_keyboard(role),
         )
         return
 
@@ -3686,7 +3984,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_in_rep_scope:
             await update.message.reply_text(
                 f"⚠️ **اکانت `{account_code}` در محدوده مجاز شما یافت نشد.**",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_actor_navigation_keyboard(role),
             )
             return
 
@@ -3761,7 +4060,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await asyncio.to_thread(send_admin_log, f"🛑 **قطع اتصال اکانت:** `{email}` توسط {user.full_name}\nحجم محفوظ: {rem_gb:.2f} GB")
         else:
-            await update.message.reply_text(f"❌ خطا در غیرفعال‌سازی اکانت: {res.get('message')}")
+            await update.message.reply_text(
+                f"❌ خطا در غیرفعال‌سازی اکانت: {res.get('message')}",
+                reply_markup=build_actor_navigation_keyboard(role),
+            )
 
     elif intent == "activate" and role in ("super_admin", "rep"):
         res = await asyncio.to_thread(xui_manager.set_client_enable, email, enable=True, scope=scope_flt)
@@ -3787,7 +4089,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await asyncio.to_thread(send_admin_log, f"✅ **برقراری مجدد اتصال اکانت:** `{email}` توسط {user.full_name}")
         else:
-            await update.message.reply_text(f"❌ خطا در برقراری اتصال اکانت: {res.get('message')}")
+            await update.message.reply_text(
+                f"❌ خطا در برقراری اتصال اکانت: {res.get('message')}",
+                reply_markup=build_actor_navigation_keyboard(role),
+            )
 
     elif intent == "renew" and role in ("super_admin", "rep"):
         gb = params.get("gb", 20.0)
@@ -3863,9 +4168,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     thread_id = update.effective_message.message_thread_id if update.effective_message else None
     
-    role, rep = database.get_user_role(user.id, chat.id, thread_id)
-    if chat and chat.type == "private" and _runtime_flag("v52_persona_switcher_enabled"):
-        role, rep = _resolve_active_persona_role(user, base_role=role, base_rep=rep)
+    role, rep = _persona_aware_role(user, chat, thread_id)
     if role == "unauthorized_group":
         await query.answer("⛔️ دسترسی غیرمجاز در این تاپیک.", show_alert=True)
         return
@@ -3939,7 +4242,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"• مبلغ: **{rcp['amount_toman']:,} تومان**\n"
                     f"• وضعیت: **تایید شد و حساب شما شارژ/تسویه گردید.**"
                 )
-                await context.bot.send_message(chat_id=rcp["user_id"], text=notify_txt, parse_mode=ParseMode.MARKDOWN)
+                await context.bot.send_message(
+                    chat_id=rcp["user_id"], text=notify_txt, parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=build_actor_navigation_keyboard(
+                        "rep" if rcp["role"] == "rep" else "end_user"),
+                )
             except Exception as e:
                 logger.error(f"Failed to notify user of receipt approval: {e}")
         except Exception as e:
@@ -3974,7 +4281,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"• مبلغ: **{rcp['amount_toman']:,} تومان**\n"
                     f"• وضعیت: **رد شد** (علت: عدم تطابق با تراکنش‌های بانکی)"
                 )
-                await context.bot.send_message(chat_id=rcp["user_id"], text=notify_txt, parse_mode=ParseMode.MARKDOWN)
+                await context.bot.send_message(
+                    chat_id=rcp["user_id"], text=notify_txt, parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=build_actor_navigation_keyboard(
+                        "rep" if rcp["role"] == "rep" else "end_user"),
+                )
             except Exception as e:
                 logger.error(f"Failed to notify user of receipt rejection: {e}")
         except Exception as e:
@@ -4049,7 +4360,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📸 **لطفاً تصویر فیش واریزی خود را ارسال فرمایید:**\n\n"
             f"• کد پیگیری: `{tr_code}`\n"
             f"*(توضیحات یا شماره پیگیری را می‌توانید در کپشن بنویسید)*",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_finance_fsm_keyboard(role),
         )
         return
 
@@ -4068,7 +4380,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt_message = await query.message.reply_text(
             "💳 **لطفاً مبلغ مورد نظر جهت پرداخت را به تومان وارد کنید:**\n"
             "مثال: `500000`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_finance_fsm_keyboard(role),
         )
         context.user_data["deposit_form_state"] = {
             "prompt_msg_id": getattr(prompt_message, "message_id", None)
