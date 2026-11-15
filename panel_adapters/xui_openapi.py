@@ -454,12 +454,43 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         except Exception:
             raise AdapterUnavailable("server status could not be normalized") from None
 
+    async def _merge_live_traffic(self, wire: Mapping[str, Any], identifier: str) -> Mapping[str, Any]:
+        """Attach live traffic to a ``clients/get`` record.
+
+        On this fork ``clients/get/{email}`` returns the client record *without*
+        a ``traffic`` mapping, so ``used_bytes`` was always ``None`` and every
+        card reported an unknown remaining volume. The per-client counters live
+        on ``clients/traffic/{email}``; merge them, and never fabricate a value
+        when the counters cannot be read.
+        """
+        existing = wire.get("traffic")
+        if isinstance(existing, Mapping) and (existing.get("up") or existing.get("down")):
+            return wire
+        try:
+            result = await self._request("GET", f"clients/traffic/{quote(identifier, safe='')}")
+        except AdapterUnavailable:
+            return wire
+        if not self._api_ok(result):
+            return wire
+        traffic = result.payload.get("obj")
+        if not isinstance(traffic, Mapping):
+            return wire
+        merged = dict(wire)
+        merged["traffic"] = {
+            "up": traffic.get("up", 0),
+            "down": traffic.get("down", 0),
+            "total": traffic.get("total"),
+            "lastOnline": traffic.get("lastOnline"),
+        }
+        return merged
+
     async def get_client(self, identifier: str) -> LookupResult:
         if not isinstance(identifier, str) or not identifier:
             return LookupResult("unavailable", evidence={"reason": "invalid_identifier"})
         state, wire, result = await self._get_wire_client(identifier)
         if state != "found":
             return LookupResult(state, evidence={"http_status": result.status_code if result else None})
+        wire = await self._merge_live_traffic(wire, identifier)
         try:
             client = self._canonical(wire)
         except AdapterUnavailable:

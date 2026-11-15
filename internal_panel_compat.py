@@ -10,8 +10,14 @@ import asyncio
 import html
 import io
 import re
+import time
 from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+# Iran Standard Time (UTC+03:30, no DST since 2022). The legacy helper rendered
+# expiry/last-online stamps in this zone and the callers' copy expects it.
+_IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 _FACTORY = None
 _URI_MARKER = "://"
@@ -187,25 +193,93 @@ def _run(coro):
 
 
 def _canonical_to_legacy(client, account=None):
+    """Render a canonical client in the legacy ``parse_client_info`` shape.
+
+    Every product call site (user_portal / rep_panel / rep_bot / admin_panel)
+    was ported from the external ``xui_manager`` helper and reads that flat
+    contract — ``sub_id``, ``total_gb``, ``used_gb``, ``remaining_gb``,
+    ``days_left``, ``is_expired``, ``is_depleted``, ``enabled``, ``is_relative``,
+    ``raw``. Emitting only the canonical spellings made every card render
+    «اطلاعات این سرویس در دسترس نیست» while the panel was perfectly healthy.
+    The canonical aliases (``state``/``enable``/``totalGB``/``subId``) are kept
+    alongside so ``format_status_report`` and ``parse_client_info`` keep working.
+    """
     if client is None:
         return {}
     quota = client.quota_bytes
     used = client.used_bytes
-    remaining = None if quota is None or used is None else max(0, quota - used)
-    return {
-        "email": str(client.ref[2]),
+    email = str(client.ref[2])
+    total_gb = round(quota / (1024 ** 3), 2) if quota is not None else 0.0
+    used_gb = round((used or 0) / (1024 ** 3), 2)
+    remaining_gb = max(0.0, round(total_gb - used_gb, 2)) if total_gb > 0 else "Unlimited"
+    is_depleted = bool(quota) and used is not None and used >= quota
+
+    now_ms = int(time.time() * 1000)
+    time_mode = client.time_mode
+    expires_at = client.expires_at
+    expiry_ms = expires_at * 1000 if expires_at is not None else 0
+    is_relative = time_mode == "on_hold"
+    is_expired = False
+    days_left = None
+    if is_relative:
+        expiry_str = "شمارش معکوس (پس از اولین اتصال)"
+    elif time_mode == "dated" and expiry_ms > 0:
+        expiry_str = datetime.fromtimestamp(expiry_ms / 1000, tz=_IRAN_TZ).strftime("%Y-%m-%d %H:%M")
+        diff_secs = (expiry_ms - now_ms) / 1000
+        days_left = round(diff_secs / 86400, 1)
+        is_expired = diff_secs <= 0
+    else:
+        expiry_str = "نامحدود"
+
+    last_connected = client.last_connected_at
+    last_online = ("هرگز" if not last_connected
+                   else datetime.fromtimestamp(last_connected, tz=_IRAN_TZ).strftime("%Y-%m-%d %H:%M"))
+
+    traffic = {"up": 0, "down": int(used or 0), "total": int(used or 0)}
+    raw = {
+        "email": email,
         "enable": client.enabled,
-        "totalGB": quota / (1024 ** 3) if quota is not None else None,
-        "expiryTime": client.expires_at * 1000 if client.expires_at is not None else 0,
-        "traffic": {"up": 0, "down": int(used or 0), "total": int(used or 0)},
+        "comment": getattr(client, "comment", "") or "",
         "subId": client.subscription_id,
-        "remaining_gb": remaining / (1024 ** 3) if remaining is not None else None,
-        "quota_mode": client.quota_mode, "time_mode": client.time_mode,
+        "totalGB": quota if quota is not None else 0,
+        "expiryTime": expiry_ms,
+        "traffic": traffic,
+    }
+    legacy = {
+        # --- legacy xui_manager.parse_client_info contract (authoritative) ---
+        "email": email,
+        "group": "Default",
+        "enabled": client.enabled,
+        "is_expired": is_expired,
+        "is_depleted": is_depleted,
+        "total_gb": total_gb,
+        "used_gb": used_gb,
+        "remaining_gb": remaining_gb,
+        "expiry_str": expiry_str,
+        "days_left": days_left,
+        "is_relative": is_relative,
+        "last_online": last_online,
+        "inbound_ids": [],
+        "sub_id": client.subscription_id or "",
+        "raw": raw,
+        # --- canonical aliases retained for the newer contract ---
+        "state": "found",
+        "enable": client.enabled,
+        "totalGB": total_gb,
+        "subId": client.subscription_id,
+        "expiryTime": expiry_ms,
+        "traffic": traffic,
+        "quota_mode": client.quota_mode,
+        "time_mode": time_mode,
+        "expires_at": expires_at,
         "observed_at": client.observed_at,
         "account_id": int(account["id"]) if account and account.get("id") else int(client.ref[0]),
         "panel_id": int(account["panel_id"]) if account and account.get("panel_id") else int(client.ref[1]),
-        "state": "found",
     }
+    # NOTE: ``relative_days`` is deliberately omitted for on-hold clients — the
+    # canonical model drops the countdown magnitude, and the legacy caller's own
+    # ``.get("relative_days", 30)`` default is preferable to a fabricated value.
+    return legacy
 
 
 def normalize_persian_digits(value: Any) -> Any:
@@ -302,18 +376,31 @@ def format_status_report(client_info: Any, is_admin: bool = False) -> str:
     info = client_info if isinstance(client_info, Mapping) else {}
     if info.get("state") != "found" and not info.get("email"):
         return "وضعیت اکانت قابل تأیید نیست؛ نتیجه نامشخص است."
-    state = info.get("enable")
+    # Accept both generations: the canonical ``enable``/``totalGB`` spellings and
+    # the legacy ``enabled``/``total_gb`` ones produced by _canonical_to_legacy.
+    state = info.get("enable") if "enable" in info else info.get("enabled")
     state_text = "فعال" if state is True else "غیرفعال" if state is False else "نامشخص"
-    quota = info.get("totalGB")
+    quota = info.get("totalGB") if "totalGB" in info else info.get("total_gb")
     try:
         quota_text = f"{float(quota):.2f} GB" if quota is not None else "نامشخص"
     except (TypeError, ValueError):
         quota_text = "نامشخص"
     remaining = info.get("remaining_gb")
-    remaining_text = f"{float(remaining):.2f} GB" if isinstance(remaining, (int, float)) else "نامشخص"
+    if isinstance(remaining, (int, float)):
+        remaining_text = f"{float(remaining):.2f} GB"
+    elif isinstance(remaining, str) and remaining.strip():
+        remaining_text = html.escape(remaining.strip(), quote=True)
+    else:
+        remaining_text = "نامشخص"
     account = html.escape(str(info.get("email") or "نامشخص"), quote=True)
     lines = [f"📊 وضعیت اکانت: <code>{account}</code>", f"اتصال: <b>{state_text}</b>",
              f"حجم کل: <b>{quota_text}</b>", f"حجم باقی‌مانده: <b>{remaining_text}</b>"]
+    expiry = info.get("expiry_str")
+    if isinstance(expiry, str) and expiry.strip():
+        lines.append("انقضا: <b>" + html.escape(expiry.strip(), quote=True) + "</b>")
+    days_left = info.get("days_left")
+    if isinstance(days_left, (int, float)):
+        lines.append(f"روز باقی‌مانده: <b>{float(days_left):g}</b>")
     if is_admin and info.get("comment"):
         lines.append("توضیحات: " + html.escape(str(info["comment"]), quote=True))
     return "\n".join(lines)
@@ -386,39 +473,53 @@ def _lookup(identifier: str, *, account_ref=None, panel_id=None):
         info["sub_id"] = _database().read_account_sub_id(int(binding["id"]))
     except Exception:
         info["sub_id"] = None
+    if not info["sub_id"]:
+        # The panel is authoritative for the live subscription ID; the local
+        # column is empty for accounts created before the secret was stored.
+        info["sub_id"] = result.client.subscription_id
     info["subId"] = info["sub_id"]
     return binding, {"state": "found", "client": result.client, "info": info}
 
 
 def inspect_client(identifier: str, scope=None, by_code_only: bool = False, *, account_ref=None, panel_id=None):
+    """Legacy-compatible single-client read for the portal/rep/admin callers.
+
+    The historical ``xui_manager.inspect_client`` contract is
+    ``{"status": "ok"|"not_found"|"multiple_matches"|"unknown", "data": <flat record>|None}``
+    and every product caller (user_portal/rep_panel/rep_bot/admin_panel) is
+    written against it. The canonical ``found``/``state`` keys are returned
+    alongside so newer callers and the facade tests keep working.
+    """
     binding, outcome = _lookup(identifier, account_ref=account_ref, panel_id=panel_id)
-    if outcome["state"] != "found":
-        return {"found": False, "state": outcome["state"], "reason": outcome.get("reason"), "data": None}
-    return {"found": True, "state": "found", "data": {"info": outcome["info"], "raw": outcome["info"]}}
+    state = outcome["state"]
+    if state != "found":
+        return {"status": state, "found": False, "state": state,
+                "reason": outcome.get("reason"), "query": identifier, "data": None}
+    return {"status": "ok", "found": True, "state": "found", "data": outcome["info"]}
 
 
 def find_client_by_code(identifier: str, *, account_ref=None, panel_id=None):
+    """Legacy contract: ``{"found": bool, "data": {"raw", "email", ...}}``."""
     return inspect_client(identifier, account_ref=account_ref, panel_id=panel_id)
 
 
 def get_client_links(identifier: str, *, account_ref=None, panel_id=None):
+    """Legacy contract: a plain list of config URIs (empty when unavailable).
+
+    The historical ``xui_manager.get_client_links`` returned the raw
+    ``clients/links/{email}`` payload — a list of share URI strings — and the
+    delivery/QR callers index it directly (``links[0]``), so a mapping would
+    break them.
+    """
     binding, outcome = _lookup(identifier, account_ref=account_ref, panel_id=panel_id)
     if outcome["state"] != "found":
-        return {"state": outcome["state"], "links": [], "reason": outcome.get("reason")}
+        return []
     try:
         adapter = _factory().resolve_account_adapter(int(binding["id"]))
         nodes = _run(adapter.get_client_configs(str(binding["email"])))
-        links = [{"label": item.label, "protocol": item.protocol, "uri": item.uri,
-                  "node_key": item.node_key} for item in nodes]
-        sub_id = outcome["info"].get("sub_id")
-        if sub_id:
-            import sub_manager
-            subscription_url = sub_manager.get_subscription_url(sub_id, account_ref=binding)
-            if subscription_url:
-                links.insert(0, {"label": "subscription", "protocol": "subscription", "uri": subscription_url})
-        return {"state": "found", "links": links, "configs": links}
-    except Exception as exc:
-        return {"state": "unknown", "links": [], "reason": type(exc).__name__}
+        return [item.uri for item in nodes if getattr(item, "uri", None)]
+    except Exception:
+        return []
 
 
 def _account_for_sub_id(sub_id: str):

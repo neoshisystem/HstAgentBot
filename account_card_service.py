@@ -161,7 +161,8 @@ async def build_account_card(
         body = "دریافت snapshot از پنل ممکن نشد؛ مقادیر مصرف و انقضا نامعلوم‌اند."
 
     rows = [[button("کانفیگ‌ها و پروفایل‌ها", f"v52:sub:{exact_id}")],
-            [button("دریافت کانفیگ‌ها", f"v52:cfg:{exact_id}")]]
+            [button("دریافت کانفیگ‌ها", f"v52:cfg:{exact_id}")],
+            [button("🎫 پشتیبانی این سرویس", f"v52:support:{exact_id}")]]
     if authorize(ctx, exact_id, "rotate"):
         rows.append([button("چرخش لینک اشتراک", f"v52:rotate:sub:{exact_id}"),
                      button("چرخش اعتبارنامه", f"v52:rotate:cred:{exact_id}")])

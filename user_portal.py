@@ -258,19 +258,12 @@ async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         "👇 لطفاً بخش مورد نظر خود را انتخاب نمایید:"
     )
     keyboard = build_user_portal_keyboard(base_role=role)
-    if _v52_ui_enabled():
-        # ``InlineKeyboardMarkup.inline_keyboard`` is a tuple in python-telegram-bot
-        # v20+, so appending to it raised AttributeError and the portal button did
-        # nothing at all. Rebuild the markup from a list instead of mutating it.
-        rows = list(keyboard.inline_keyboard)
-        for account in linked_accs:
-            account_id = account.get("id") if isinstance(account, dict) else None
-            if isinstance(account_id, int) and account_id > 0:
-                label = str(account.get("account_code") or f"سرویس {account_id}")[:20]
-                rows.append([
-                    InlineKeyboardButton(f"🎫 تیکت {label}", callback_data=f"v52:support:{account_id}")
-                ])
-        keyboard = InlineKeyboardMarkup(rows)
+    # The portal menu used to append one «🎫 تیکت {account_code}» button per linked
+    # account. That surfaced the raw panel client identifier (e.g.
+    # ``default-pane-768db29…``) directly in the main menu and duplicated the
+    # «🎫 تیکت‌های من» entry that ``build_user_portal_keyboard`` already provides.
+    # Per-service ticketing belongs on the service card (``v52:support:<id>``),
+    # so the menu keeps the single, correctly-labelled entry.
 
     if edit_message and update.callback_query:
         try:
