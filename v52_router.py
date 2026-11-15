@@ -77,6 +77,8 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:panelnew:(3x-ui|manual)$"), "begin_panel_draft", "root", lambda m: {"panel_type": m[1]}),
     (re.compile(r"^v52:panelnew:(test|confirm)$"), "confirm_panel_draft", "root", lambda m: {"step": m[1]}),
     (re.compile(r"^v52:panelpolicy:([1-9][0-9]{0,17})$"), "preview_panel_policy", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:panelinbound:([1-9][0-9]{0,17})$"), "choose_panel_inbound", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:panelsetinbound:([1-9][0-9]{0,17}):([1-9][0-9]{0,17})$"), "set_panel_inbound", "root", lambda m: {"panel_id": int(m[1]), "inbound_id": int(m[2])}),
     (re.compile(r"^v52:bots$"), "list_bots", "root", lambda m: {}),
     (re.compile(r"^v52:bot:(primary|rep)$"), "begin_register_bot", "root", lambda m: {"kind": m[1]}),
     (re.compile(r"^v52:domains$"), "list_domains", "root", lambda m: {}),

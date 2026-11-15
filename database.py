@@ -53,6 +53,11 @@ DEFAULT_SETTINGS = [
     ("rep_logs_topic_id", "0", "تاپیک لاگ نمایندگی", "شناسه تاپیک اختصاصی لاگ‌های نماینده"),
     ("backups_topic_id", str(BACKUPS_TOPIC_ID), "تاپیک بکاپ‌ها", "شناسه تاپیک آپلود خودکار فایل‌های پشتیبان"),
     ("admin_dm_topic_id", str(ADMIN_DM_LOGS_TOPIC_ID), "تاپیک پیوی ادمین", "شناسه تاپیک میرور گزارشات در پیوی ادمین"),
+    ("registration_mode", "open", "حالت ثبت‌نام کاربران", "open (باز) | approval_required (نیازمند تایید مدیریت) | referral_only (فقط با کد معرف)"),
+    ("referral_requires_approval", "0", "تایید مدیریت پس از کد معرف", "اگر ۱ باشد کاربر دارای کد معرف معتبر باز هم نیازمند تایید مدیریت است"),
+    ("referral_signup_bonus", "0", "هدیه ثبت‌نام معرف (تومان)", "مبلغ ثابت واریز به کیف پول معرف پس از تایید عضویت زیرمجموعه"),
+    ("referral_first_purchase_bonus", "0", "هدیه اولین خرید معرف (تومان)", "مبلغ ثابت واریز به کیف پول معرف پس از اولین خرید موفق زیرمجموعه"),
+    ("referral_purchase_reward_percent", "0", "درصد پاداش خرید معرف", "درصدی از مبلغ اولین خرید زیرمجموعه که به کیف پول معرف واریز می‌شود"),
     ("pending_receipts_topic_id", "0", "تاپیک فیش‌ها و امور مالی", "شناسه تاپیک تایید فیش‌ها و عملیات مالی"),
     ("support_tickets_topic_id", "0", "تاپیک تیکت‌ها و گزارش تخلف", "شناسه تاپیک تیکت‌ها و گزارش تخلف"),
     ("admin_telegram_id", str(ADMIN_TELEGRAM_ID), "شناسه تلگرام ادمین کل", "شناسه عددی ادمین اصلی سیستم")
@@ -549,6 +554,76 @@ def init_db():
         if "credit_limit_toman" not in cols_rep:
             cur.execute("ALTER TABLE representatives ADD COLUMN credit_limit_toman INTEGER DEFAULT 5000000")
 
+        # --- S51 registration / referral schema ---------------------------------
+        # Added through the idempotent PRAGMA+ALTER path on purpose: a nineteenth
+        # migration file would change the frozen schema_migrations count that the
+        # v5.2 acceptance tests assert.
+        cols_users = [c[1] for c in cur.execute("PRAGMA table_info(bot_users)").fetchall()]
+        for column_name, column_definition in (
+            # Every pre-existing row must stay usable, so the default is approved.
+            ("registration_status", "TEXT NOT NULL DEFAULT 'approved'"),
+            ("referral_code", "TEXT"),
+            ("referred_by_user_id", "INTEGER"),
+            ("referred_by_code", "TEXT"),
+            ("origin_bot_id", "INTEGER"),
+            ("assigned_rep_id", "INTEGER"),
+            ("registration_decided_at", "TIMESTAMP"),
+            ("registration_decided_by", "INTEGER"),
+        ):
+            if column_name not in cols_users:
+                cur.execute(
+                    f"ALTER TABLE bot_users ADD COLUMN {column_name} {column_definition}"
+                )
+                cols_users.append(column_name)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bot_users_registration "
+            "ON bot_users(registration_status, origin_bot_id)"
+        )
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_bot_users_referral_code "
+            "ON bot_users(referral_code) WHERE referral_code IS NOT NULL"
+        )
+        # Every row that exists before the registration policy is switched on is
+        # treated as already decided, so an existing customer is never re-queued.
+        cur.execute(
+            "UPDATE bot_users SET registration_decided_at="
+            "COALESCE(registration_decided_at, created_at, CURRENT_TIMESTAMP) "
+            "WHERE registration_decided_at IS NULL AND registration_status='approved'"
+        )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS referral_rewards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_user_id INTEGER NOT NULL,
+            referred_user_id INTEGER NOT NULL,
+            reward_type TEXT NOT NULL,
+            amount_toman INTEGER NOT NULL DEFAULT 0,
+            order_id TEXT,
+            ledger_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(referrer_user_id, referred_user_id, reward_type)
+        )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_referral_rewards_referrer "
+            "ON referral_rewards(referrer_user_id, created_at)"
+        )
+        # Per-tenant registration policy. 'inherit' falls back to the parent scope
+        # so an existing deployment keeps its behaviour until it is set explicitly.
+        # ``bot_registry`` is created by migration 006, which runs *after* init_db,
+        # so the column is added only when the table already exists.
+        def _add_column_if_present(table: str, column: str, definition: str) -> None:
+            exists = cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if exists is None:
+                return
+            present = [c[1] for c in cur.execute(f"PRAGMA table_info({table})").fetchall()]
+            if column not in present:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+        _add_column_if_present("bot_registry", "registration_mode", "TEXT NOT NULL DEFAULT 'inherit'")
+        _add_column_if_present("representatives", "registration_mode", "TEXT NOT NULL DEFAULT 'inherit'")
+
         cols_plans = [c[1] for c in cur.execute("PRAGMA table_info(pricing_plans)").fetchall()]
         if "is_active" not in cols_plans:
             cur.execute("ALTER TABLE pricing_plans ADD COLUMN is_active INTEGER DEFAULT 1")
@@ -1005,6 +1080,67 @@ def get_main_group_id() -> int:
         return normalize_group_chat_id(raw)
     except ValueError:
         return 0
+
+
+def account_exists_for_email(email: str) -> bool:
+    """True when a non-deleted local account already carries this identifier."""
+    identifier = str(email or "").strip()
+    if not identifier:
+        return False
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM accounts WHERE LOWER(email)=LOWER(?) AND deleted_at IS NULL",
+            (identifier,),
+        ).fetchone()
+    return row is not None
+
+
+def credit_referral_reward(
+    referrer_user_id: int, referred_user_id: int, reward_type: str, amount_toman: int,
+    description: str, *, order_id: str | None = None, actor_id: int = 0,
+    actor_name: str = "ReferralReward",
+) -> dict:
+    """Credit one referral reward to the referrer's wallet and ledger atomically.
+
+    The ``referral_rewards`` row is the idempotency guard: a second call for the
+    same (referrer, referred, reward_type) triple credits nothing and reports
+    ``already_paid``. The wallet credit and the ledger row are written in the same
+    transaction, so a crash cannot pay twice or pay without a ledger entry.
+    """
+    import registration_service
+
+    amount = int(amount_toman)
+    if amount <= 0:
+        return {"status": "skipped", "reason": "reward_amount_is_zero"}
+    referrer = int(referrer_user_id)
+    referred = int(referred_user_id)
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        if registration_service.reward_already_paid(
+            cur, referrer_user_id=referrer, referred_user_id=referred,
+            reward_type=reward_type,
+        ):
+            return {"status": "already_paid", "amount_toman": amount}
+        new_balance = _credit_user_wallet(
+            cur, referrer, amount, description, int(actor_id), str(actor_name)
+        )
+        ledger = cur.execute(
+            "SELECT id FROM financial_ledger WHERE user_id=? ORDER BY id DESC LIMIT 1",
+            (referrer,),
+        ).fetchone()
+        ledger_id = int(ledger["id"]) if ledger is not None else None
+        recorded = registration_service.record_reward(
+            cur, referrer_user_id=referrer, referred_user_id=referred,
+            reward_type=reward_type, amount_toman=amount, ledger_id=ledger_id,
+            order_id=order_id,
+        )
+        if not recorded:
+            raise RuntimeError("referral reward could not be recorded")
+        return {
+            "status": "credited", "amount_toman": amount,
+            "new_balance": new_balance, "ledger_id": ledger_id,
+        }
 
 
 def list_unresolved_user_action_intents(limit: int = 30, user_id: int | None = None) -> list:

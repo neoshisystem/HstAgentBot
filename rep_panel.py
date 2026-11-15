@@ -175,6 +175,13 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     parts = data.split(":")
     action = parts[1] if len(parts)>1 else "main"
+    sub_action = parts[2] if len(parts) > 2 else ""
+    if action in {"reg_settings", "reg_mode", "reg_toggle_approval", "pending_reg",
+                  "reg_approve", "reg_reject", "reg_approve_all"}:
+        from rep_bot import _handle_registration_admin
+        await _handle_registration_admin(
+            update, context, scope="rep", action=action, sub_action=sub_action)
+        return
     if action=="cancel_form":
         state=context.user_data.pop("rep_state",None) or {}
         await _cleanup_form_prompt(

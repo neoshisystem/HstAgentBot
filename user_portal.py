@@ -41,6 +41,67 @@ def _v52_ui_enabled() -> bool:
     return str(value).strip().lower() in enabled or str(environment).strip().lower() in enabled
 
 
+async def _provision_on_panel(user, context, *, plan_code, gb, days, comment, order_id,
+                              for_role="end_user", rep_id=None):
+    """Create the client on an active panel when the pre-allocated pool is empty.
+
+    Returns a legacy-shaped result so the caller's existing SUCCESS / FAILURE /
+    UNKNOWN handling applies unchanged: a proven creation is a success, a proven
+    rejection is a definite failure (which refunds), and anything else keeps the
+    lock for reconciliation.
+    """
+    import panel_provisioning_service as provisioning
+    try:
+        with database.get_db() as conn:
+            panel = provisioning.select_panel(
+                conn, for_role=for_role, rep_id=rep_id, plan_code=plan_code)
+    except provisioning.ProvisioningError as exc:
+        return {"status": "failed", "state": "definite_failure", "dispatched": False,
+                "reason": str(exc)}
+    try:
+        adapter = xui_manager.get_panel_adapter(int(panel["id"]))
+    except Exception as exc:
+        return {"status": "failed", "state": "definite_failure", "dispatched": False,
+                "reason": f"adapter_unavailable:{type(exc).__name__}"}
+    try:
+        inbound_ids = provisioning.resolve_inbound_ids(panel)
+        if not inbound_ids:
+            inbound_ids = await provisioning.discover_inbound_ids(adapter)
+        email = provisioning.build_client_email(panel)
+        with database.get_db() as conn:
+            outcome = await provisioning.provision_account(
+                adapter, conn,
+                panel=panel, email=email, gb=float(gb), days=int(days),
+                owner_tg_id=int(user.id), actor_tg_id=int(user.id),
+                bot_id=int(getattr(context.bot, "id", 0) or 0),
+                seller_key="root" if rep_id is None else f"rep:{int(rep_id)}",
+                rep_id=rep_id, customer_name=getattr(user, "full_name", "") or "",
+                # ``panel_operations.order_id`` is a foreign key into
+                # ``payment_orders``; a wallet purchase is keyed by its
+                # user_action_intent, so the intent id travels in the comment
+                # instead of being written into a column it cannot satisfy.
+                order_id=None, inbound_ids=inbound_ids,
+                comment=(f"{comment} intent:{order_id}" if order_id else comment),
+            )
+    except provisioning.ProvisioningError as exc:
+        return {"status": "failed", "state": "definite_failure", "dispatched": False,
+                "reason": str(exc)}
+    except Exception:
+        logger.exception("Panel provisioning raised before dispatch")
+        return {"status": "unknown", "state": "unknown", "dispatched": True,
+                "reason": "provisioning_exception"}
+    state = str(outcome.get("state"))
+    if state == "success":
+        return {"status": "ok", "state": "success", "dispatched": True,
+                "email": email, "sub_id": None, "data": {},
+                "panel_id": int(panel["id"]), "account_id": outcome.get("account_id")}
+    if state == "definite_failure":
+        return {"status": "failed", "state": "definite_failure", "dispatched": True,
+                "reason": "panel_rejected_creation"}
+    return {"status": "unknown", "state": "unknown", "dispatched": True,
+            "reason": "panel_creation_outcome_unknown"}
+
+
 async def _dispatch_v52_from_portal(update, context, role="end_user", rep=None):
     from rep_bot import _dispatch_v52_callback
     return await _dispatch_v52_callback(update, context, role=role, rep=rep)
@@ -119,6 +180,7 @@ def build_user_portal_keyboard(base_role: str | None = None) -> InlineKeyboardMa
              InlineKeyboardButton("💳 کیف پول", callback_data="user:wallet")],
             [InlineKeyboardButton("🎫 تیکت‌های من", callback_data="v52:tickets"),
              InlineKeyboardButton("🚨 گزارش تخلف", callback_data="v52:abuse")],
+            [InlineKeyboardButton("🎁 دعوت از دوستان (کد معرف)", callback_data="user:referral")],
             # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
             [InlineKeyboardButton("🛒 خرید سرویس جدید", callback_data="user:buy_service"),
              InlineKeyboardButton("🔗 اتصال اکانت به تلگرام", callback_data="user:prompt_link")],
@@ -132,6 +194,7 @@ def build_user_portal_keyboard(base_role: str | None = None) -> InlineKeyboardMa
         [InlineKeyboardButton("💳 کیف پول و شارژ حساب", callback_data="user:wallet"),
          InlineKeyboardButton("🔗 اتصال اکانت به تلگرام", callback_data="user:prompt_link")],
         [InlineKeyboardButton("📋 تعرفه‌ها و قیمت‌ها", callback_data="user:pricing")],
+        [InlineKeyboardButton("🎁 دعوت از دوستان (کد معرف)", callback_data="user:referral")],
     ]
     rows.extend(persona_switch_rows(base_role))
     return InlineKeyboardMarkup(rows)
@@ -671,6 +734,15 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
             )
             return
 
+        # The pre-allocated pool cannot serve this call (no binding was even
+        # resolved). Fall back to creating the client on a real panel, which is
+        # the only path that can actually deliver the service.
+        if classify_xui_result(alloc_res) == XUIResult.FAILURE and alloc_res.get("dispatched") is False:
+            alloc_res = await _provision_on_panel(
+                user, context, plan_code=intent.get("plan_code"), gb=gb, days=days,
+                comment=comment, order_id=intent_id,
+            )
+
         if classify_xui_result(alloc_res) == XUIResult.SUCCESS:
             email = alloc_res.get("email")
             sub_id = alloc_res.get("sub_id")
@@ -688,17 +760,20 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
 
             try:
                 code = xui_manager.extract_account_identifier(email) or email
-                database.upsert_account_record(
-                    rep_id=None,
-                    email=email,
-                    account_code=code,
-                    customer_name=user.full_name or "EndUser",
-                    sub_id=sub_id,
-                    enable=1,
-                    total_gb=gb,
-                    expiry_time=alloc_res.get("data", {}).get("expiry_time", 0),
-                    owner_tg_id=user.id
-                )
+                # The panel-provisioning path already persisted the account row
+                # before dispatch; only the pool path needs it created here.
+                if not database.account_exists_for_email(email):
+                    database.upsert_account_record(
+                        rep_id=None,
+                        email=email,
+                        account_code=code,
+                        customer_name=user.full_name or "EndUser",
+                        sub_id=sub_id,
+                        enable=1,
+                        total_gb=gb,
+                        expiry_time=alloc_res.get("data", {}).get("expiry_time", 0),
+                        owner_tg_id=user.id
+                    )
             except Exception:
                 logger.exception("X-UI allocated account %s but local persistence failed", email)
                 try:
@@ -769,6 +844,20 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
                     reply_markup=build_user_portal_keyboard()
                 )
             await query.answer("🎉 خرید با موفقیت انجام شد!")
+            # The first successful purchase of an invited user pays the referrer
+            # once; the reward row is the idempotency key, so a later purchase
+            # credits nothing.
+            try:
+                import registration_service
+                reward = registration_service.pay_first_purchase_reward(
+                    user.id, order_amount=price, order_id=intent_id,
+                    actor_id=user.id, actor_name="ReferralReward",
+                )
+                if reward.get("status") == "credited":
+                    from rep_bot import _notify_referrer_of_reward
+                    await _notify_referrer_of_reward(context, reward, user.id)
+            except Exception:
+                logger.exception("Could not pay the referral first-purchase reward")
         elif classify_xui_result(alloc_res) == XUIResult.FAILURE:
             try:
                 database.refund_user_wallet_and_release_operation_lock(
@@ -862,6 +951,64 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
         keyboard = build_back_to_user_keyboard(extra_btns)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("کیف پول")
+
+    # 3.9 Registration status, referral code capture and the invite page
+    elif action in {"reg_status", "referral", "referral_list", "referral_code"}:
+        import registration_service
+        import registration_ui
+
+        if action == "reg_status":
+            with database.get_db() as conn:
+                row = conn.execute(
+                    "SELECT registration_status FROM bot_users WHERE telegram_id=?",
+                    (int(user.id),),
+                ).fetchone()
+            status = str(row["registration_status"]) if row is not None else "approved"
+            text, markup = registration_ui.build_registration_status_page(status)
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+            await query.answer("وضعیت عضویت")
+            return
+
+        if action == "referral_code":
+            context.user_data["referral_pending"] = True
+            text, markup = registration_ui.build_referral_code_prompt()
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+            await query.answer("کد معرف را ارسال کنید")
+            return
+
+        if action == "referral_list":
+            with database.get_db() as conn:
+                referrals = registration_service.list_referrals(conn, user.id)
+            text, markup = registration_ui.build_referral_list_page(referrals)
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+            await query.answer("دوستان دعوت‌شده")
+            return
+
+        bot_username = ""
+        try:
+            bot_username = str(getattr(context.bot, "username", "") or "")
+        except Exception:
+            bot_username = ""
+        if not bot_username:
+            try:
+                with database.get_db() as conn:
+                    row = conn.execute(
+                        "SELECT username FROM bot_registry WHERE bot_id=?",
+                        (int(getattr(context.bot, "id", 0) or 0),),
+                    ).fetchone()
+                bot_username = str(row["username"]) if row is not None else ""
+            except Exception:
+                bot_username = ""
+        with database.get_db() as conn:
+            code = registration_service.generate_referral_code(conn, user.id)
+            stats = registration_service.referral_stats(conn, user.id)
+            plan = registration_service.reward_plan(conn)
+            conn.commit()
+        link = registration_service.invite_link(bot_username, code)
+        text, markup = registration_ui.build_referral_page(
+            code=code, link=link, stats=stats, reward_plan=plan)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        await query.answer("دعوت از دوستان")
 
     # 4.0 Escrowed / unresolved transactions — the customer must never think the
     # money simply vanished; show exactly what is held and how to get it back.

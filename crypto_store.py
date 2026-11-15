@@ -15,7 +15,13 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 _ENV_KEY: Final[str] = "BACKUP_ENCRYPTION_KEY"
 _HKDF_SALT: Final[bytes] = b"hstagent/crypto-store/v1"
 _ALLOWED_LABELS: Final[frozenset[str]] = frozenset(
-    {"hstagent/columns/v1", "hstagent/archive/v1"}
+    {
+        "hstagent/columns/v1",
+        "hstagent/archive/v1",
+        # Prepared panel-operation requests (client creation) are their own
+        # domain so a ciphertext from one purpose can never be replayed in another.
+        "hstagent/panel-operation/v1",
+    }
 )
 _ENVELOPE_VERSION: Final[str] = "v1"
 _KEY_ENCODING_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{43}={0,1}$")

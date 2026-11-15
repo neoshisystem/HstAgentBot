@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import logging
 import asyncio
 import time
@@ -378,6 +379,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if database.is_user_blocked(user.id):
         await update.message.reply_text("⛔️ دسترسی حساب شما به این بات توسط مدیریت مسدود شده است.")
+        return
+    if await _apply_registration_gate(update, context, role, rep):
         return
     if role == "super_admin":
         await admin_panel.show_admin_dashboard(update, context)
@@ -1336,9 +1339,63 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         [button("ویرایش اتصال", f"v52:panelconfig:{panel_id}")],
                         [button("🧪 آزمایش اتصال", f"v52:paneltest:{panel_id}")],
                         [button("⚡ تست اتصال و فعال‌سازی خودکار", f"v52:panelauto:{panel_id}")],
+                        [button("🧩 انتخاب Inbound پیش‌فرض ساخت اکانت", f"v52:panelinbound:{panel_id}")],
                         [button("🟢 فعال‌سازی پس از آزمایش", f"v52:life:{panel_id}:active")],
                         [button("بازگشت به فهرست", "v52:panels")],
                     ])
+            elif name == "choose_panel_inbound":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("انتخاب inbound پیش‌فرض فقط در اختیار root است.")
+                from ui_v52 import render_page, button, render_error
+                panel_id = int(params["panel_id"])
+                listing = await asyncio.to_thread(xui_manager.list_panel_inbounds, panel_id)
+                if listing.get("state") != "found":
+                    page = render_error(
+                        f"خواندن inboundهای پنل ممکن نشد ({listing.get('reason') or 'نامشخص'}).",
+                        persona="admin", parent_callback=f"v52:panel:{panel_id}")
+                else:
+                    inbounds = listing.get("inbounds") or []
+                    if not inbounds:
+                        page = render_error(
+                            "این پنل هیچ inbound فعالی برنگرداند.",
+                            persona="admin", parent_callback=f"v52:panel:{panel_id}")
+                    else:
+                        lines = ["inboundهای خوانده‌شده از پنل:", ""]
+                        rows = []
+                        for item in inbounds[:20]:
+                            lines.append(
+                                f"• id={item.get('id')} | {item.get('protocol') or '—'} | "
+                                f"پورت {item.get('port') or '—'} | {item.get('remark') or 'بدون نام'} | "
+                                f"{'فعال' if item.get('enable') else 'غیرفعال'}"
+                            )
+                            rows.append([button(
+                                f"انتخاب inbound {item.get('id')}",
+                                f"v52:panelsetinbound:{panel_id}:{item.get('id')}")])
+                        rows.append([button("بازگشت به پنل", f"v52:panel:{panel_id}")])
+                        page = render_page(
+                            "انتخاب Inbound پیش‌فرض ساخت اکانت", "\n".join(lines),
+                            persona="admin", page_kind="form", rows=rows)
+            elif name == "set_panel_inbound":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("ثبت inbound پیش‌فرض فقط در اختیار root است.")
+                from ui_v52 import render_page
+                panel_id = int(params["panel_id"])
+                inbound_id = int(params["inbound_id"])
+                with database.get_db() as conn:
+                    exists = conn.execute("SELECT 1 FROM panels WHERE id=?", (panel_id,)).fetchone()
+                    if exists is None:
+                        raise ValueError("پنل موردنظر وجود ندارد.")
+                    conn.execute(
+                        "UPDATE panels SET default_inbound_ids_json=?, revision=revision+1 "
+                        "WHERE id=?",
+                        (json.dumps([inbound_id]), panel_id),
+                    )
+                    conn.commit()
+                page = render_page(
+                    "Inbound پیش‌فرض ثبت شد",
+                    f"پنل {panel_id} اکنون اکانت‌های جدید را روی inbound {inbound_id} می‌سازد.",
+                    persona="admin", page_kind="result",
+                    parent_callback=f"v52:panel:{panel_id}")
             elif name == "begin_panel_config":
                 if persona != "admin" or not ctx.get("is_root") or getattr(update.effective_chat, "type", "") != "private":
                     raise PermissionError("تنظیم اتصال پنل فقط در پیوی root مجاز است.")
@@ -2765,7 +2822,7 @@ def _runtime_flag(name: str) -> bool:
 CONVERSATION_STATE_KEYS = (
     "user_state", "admin_state", "rep_state", "fsm_state",
     "deposit_role", "deposit_amount", "deposit_form_state",
-    "active_receipt_code", "transfer_confirm",
+    "active_receipt_code", "transfer_confirm", "referral_pending",
 )
 
 # Callbacks that mean "I am leaving whatever I was doing": every main-menu entry,
@@ -2790,6 +2847,269 @@ _WORKFLOW_START_PREFIXES = (
     "admin:prompt_", "rep:prompt_", "v52:panelnew", "v52:panelconfig:",
     "v52:domain:", "v52:bot:", "v52:inventory:", "v52:poolimport:",
 )
+
+
+async def _notify_registration_owner(update, context, user_row, rep_id) -> None:
+    """Send the approval card to the tenant owner: the rep of this bot, else root.
+
+    A representative's own bot must never route a pending approval into the root
+    queue, so the destination is derived from the bot/rep scope, not from a
+    global admin id.
+    """
+    import registration_ui
+    try:
+        target_chat = None
+        if rep_id:
+            rep_info = database.get_rep_by_id(int(rep_id))
+            if rep_info and rep_info.get("telegram_id"):
+                target_chat = int(rep_info["telegram_id"])
+        if target_chat is None:
+            target_chat = int(database.get_setting(
+                "admin_telegram_id", default=ADMIN_TELEGRAM_ID, cast_type=int) or 0)
+        if not target_chat:
+            # A stored 0 means "not configured", not "send nowhere": fall back to
+            # the deployment's configured root so the queue can never be silent.
+            target_chat = int(ADMIN_TELEGRAM_ID or 0)
+        if not target_chat:
+            return
+        if rep_id:
+            text, markup = registration_ui.build_rep_approval_card(user_row)
+        else:
+            text, markup = registration_ui.build_approval_card(user_row)
+        await context.bot.send_message(
+            chat_id=target_chat, text=text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=markup,
+        )
+    except Exception:
+        logger.exception("Could not deliver the registration approval card")
+
+
+async def _apply_registration_gate(update, context, role, rep) -> bool:
+    """Apply the tenant registration policy; True when the actor is held back.
+
+    Root and representatives are provisioned by the operator and never queued.
+    Every other actor is classified by the tenant's mode, and a not-yet-approved
+    actor sees the holding page instead of the portal.
+    """
+    import registration_service
+    import registration_ui
+    user = update.effective_user
+    chat = update.effective_chat
+    if role in ("super_admin", "rep", "unauthorized_group") or user is None:
+        return False
+    bot_id = _bot_id_of(context)
+    rep_id = rep.get("id") if isinstance(rep, dict) else None
+    invite_code = registration_service.parse_start_payload(getattr(context, "args", None))
+    typed_code = context.user_data.pop("referral_pending_code", "")
+    try:
+        database.ensure_bot_user(user.id, user.username or "", user.full_name or "", role="end_user")
+        with database.get_db() as conn:
+            result = registration_service.register(
+                conn, user_id=user.id, username=user.username or "",
+                full_name=user.full_name or "", bot_id=bot_id or None,
+                rep_id=rep_id, invite_code=invite_code or None,
+                typed_code=typed_code or None, now=int(time.time()),
+            )
+            conn.commit()
+    except registration_service.RegistrationError:
+        text, markup = registration_ui.build_registration_waiting_page(
+            registration_service.STATUS_AWAITING_REFERRAL)
+        await update.message.reply_text(
+            "❌ کد معرف وارد‌شده معتبر نیست.\n\n" + text,
+            parse_mode=ParseMode.MARKDOWN, reply_markup=markup,
+        )
+        return True
+    except Exception:
+        logger.exception("Registration policy evaluation failed; access is held back")
+        await update.message.reply_text(
+            "⛔️ بررسی وضعیت عضویت ممکن نشد؛ لطفاً بعداً دوباره تلاش کنید.",
+            reply_markup=build_actor_navigation_keyboard(role),
+        )
+        return True
+
+    status = str(result["status"])
+    if status == registration_service.STATUS_APPROVED:
+        return False
+    if status == registration_service.STATUS_PENDING and result.get("changed"):
+        row = database.get_bot_user_by_tg_id(user.id) or {}
+        await _notify_registration_owner(update, context, row, rep_id)
+    if status == registration_service.STATUS_REJECTED:
+        text, markup = registration_ui.build_registration_rejected_page()
+    else:
+        text, markup = registration_ui.build_registration_waiting_page(
+            status, has_referrer=bool(result.get("referrer")))
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+    return True
+
+
+async def _handle_registration_admin(update, context, *, scope: str, action: str, sub_action: str) -> bool:
+    """Shared registration-policy and approval-queue handler for admin and rep.
+
+    One implementation serves both entry points so a representative's bot can
+    never diverge from the root behaviour, and the tenant scope is what decides
+    which queue is read and written.
+    """
+    import registration_service
+    import registration_ui
+
+    query = update.callback_query
+    user = update.effective_user
+    prefix = "admin" if scope == "admin" else "rep"
+    rep_id = None
+    if scope == "rep":
+        active_rep = _resolve_persona_rep(user)
+        rep_id = active_rep.get("id") if isinstance(active_rep, dict) else None
+        if rep_id is None:
+            await query.answer("⛔️ میزکار نمایندگی برای حساب شما فعال نیست.", show_alert=True)
+            return True
+    bot_id = _bot_id_of(context) or None
+
+    def _read_policy():
+        with database.get_db() as conn:
+            mode = registration_service.resolve_mode(conn, bot_id=bot_id, rep_id=rep_id)
+            pending = registration_service.pending_count(conn, bot_id=bot_id, rep_id=rep_id)
+        requires = str(database.get_setting(
+            "referral_requires_approval", "0")).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        return mode, requires, pending
+
+    async def _render_settings():
+        mode, requires, pending = _read_policy()
+        text, markup = registration_ui.build_registration_settings_page(
+            mode=mode, requires_approval=requires, pending=pending, scope=scope)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+
+    async def _render_queue():
+        with database.get_db() as conn:
+            pending = registration_service.list_pending(conn, bot_id=bot_id, rep_id=rep_id)
+        text, markup = registration_ui.build_pending_registrations_page(pending, scope=scope)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+
+    if action == "reg_settings":
+        await _render_settings()
+        await query.answer("سیاست ثبت‌نام")
+        return True
+
+    if action == "reg_mode":
+        try:
+            with database.get_db() as conn:
+                registration_service.set_mode(
+                    conn, mode=sub_action, bot_id=bot_id, rep_id=rep_id)
+                conn.commit()
+        except registration_service.RegistrationError as exc:
+            await query.answer(f"❌ حالت نامعتبر: {exc}", show_alert=True)
+            return True
+        await _render_settings()
+        await query.answer("حالت ثبت‌نام ذخیره شد.")
+        return True
+
+    if action == "reg_toggle_approval":
+        current = str(database.get_setting(
+            "referral_requires_approval", "0")).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        database.set_setting(
+            "referral_requires_approval", "0" if current else "1",
+            actor_id=user.id, actor_name=user.full_name or "Admin")
+        await _render_settings()
+        await query.answer("تنظیم ذخیره شد.")
+        return True
+
+    if action == "pending_reg":
+        await _render_queue()
+        await query.answer("درخواست‌های عضویت")
+        return True
+
+    if action == "reg_approve_all":
+        with database.get_db() as conn:
+            pending = registration_service.list_pending(conn, bot_id=bot_id, rep_id=rep_id)
+        changed = 0
+        for item in pending:
+            target = int(item["telegram_id"])
+            try:
+                with database.get_db() as conn:
+                    outcome = registration_service.approve(conn, user_id=target, actor_id=user.id)
+                    conn.commit()
+            except Exception:
+                logger.exception("Bulk approval failed for %s", target)
+                continue
+            if outcome.get("changed"):
+                changed += 1
+                await _notify_registration_decision(context, target, approved=True)
+                registration_service.pay_signup_bonus(
+                    target, actor_id=user.id, actor_name=user.full_name or "Admin")
+        await _render_queue()
+        await query.answer(f"✅ {changed} درخواست تایید شد.")
+        return True
+
+    if action in {"reg_approve", "reg_reject"}:
+        try:
+            target = int(str(sub_action))
+        except (TypeError, ValueError):
+            await query.answer("شناسه کاربر نامعتبر است.", show_alert=True)
+            return True
+        approve = action == "reg_approve"
+        try:
+            with database.get_db() as conn:
+                decision = (registration_service.approve if approve else registration_service.reject)
+                outcome = decision(conn, user_id=target, actor_id=user.id)
+                conn.commit()
+        except registration_service.RegistrationError as exc:
+            await query.answer(f"❌ تعیین تکلیف انجام نشد: {exc}", show_alert=True)
+            return True
+        if outcome.get("changed"):
+            await _notify_registration_decision(context, target, approved=approve)
+            if approve:
+                reward = registration_service.pay_signup_bonus(
+                    target, actor_id=user.id, actor_name=user.full_name or "Admin")
+                await _notify_referrer_of_reward(context, reward, target)
+        await _render_queue()
+        await query.answer("✅ تایید شد." if approve else "❌ رد شد.")
+        return True
+    return False
+
+
+async def _notify_registration_decision(context, target_user_id: int, *, approved: bool) -> None:
+    """Tell the applicant the outcome and give them the way back in."""
+    try:
+        if approved:
+            text = ("🎉 **حساب شما تایید شد!**\n\n"
+                    "از این پس می‌توانید از منوی اصلی ربات استفاده کنید.")
+            label = "🏠 ورود به منوی اصلی"
+        else:
+            text = ("❌ **درخواست عضویت شما تایید نشد.**\n\n"
+                    "در صورت نیاز با پشتیبانی تماس بگیرید.")
+            label = "🔄 بررسی وضعیت تایید"
+        callback = "user:main" if approved else "user:reg_status"
+        await context.bot.send_message(
+            chat_id=int(target_user_id), text=text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=callback)]]),
+        )
+    except Exception:
+        logger.exception("Could not notify user %s about the registration decision", target_user_id)
+
+
+async def _notify_referrer_of_reward(context, reward, referred_user_id: int) -> None:
+    """Congratulate the referrer when a reward actually lands in their wallet."""
+    if not isinstance(reward, dict) or reward.get("status") != "credited":
+        return
+    referrer = int(reward.get("referrer_user_id") or 0)
+    if not referrer:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=referrer,
+            text=(
+                "🎁 **پاداش دعوت شما واریز شد!**\n\n"
+                f"• مبلغ: **{int(reward.get('amount_toman') or 0):,} تومان**\n"
+                f"• موجودی جدید کیف پول: **{int(reward.get('new_balance') or 0):,} تومان**\n\n"
+                "از دعوت دوستانتان سپاسگزاریم."
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💳 کیف پول من", callback_data="user:wallet"),
+                InlineKeyboardButton("🎁 دعوت از دوستان", callback_data="user:referral"),
+            ]]),
+        )
+    except Exception:
+        logger.exception("Could not notify referrer %s about the reward", referrer)
 
 
 def _bot_id_of(context) -> int:
@@ -3686,6 +4006,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ دسترسی شما به این بات توسط مدیریت مسدود شده است.")
         return
     if role == "super_admin" and chat.type != "private":
+        return
+
+    # A user held at the referral gate may send their code as plain text. It is
+    # captured before any other handler so the code is never mistaken for an
+    # amount, a ticket body or a search term.
+    if role == "end_user" and context.user_data.get("referral_pending"):
+        import registration_service
+        import registration_ui
+        code = registration_service.normalize_referral_code(msg_text)
+        context.user_data.pop("referral_pending", None)
+        if code:
+            context.user_data["referral_pending_code"] = code
+            await start_cmd(update, context)
+        else:
+            text, markup = registration_ui.build_referral_code_prompt()
+            await update.message.reply_text(
+                "❌ کد معرف نامعتبر است.\n\n" + text,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=markup,
+            )
         return
 
     if await _route_v52_fsm_text(update, context):

@@ -714,6 +714,22 @@ def allocate_pool_client(identifier: str, gb=None, days=None, *args, account_ref
         return {"status": "unknown", "state": "unknown", "reason": "allocation_outcome_unknown"}
 
 
+def get_panel_adapter(panel_id: int):
+    """Resolve the adapter for one panel; used by the provisioning service."""
+    return _factory().get_adapter(_positive(panel_id, "panel_id"))
+
+
+def list_panel_inbounds(panel_id: int):
+    """Read the panel's inbounds for the admin picker; never mutates anything."""
+    try:
+        pid = _positive(panel_id, "panel_id")
+        inbounds = _run(_factory().get_adapter(pid).list_inbounds())
+        return {"state": "found", "panel_id": pid, "inbounds": list(inbounds)}
+    except Exception as exc:
+        return {"state": "unknown", "panel_id": panel_id, "inbounds": [],
+                "reason": type(exc).__name__}
+
+
 def audit_clients_overview(panel_id: int):
     try:
         pid = _positive(panel_id, "panel_id")
@@ -730,5 +746,5 @@ __all__ = [
     "extract_customer_name", "parse_package_terms", "format_audit_report",
     "allocate_pool_client", "renew_client", "set_client_enable", "set_client_comment",
     "inspect_client", "get_client_links", "get_sub_url", "find_client_by_code",
-    "update_client_sub_id", "audit_clients_overview",
+    "update_client_sub_id", "audit_clients_overview", "list_panel_inbounds", "get_panel_adapter",
 ]

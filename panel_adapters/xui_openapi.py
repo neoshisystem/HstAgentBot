@@ -939,6 +939,34 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             "observed_at": int(self._clock()),
         }
 
+    async def list_inbounds(self) -> list[dict[str, Any]]:
+        """Return the panel's inbounds with the fields the account wizard needs.
+
+        Read-only. The caller uses it to discover which inbound a new client
+        should be created on when the panel has no configured default, and the
+        admin panel uses it to let an operator pick one explicitly.
+        """
+        result = await self._request("GET", "inbounds/list")
+        rows = self._obj(result)
+        if not isinstance(rows, list):
+            raise AdapterUnavailable("inbounds/list returned a malformed object")
+        inbounds: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            inbound_id = row.get("id")
+            if isinstance(inbound_id, bool) or not isinstance(inbound_id, int) or inbound_id <= 0:
+                continue
+            port = row.get("port")
+            inbounds.append({
+                "id": inbound_id,
+                "remark": str(row.get("remark") or ""),
+                "protocol": str(row.get("protocol") or ""),
+                "port": port if isinstance(port, int) and not isinstance(port, bool) else None,
+                "enable": bool(row.get("enable", True)),
+            })
+        return sorted(inbounds, key=lambda item: item["id"])
+
     async def add_traffic_and_days(self, email: str, add_bytes: int, add_days: int) -> MutationResult:
         """Add paid quota and days while preserving use; reconcile exact RFP targets."""
         if not isinstance(email, str) or not email:

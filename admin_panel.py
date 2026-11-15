@@ -87,6 +87,11 @@ def build_settings_category_page(cat_key: str):
     if cat_key == "group":
         rows.append([InlineKeyboardButton(
             "🔄 ساخت و همگام‌سازی خودکار تاپیک‌ها", callback_data="v52:forums:root")])
+    if cat_key == "registration":
+        rows.append([InlineKeyboardButton(
+            "🔐 سیاست ثبت‌نام، عضویت و کد معرف", callback_data="admin:reg_settings")])
+        rows.append([InlineKeyboardButton(
+            "⏳ درخواست‌های عضویت در انتظار", callback_data="admin:pending_reg")])
     rows.append([InlineKeyboardButton(
         "↩️ بازگشت به دسته‌بندی تنظیمات", callback_data="admin:settings")])
     return "\n".join(lines), rows
@@ -584,6 +589,12 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
     parts=data.split(":")
     action=parts[1] if len(parts)>1 else "main"
     sub_action=parts[2] if len(parts)>2 else ""
+    if action in {"reg_settings", "reg_mode", "reg_toggle_approval", "pending_reg",
+                  "reg_approve", "reg_reject", "reg_approve_all"}:
+        from rep_bot import _handle_registration_admin
+        await _handle_registration_admin(
+            update, context, scope="admin", action=action, sub_action=sub_action)
+        return
     if action=="cancel_form":
         state=context.user_data.pop("admin_state",None) or {}
         await _cleanup_form_prompt(

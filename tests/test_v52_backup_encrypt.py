@@ -84,7 +84,11 @@ def test_encrypted_archive_integrity(tmp_path, monkeypatch):
     # Updating the sidecar cannot make modified ciphertext authentic.
     monkeypatch.setenv("BACKUP_ENCRYPTION_KEY", _key(3))
     changed = bytearray(ciphertext)
-    changed[-2] ^= 1
+    # Tamper with an interior byte. The second-to-last character of a base64
+    # envelope can sit in the final group's padding bits, in which case the flip
+    # decodes to the identical bytes and the HMAC still verifies — a flaky test,
+    # not a real tamper. An interior byte always changes the decoded payload.
+    changed[len(changed) // 2] ^= 1
     with open(archive_path, "wb") as stream:
         stream.write(changed)
     backup._write_sha256_sidecar(archive_path, backup._sha256_file(archive_path))
