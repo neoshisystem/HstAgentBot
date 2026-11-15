@@ -5,21 +5,58 @@ import sqlite3
 from typing import Any, Iterable
 
 TOPIC_TITLES = {
+    # --- standard report topics provisioned by the settings centre ---
+    "operational_logs": "📋 گزارش عملیات و لاگ‌ها",
+    "rep_activity": "👥 فعالیت نمایندگان",
     "buyreport": "گزارش خرید",
     "otherservice": "سایر خدمات",
-    "pendingreceipts": "فیش‌های در انتظار",
+    "pendingreceipts": "🧾 تایید فیش‌ها و امور مالی",
     "paymentreport": "گزارش پرداخت",
     "reporttest": "گزارش آزمایشی",
-    "supportreport": "پشتیبانی",
+    "supportreport": "🎫 تیکت‌ها و گزارش تخلف",
     "errorreport": "خطاها",
     "reportcron": "گزارش زمان‌بندی",
     "reportnight": "گزارش شبانه",
-    "backupfile": "فایل‌های پشتیبان",
+    "backupfile": "💾 پشتیبان‌گیری دیتابیس",
 }
+
+
+# topic_key -> (Persian title, system_settings key that stores its thread id)
+STANDARD_TOPICS: tuple[tuple[str, str, str], ...] = (
+    ("operational_logs", "📋 گزارش عملیات و لاگ‌ها", "operational_logs_topic_id"),
+    ("pendingreceipts", "🧾 تایید فیش‌ها و امور مالی", "pending_receipts_topic_id"),
+    ("backupfile", "💾 پشتیبان‌گیری دیتابیس", "backups_topic_id"),
+    ("rep_activity", "👥 فعالیت نمایندگان", "rep_logs_topic_id"),
+    ("supportreport", "🎫 تیکت‌ها و گزارش تخلف", "support_tickets_topic_id"),
+)
+
+STANDARD_TOPIC_KEYS = tuple(key for key, _title, _setting in STANDARD_TOPICS)
 
 
 class ForumError(ValueError):
     """Forum registration or provisioning cannot be completed safely."""
+
+
+def normalize_group_chat_id(value: Any) -> int:
+    """Canonicalise a configured group id to Telegram's signed supergroup form.
+
+    Operators routinely paste the bare ``100…`` id without the leading minus.
+    ``1004377897090`` is not a chat Telegram will accept, so it must become
+    ``-1004377897090``; a plain positive group id becomes negative too. ``0``
+    keeps its meaning of "not configured".
+    """
+    if isinstance(value, bool) or value is None:
+        raise ForumError("group id must be an integer")
+    text = str(value).strip().replace(" ", "").replace("\u200c", "")
+    if not text:
+        raise ForumError("group id must be an integer")
+    try:
+        number = int(text)
+    except (TypeError, ValueError):
+        raise ForumError("group id must be an integer") from None
+    if number == 0:
+        return 0
+    return -abs(number)
 
 
 def _chat_id(value: Any, name: str) -> int:
@@ -196,4 +233,43 @@ def sync_report_topics(
     return outcomes
 
 
-__all__ = ["ForumError", "TOPIC_TITLES", "check_forum_permissions", "sync_report_topics"]
+def provision_standard_topics(
+    conn: sqlite3.Connection,
+    api: Any,
+    *,
+    bot_id: int,
+    group_chat_id: int,
+    now: int,
+    owner_key: str = "root",
+) -> dict[str, Any]:
+    """Create the five standard report topics and return their real thread ids.
+
+    ``sync_report_topics`` already commits a durable ``creating`` intent before
+    every Telegram call, so a retry can never duplicate a topic. This wrapper
+    only adds the mapping from each provisioned topic to the ``system_settings``
+    key the routing layer reads.
+    """
+    outcomes = sync_report_topics(
+        conn, api, bot_id=bot_id, group_chat_id=group_chat_id, now=now,
+        owner_key=owner_key, topic_keys=STANDARD_TOPIC_KEYS,
+    )
+    by_key = {str(item.get("topic_key")): item for item in outcomes}
+    settings: dict[str, str] = {}
+    for topic_key, _title, setting_key in STANDARD_TOPICS:
+        item = by_key.get(topic_key) or {}
+        thread_id = item.get("thread_id")
+        if item.get("state") == "active" and isinstance(thread_id, int) and thread_id > 0:
+            settings[setting_key] = str(thread_id)
+    return {
+        "outcomes": outcomes,
+        "settings": settings,
+        "active": sum(1 for item in outcomes if item.get("state") == "active"),
+        "total": len(outcomes),
+    }
+
+
+__all__ = [
+    "ForumError", "TOPIC_TITLES", "STANDARD_TOPICS", "STANDARD_TOPIC_KEYS",
+    "check_forum_permissions", "sync_report_topics", "provision_standard_topics",
+    "normalize_group_chat_id",
+]

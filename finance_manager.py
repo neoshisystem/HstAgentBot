@@ -57,10 +57,20 @@ def build_admin_receipt_review_keyboard(receipt_id: int) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_admin_reviewed_keyboard(status: str) -> InlineKeyboardMarkup:
-    """Keyboard shown after an admin settles the receipt."""
+def build_admin_reviewed_keyboard(status: str, user_id: int | None = None) -> InlineKeyboardMarkup:
+    """Keyboard shown after an admin settles the receipt.
+
+    The status chip is inert: pressing it must never re-run the review or query
+    the panel again, it only reports that the decision is already final. The
+    payer's profile and the way back to the admin desk stay reachable.
+    """
     text = "✅ تایید شده" if status == "approved" else "❌ رد شده"
-    return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data="noop")]])
+    rows = [[InlineKeyboardButton(text, callback_data="noop")]]
+    if user_id:
+        rows.append([InlineKeyboardButton(
+            "👤 مشاهده پروفایل کاربر", callback_data=f"admin:user_detail:{int(user_id)}")])
+    rows.append([InlineKeyboardButton("👑 بازگشت به میز مدیر کل", callback_data="admin:main")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def reply_with_receipt_detail(message, receipt: dict, text: str, reply_markup=None):

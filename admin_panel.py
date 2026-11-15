@@ -22,6 +22,194 @@ logger = logging.getLogger("HstAgentBot.AdminPanel")
 
 _V52_ADMIN_ADAPTER_FACTORY = None
 
+# The advanced settings centre is grouped so an operator never has to scan a flat
+# list of 17+ English keys. Every key stays editable; only its presentation and its
+# post-save destination change.
+SETTINGS_CATEGORIES = (
+    ("group", "📢 تنظیمات سوپرگروه و تاپیک‌های گزارش",
+     ("main_group_id", "operational_logs_topic_id", "pending_receipts_topic_id",
+      "backups_topic_id", "rep_logs_topic_id", "support_tickets_topic_id", "admin_dm_topic_id")),
+    ("registration", "🔐 سیاست‌های ثبت‌نام، عضویت و کد معرف",
+     ("registration_mode", "referral_requires_approval", "referral_reward_toman",
+      "referral_reward_percent", "sub_profile_limit")),
+    ("finance", "💰 آستانه‌های مالی، رزرو و قوانین تمدید (Rollover)",
+     ("rollover_max_gb", "rollover_max_days", "reserve_trigger_gb", "renewal_lock_ttl_sec")),
+    ("monitoring", "🔍 تنظیمات مانیتورینگ، دیده‌بان (Watchdog) و استخر آزاد",
+     ("watchdog_interval_sec", "pool_warning_threshold", "critical_audit_gb", "critical_audit_days")),
+    ("features", "🎛 قابلیت‌های رابط کاربری و چندباتی (v5.2 Features)",
+     ("v52_ui_enabled", "v52_persona_switcher_enabled", "admin_telegram_id")),
+)
+SETTINGS_CATEGORY_TITLES = {key: title for key, title, _keys in SETTINGS_CATEGORIES}
+SETTINGS_CATEGORY_OF = {k: key for key, _title, keys in SETTINGS_CATEGORIES for k in keys}
+SETTINGS_OTHER_TITLE = "🧩 سایر پارامترها"
+
+
+def settings_category_of(key: str) -> str:
+    """Category a setting belongs to; unknown keys land in the catch-all bucket."""
+    return SETTINGS_CATEGORY_OF.get(str(key), "other")
+
+
+def settings_category_title(cat_key: str) -> str:
+    if cat_key == "other":
+        return SETTINGS_OTHER_TITLE
+    return SETTINGS_CATEGORY_TITLES.get(cat_key, "🛠 تنظیمات پیشرفته")
+
+
+def _settings_category_members(cat_key: str):
+    """Live settings rows for one category, in the category's declared order."""
+    settings_list = database.get_all_settings()
+    if cat_key == "other":
+        return [s for s in settings_list if s["key"] not in SETTINGS_CATEGORY_OF]
+    order = {k: i for i, k in enumerate(
+        [k for k, c in SETTINGS_CATEGORY_OF.items() if c == cat_key])}
+    return sorted([s for s in settings_list if s["key"] in order],
+                  key=lambda s: order[s["key"]])
+
+
+def build_settings_category_page(cat_key: str):
+    """Readable Persian page for one settings category plus its button rows."""
+    title = settings_category_title(cat_key)
+    members = _settings_category_members(cat_key)
+    lines = [f"**{title}**\n"]
+    rows = []
+    if not members:
+        lines.append("• پارامتری در این دسته‌بندی ثبت نشده است.")
+    for setting in members:
+        key = setting["key"]
+        label = setting["label"] or key
+        value = setting["value"]
+        description = setting.get("description") or ""
+        lines.append(f"• **{label}**\n   مقدار فعلی: `{value}`\n   {description}")
+        rows.append([InlineKeyboardButton(
+            f"⚙️ {label}: {value}",
+            callback_data=f"admin:prompt_setting:{key}:{cat_key}",
+        )])
+    if cat_key == "group":
+        rows.append([InlineKeyboardButton(
+            "🔄 ساخت و همگام‌سازی خودکار تاپیک‌ها", callback_data="v52:forums:root")])
+    rows.append([InlineKeyboardButton(
+        "↩️ بازگشت به دسته‌بندی تنظیمات", callback_data="admin:settings")])
+    return "\n".join(lines), rows
+
+
+def _pending_intent_card(intent: dict):
+    """Readable card for one locked transaction plus its resolution buttons."""
+    intent_id = str(intent["intent_id"])
+    label = "خرید" if intent.get("action_type") == "buy" else "تمدید"
+    payer = intent.get("full_name") or intent.get("username") or "—"
+    state_fa = ("در انتظار تعیین تکلیف مدیریت" if intent.get("status") == "needs_reconciliation"
+                else "در حال پردازش")
+    lines = [
+        f"⏳ **تراکنش معلق و قفل‌شده:**\n",
+        f"• شناسه: `{intent_id}`",
+        f"• نوع: **{label}** | بسته: **{intent.get('plan_name') or '—'}**",
+        f"• مبلغ قفل‌شده: **{int(intent.get('amount') or 0):,} تومان**",
+        f"• پرداخت‌کننده: **{payer}** (`{int(intent.get('user_id') or 0)}`)",
+        f"• وضعیت: **{state_fa}**",
+        f"• قفل عملیات: `{intent.get('operation_lock_key') or '—'}`",
+        f"• تاریخ: `{str(intent.get('created_at') or '')[:19]}`",
+    ]
+    note = str(intent.get("result_note") or "").strip()
+    if note:
+        lines.append(f"• یادداشت سیستم: {note[:220]}")
+    lines.append(
+        "\nℹ️ «تایید تحویل» برداشت را نهایی و قفل را آزاد می‌کند؛ "
+        "«لغو و بازگشت وجه» مبلغ را اتمیک به کیف پول کاربر برمی‌گرداند."
+    )
+    rows = [
+        [InlineKeyboardButton("👤 مشاهده پروفایل کاربر",
+                              callback_data=f"admin:user_detail:{int(intent.get('user_id') or 0)}")],
+        [InlineKeyboardButton("🔄 استعلام مجدد از پنل",
+                              callback_data=f"admin:pending_recheck:{intent_id}")],
+        [InlineKeyboardButton("✅ تایید تحویل و نهایی‌سازی",
+                              callback_data=f"admin:pending_confirm:{intent_id}")],
+        [InlineKeyboardButton("💸 لغو و بازگشت وجه به کیف پول",
+                              callback_data=f"admin:pending_refund:{intent_id}")],
+        [InlineKeyboardButton("↩️ بازگشت به صف تراکنش‌های معلق",
+                              callback_data="admin:pending_tx")],
+    ]
+    return "\n".join(lines), rows
+
+
+def _pending_intent_confirm_card(intent: dict, action: str):
+    """Two-step confirmation before any money moves."""
+    intent_id = str(intent["intent_id"])
+    amount = int(intent.get("amount") or 0)
+    payer = intent.get("full_name") or intent.get("username") or str(intent.get("user_id"))
+    if action == "apply":
+        title = "✅ **تایید تحویل و نهایی‌سازی تراکنش**"
+        consequence = (
+            f"برداشت **{amount:,} تومان** نهایی می‌شود، قفل عملیات آزاد و تراکنش «انجام‌شده» ثبت می‌گردد. "
+            "هیچ مبلغی به کیف پول بازنمی‌گردد."
+        )
+        confirm_cb = f"admin:pending_do_apply:{intent_id}"
+        confirm_label = "✅ بله، تحویل را تایید کن"
+    else:
+        title = "💸 **لغو و بازگشت وجه به کیف پول**"
+        consequence = (
+            f"مبلغ **{amount:,} تومان** به‌صورت اتمیک به کیف پول **{payer}** بازمی‌گردد، "
+            "قفل عملیات آزاد و تراکنش «بازگشت‌شده» ثبت می‌گردد."
+        )
+        confirm_cb = f"admin:pending_do_refund:{intent_id}"
+        confirm_label = "💸 بله، وجه را برگردان"
+    text = (
+        f"{title}\n\n"
+        f"• تراکنش: `{intent_id}`\n"
+        f"• پرداخت‌کننده: **{payer}**\n"
+        f"• مبلغ: **{amount:,} تومان**\n\n"
+        f"⚠️ {consequence}\n\nآیا مطمئن هستید؟"
+    )
+    rows = [
+        [InlineKeyboardButton(confirm_label, callback_data=confirm_cb)],
+        [InlineKeyboardButton("❌ انصراف", callback_data=f"admin:pending_tx:{intent_id}")],
+    ]
+    return text, rows
+
+
+def build_pending_transactions_page(user_id: int | None = None):
+    """Queue of every transaction still holding a customer's money."""
+    rows_data = database.list_unresolved_user_action_intents(limit=30, user_id=user_id)
+    lines = ["⏳ **تراکنش‌های معلق و قفل‌شده:**\n"]
+    buttons = []
+    if not rows_data:
+        lines.append("✅ در حال حاضر هیچ تراکنش معلق یا قفل‌شده‌ای وجود ندارد.")
+    else:
+        total = sum(int(item.get("amount") or 0) for item in rows_data)
+        lines.append(f"• تعداد: **{len(rows_data)}** | مجموع مبلغ قفل‌شده: **{total:,} تومان**\n")
+        for item in rows_data:
+            label = "خرید" if item.get("action_type") == "buy" else "تمدید"
+            payer = item.get("full_name") or item.get("username") or "—"
+            lines.append(
+                f"• `{str(item['intent_id'])[:10]}` | {label} **{item.get('plan_name') or '—'}** | "
+                f"**{int(item.get('amount') or 0):,} ت** | {payer}"
+            )
+            buttons.append([InlineKeyboardButton(
+                f"⏳ {label} {int(item.get('amount') or 0):,} ت — {payer}"[:60],
+                callback_data=f"admin:pending_tx:{item['intent_id']}",
+            )])
+    return "\n".join(lines), buttons
+
+
+async def _provision_topics_after_group_change(update, context, group_id_text) -> str:
+    """Provision the standard report topics the moment the group id is saved."""
+    try:
+        from rep_bot import _sync_v52_forum_topics
+        group_id = database.normalize_group_chat_id(group_id_text)
+        if not group_id:
+            return "\n• همگام‌سازی تاپیک‌ها: شناسه گروه صفر است؛ انجام نشد."
+        result = await _sync_v52_forum_topics(
+            context.bot, int(context.bot.id), int(group_id), owner_key="root",
+        )
+        if result.get("state") != "completed":
+            return f"\n⚠️ همگام‌سازی تاپیک‌ها انجام نشد: `{result.get('reason')}`"
+        return (
+            f"\n• همگام‌سازی تاپیک‌ها: **{result.get('active', 0)}/{result.get('topics', 0)}** تاپیک فعال"
+            f"\n• شناسه‌های ذخیره‌شده در تنظیمات: **{result.get('settings_written', 0)}**"
+        )
+    except Exception as exc:
+        logger.exception("Forum topic provisioning after a group-id change failed")
+        return f"\n⚠️ همگام‌سازی تاپیک‌ها ناموفق بود: `{type(exc).__name__}`"
+
 
 def _v52_admin_enabled() -> bool:
     enabled = {"1", "true", "yes", "on", "enabled"}
@@ -136,6 +324,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
              InlineKeyboardButton("🏊 استخر آزاد", callback_data="admin:pool")],
             [InlineKeyboardButton("📦 بسته‌های رزرو در انتظار", callback_data="admin:reserves"),
              InlineKeyboardButton("🛠 تنظیمات پیشرفته سامانه", callback_data="admin:settings")],
+            [InlineKeyboardButton("⏳ تراکنش‌های معلق و قفل‌شده", callback_data="admin:pending_tx")],
             [InlineKeyboardButton("💾 پشتیبان‌گیری سریع دیتابیس", callback_data="admin:backup")],
             # --- Persona Switcher ---
             [InlineKeyboardButton("🧑‍💼 میزکار نماینده (root_admin_rep)", callback_data="v52:persona:rep")],
@@ -1103,24 +1292,156 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         except Exception as e:
             await query.answer(f"خطا در بکاپ: {e}", show_alert=True)
 
-    # 11. Dynamic System Settings Panel
+    # 11. Dynamic System Settings Panel — grouped, never a flat 17-row wall
     elif action == "settings":
-        settings_list = database.get_all_settings()
         lines = [
-            "🛠 **مرکز تنظیمات پویا و متغیرهای کنترلی سامانه:**\n",
-            "برای ویرایش هر پارامتر، روی دکمه آن کلیک کنید. تغییرات به صورت آنی (Hot-Reload) و بدون نیاز به ری‌استارت اعمال می‌شوند:\n"
+            "🛠 **مرکز تنظیمات پیشرفته سامانه:**\n",
+            "پارامترها دسته‌بندی شده‌اند. دسته مورد نظر را انتخاب کنید؛ "
+            "تغییرات به صورت آنی (Hot-Reload) و بدون ری‌استارت اعمال می‌شوند:\n"
         ]
         setting_buttons = []
-        for s in settings_list:
-            k = s["key"]
-            lbl = s["label"] or k
-            v = s["value"]
-            lines.append(f"• **{lbl}** (`{k}`): `{v}`")
-            setting_buttons.append([InlineKeyboardButton(f"⚙️ {lbl}: {v}", callback_data=f"admin:prompt_setting:{k}")])
-            
+        for cat_key, title, _keys in SETTINGS_CATEGORIES:
+            count = len(_settings_category_members(cat_key))
+            lines.append(f"• {title}: **{count}** پارامتر")
+            setting_buttons.append([InlineKeyboardButton(
+                f"{title} ({count})", callback_data=f"admin:settings_cat:{cat_key}")])
+        other_count = len(_settings_category_members("other"))
+        if other_count:
+            lines.append(f"• {SETTINGS_OTHER_TITLE}: **{other_count}** پارامتر")
+            setting_buttons.append([InlineKeyboardButton(
+                f"{SETTINGS_OTHER_TITLE} ({other_count})", callback_data="admin:settings_cat:other")])
+        setting_buttons.append([InlineKeyboardButton(
+            "🔄 ساخت و همگام‌سازی خودکار تاپیک‌ها", callback_data="v52:forums:root")])
         keyboard = build_back_to_admin_keyboard(setting_buttons)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("تنظیمات سیستم")
+
+    # 11.1 One settings category
+    elif action == "settings_cat":
+        cat_key = sub_action or "group"
+        text, rows = build_settings_category_page(cat_key)
+        keyboard = build_back_to_admin_keyboard(rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await query.answer(settings_category_title(cat_key))
+
+    # 11.2 Pending / locked transaction centre with manual settlement
+    elif action in {
+        "pending_tx", "pending_recheck", "pending_confirm", "pending_refund",
+        "pending_do_apply", "pending_do_refund",
+    }:
+        intent_id = sub_action
+        if action == "pending_tx" and not intent_id:
+            text, rows = build_pending_transactions_page()
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                                          reply_markup=build_back_to_admin_keyboard(rows))
+            await query.answer("تراکنش‌های معلق")
+            return
+
+        intent = database.get_unresolved_user_action_intent(intent_id)
+        if not intent:
+            await query.answer("این تراکنش دیگر معلق نیست؛ فهرست تازه شد.", show_alert=True)
+            text, rows = build_pending_transactions_page()
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                                          reply_markup=build_back_to_admin_keyboard(rows))
+            return
+
+        if action == "pending_tx":
+            text, rows = _pending_intent_card(intent)
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                                          reply_markup=build_back_to_admin_keyboard(rows))
+            await query.answer("جزئیات تراکنش")
+            return
+
+        if action == "pending_recheck":
+            # Honest re-read: the authoritative state is the intent row plus the
+            # operation lock. No panel request is issued here, so no panel effect
+            # is ever claimed.
+            lock_state = "قفل عملیات آزاد شده است"
+            try:
+                with database.get_db() as conn:
+                    lock = conn.execute(
+                        "SELECT token FROM operation_locks WHERE lock_key = ?",
+                        (str(intent.get("operation_lock_key") or ""),),
+                    ).fetchone()
+                lock_state = ("قفل عملیات همچنان برقرار است" if lock
+                              else "قفل عملیات آزاد شده است")
+            except Exception:
+                lock_state = "وضعیت قفل قابل خواندن نبود"
+            text = (
+                "🔄 **استعلام مجدد (بازخوانی وضعیت مرجع):**\n\n"
+                f"• تراکنش: `{intent_id}`\n"
+                f"• وضعیت ثبت‌شده: **{intent.get('status')}**\n"
+                f"• {lock_state}\n"
+                f"• یادداشت سیستم: {str(intent.get('result_note') or '—')[:220]}\n\n"
+                "ℹ️ این استعلام فقط وضعیت دیتابیس را بازمی‌خواند و هیچ درخواستی به پنل "
+                "ارسال نمی‌کند؛ اثر واقعی در پنل باید مستقیماً در 3X-UI بررسی شود. "
+                "پس از بررسی، از دو دکمه پایین تصمیم نهایی را ثبت کنید."
+            )
+            rows = [
+                [InlineKeyboardButton("✅ تایید تحویل و نهایی‌سازی",
+                                      callback_data=f"admin:pending_confirm:{intent_id}")],
+                [InlineKeyboardButton("💸 لغو و بازگشت وجه به کیف پول",
+                                      callback_data=f"admin:pending_refund:{intent_id}")],
+                [InlineKeyboardButton("↩️ بازگشت به کارت تراکنش",
+                                      callback_data=f"admin:pending_tx:{intent_id}")],
+            ]
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                                          reply_markup=build_back_to_admin_keyboard(rows))
+            await query.answer("وضعیت بازخوانی شد")
+            return
+
+        if action in {"pending_confirm", "pending_refund"}:
+            kind = "apply" if action == "pending_confirm" else "refund"
+            text, rows = _pending_intent_confirm_card(intent, kind)
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                                          reply_markup=build_back_to_admin_keyboard(rows))
+            await query.answer("تاییدیه دو مرحله‌ای")
+            return
+
+        resolution = "APPLIED" if action == "pending_do_apply" else "REFUND_NOT_APPLIED"
+        actor_name = user.full_name or "Super Admin"
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        verb = "تایید تحویل" if resolution == "APPLIED" else "بازگشت دستی وجه"
+        evidence = f"{resolution}: {verb} از پنل تراکنش‌های معلق توسط {actor_name} در {stamp}"
+        try:
+            result = await asyncio.to_thread(
+                database.resolve_user_action_intent,
+                intent_id, user.id, actor_name, resolution, evidence,
+            )
+        except ValueError as exc:
+            await query.answer(f"❌ تعیین تکلیف انجام نشد: {exc}", show_alert=True)
+            return
+        except Exception:
+            logger.exception("Manual settlement of intent %s failed", intent_id)
+            await query.answer("❌ تعیین تکلیف با خطای غیرمنتظره متوقف شد.", show_alert=True)
+            return
+
+        if resolution == "REFUND_NOT_APPLIED":
+            try:
+                await context.bot.send_message(
+                    chat_id=int(result.get("user_id") or intent.get("user_id")),
+                    text=(
+                        "💸 **بازگشت وجه تراکنش معلق:**\n\n"
+                        f"• مبلغ **{int(result.get('amount') or 0):,} تومان** به کیف پول شما بازگشت داده شد.\n"
+                        f"• موجودی جدید: **{int(result.get('new_balance') or 0):,} تومان**"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("💳 کیف پول من", callback_data="user:wallet"),
+                    ]]),
+                )
+            except Exception:
+                logger.exception("Could not notify the payer about the manual refund")
+            headline = f"✅ وجه تراکنش `{intent_id}` به کیف پول کاربر بازگشت داده شد."
+        else:
+            headline = f"✅ تراکنش `{intent_id}` به‌عنوان تحویل‌شده نهایی و قفل آن آزاد شد."
+
+        text, rows = build_pending_transactions_page()
+        await query.edit_message_text(
+            f"{headline}\n\n{text}", parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_back_to_admin_keyboard(rows),
+        )
+        await query.answer("تعیین تکلیف ثبت شد.")
 
     # 12. Reserved Packages Queue Watcher
     elif action == "reserves":
@@ -1467,12 +1788,17 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
 
         elif action == "prompt_setting":
             setting_key = sub_action
+            cat_key = parts[3] if len(parts) > 3 else settings_category_of(setting_key)
             all_s = {s["key"]: s for s in database.get_all_settings()}
             target_s = all_s.get(setting_key)
             if not target_s:
                 await query.answer("❌ تنظیم مورد نظر یافت نشد.", show_alert=True)
                 return
-            context.user_data["admin_state"] = {"action": "edit_setting", "key": setting_key, "label": target_s["label"], "ts": now_ts}
+            context.user_data["admin_state"] = {
+                "action": "edit_setting", "key": setting_key, "label": target_s["label"],
+                "category": cat_key, "ts": now_ts,
+            }
+            prompt_parent_cb = f"admin:settings_cat:{cat_key}"
             msg = (
                 f"🛠 **ویرایش تنظیمات سامانه:**\n\n"
                 f"• عنوان: **{escape_markdown(target_s.get('label') or '')}**\n"
@@ -1952,19 +2278,28 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
     elif action == "edit_setting":
         setting_key = admin_state.get("key")
         label = admin_state.get("label", setting_key)
+        cat_key = admin_state.get("category") or settings_category_of(setting_key)
         new_val = text.strip()
         try:
+            if setting_key in database.GROUP_ID_SETTING_KEYS:
+                # Storing the bare ``100…`` form silently breaks every send.
+                new_val = str(database.normalize_group_chat_id(new_val))
             database.set_setting(setting_key,new_val,actor_id=update.effective_user.id,actor_name=update.effective_user.full_name or "Admin")
         except ValueError as exc:
             return await _reply_fsm_validation_error(update,context,admin_state,f"مقدار تنظیم معتبر نیست: {exc}")
         context.user_data.pop("admin_state",None)
+        extra = ""
+        if setting_key == "main_group_id":
+            extra = await _provision_topics_after_group_change(update, context, new_val)
+        page_text, page_rows = build_settings_category_page(cat_key)
         await update.message.reply_text(
             f"✅ **تنظیمات با موفقیت بروزرسانی شد.**\n\n"
             f"• پارامتر: **{label}** (`{setting_key}`)\n"
-            f"• مقدار جدید: `{new_val}`\n\n"
-            f"تغییرات به صورت آنی (Hot-Reload) در سیستم اعمال گردید.",
+            f"• مقدار جدید: `{new_val}`{extra}\n\n"
+            f"تغییرات به صورت آنی (Hot-Reload) در سیستم اعمال گردید.\n\n"
+            f"{page_text}",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=build_admin_main_keyboard()
+            reply_markup=build_back_to_admin_keyboard(page_rows)
         )
         return True
     

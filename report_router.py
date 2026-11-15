@@ -13,6 +13,9 @@ _GROUP_TOPICS = frozenset({
     "buyreport", "otherservice", "pendingreceipts", "paymentreport",
     "reporttest", "supportreport", "errorreport", "reportcron",
     "reportnight", "backupfile",
+    # Standard topics provisioned by the settings centre. They must be routable
+    # here or a provisioned topic would exist with no way to deliver into it.
+    "operational_logs", "rep_activity",
 })
 _REP_TOPICS = {
     "rep_buy": "buyreport",

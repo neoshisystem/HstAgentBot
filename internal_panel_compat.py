@@ -582,9 +582,11 @@ def _mutate(identifier: str, method: str, *, account_ref=None, panel_id=None, op
             target=None, enabled=None):
     binding = _resolve_account(identifier, account_ref=account_ref, panel_id=panel_id)
     if not binding:
-        return {"status": "unknown", "state": "unknown", "reason": "account_binding_missing_or_ambiguous"}
+        return {"status": "unknown", "state": "unknown", "dispatched": False,
+                "reason": "account_binding_missing_or_ambiguous"}
     if not operation_id:
-        return {"status": "unknown", "state": "unknown", "reason": "EVIDENCE_REQUIRED"}
+        return {"status": "unknown", "state": "unknown", "dispatched": False,
+                "reason": "EVIDENCE_REQUIRED"}
     try:
         expected_kinds = (
             ("renew", "renew_client", "vpn_renew")
@@ -592,7 +594,8 @@ def _mutate(identifier: str, method: str, *, account_ref=None, panel_id=None, op
             else ("set_client_enabled", "enable", "suspend", "activate")
         )
         if not _operation_matches(binding, str(operation_id), *expected_kinds):
-            return {"status": "unknown", "state": "unknown", "reason": "EVIDENCE_REQUIRED: operation is not prepared for this account"}
+            return {"status": "unknown", "state": "unknown", "dispatched": False,
+                    "reason": "EVIDENCE_REQUIRED: operation is not prepared for this account"}
         adapter = _factory().resolve_account_adapter(int(binding["id"]))
 
         def dispatch_from_sealed_request(request_payload, expected_effect):
@@ -642,22 +645,26 @@ def _mutate(identifier: str, method: str, *, account_ref=None, panel_id=None, op
 def renew_client(identifier: str, gb=None, days=None, *args, account_ref=None, panel_id=None,
                  operation_id=None, **kwargs):
     if gb is None and days is None:
-        return {"status": "unknown", "state": "unknown", "reason": "EVIDENCE_REQUIRED"}
+        return {"status": "unknown", "state": "unknown", "dispatched": False,
+                "reason": "EVIDENCE_REQUIRED"}
     binding = _resolve_account(identifier, account_ref=account_ref, panel_id=panel_id)
     if not binding:
-        return {"status": "unknown", "state": "unknown", "reason": "account_binding_missing_or_ambiguous"}
+        return {"status": "unknown", "state": "unknown", "dispatched": False,
+                "reason": "account_binding_missing_or_ambiguous"}
     try:
         with _database().get_db() as conn:
             panel = conn.execute(
                 "SELECT renewal_method FROM panels WHERE id=?", (int(binding["panel_id"]),)
             ).fetchone()
         if panel is None:
-            return {"status": "unknown", "state": "unknown", "reason": "panel_binding_unavailable"}
+            return {"status": "unknown", "state": "unknown", "dispatched": False,
+                    "reason": "panel_binding_unavailable"}
         if str(panel["renewal_method"] or "").casefold() == "smart_rollover":
-            return {"status": "unknown", "state": "unknown",
+            return {"status": "unknown", "state": "unknown", "dispatched": False,
                     "reason": "EVIDENCE_REQUIRED: EV-02 smart_rollover characterization is incomplete"}
     except Exception:
-        return {"status": "unknown", "state": "unknown", "reason": "EVIDENCE_REQUIRED"}
+        return {"status": "unknown", "state": "unknown", "dispatched": False,
+                "reason": "EVIDENCE_REQUIRED"}
     target = {"gb": gb, "days": days, **kwargs}
     return _mutate(identifier, "renew_client", account_ref=binding, panel_id=panel_id,
                    operation_id=operation_id, target=target)
@@ -670,7 +677,7 @@ def set_client_enable(identifier: str, enable: bool, *args, account_ref=None, pa
 
 
 def set_client_comment(identifier: str, comment: str, *args, account_ref=None, panel_id=None, **kwargs):
-    return {"status": "unknown", "state": "unknown",
+    return {"status": "unknown", "state": "unknown", "dispatched": False,
             "reason": "EVIDENCE_REQUIRED: comment mutation is not a verified adapter capability"}
 
 
@@ -681,7 +688,8 @@ def allocate_pool_client(identifier: str, gb=None, days=None, *args, account_ref
     if not binding or not operation_id or not _operation_matches(
         binding, str(operation_id), "allocate_pool_client", "allocate", "account_create"
     ):
-        return {"status": "unknown", "state": "unknown", "reason": "EVIDENCE_REQUIRED"}
+        return {"status": "unknown", "state": "unknown", "dispatched": False,
+                "reason": "EVIDENCE_REQUIRED"}
     try:
         adapter = _factory().resolve_account_adapter(int(binding["id"]))
 

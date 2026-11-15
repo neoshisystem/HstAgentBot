@@ -133,6 +133,38 @@ def _archive_members(archive: tarfile.TarFile):
     return members, root
 
 
+def resolve_backup_destination() -> dict:
+    """Where the encrypted archive goes: the backups topic, else the admin DM.
+
+    The live destination is ``system_settings.backups_topic_id`` inside the
+    ``main_group_id`` supergroup. The legacy ``BACKUPS_TOPIC_ID`` env constant is
+    only a fallback for a deployment that never wrote the setting, and a bare
+    topic id with no group falls back to the super-admin direct message so a
+    backup is never silently dropped.
+    """
+    if BACKUPS_TOPIC_ID:
+        # Historical contract: the constant already names a delivery target.
+        return {"configured": True, "target": "legacy_constant",
+                "chat_id": int(BACKUPS_TOPIC_ID), "topic_id": int(BACKUPS_TOPIC_ID)}
+    try:
+        import database
+        group_id = database.get_main_group_id()
+        topic_id = database.get_setting("backups_topic_id", None, cast_type=int) or 0
+        admin_id = database.get_setting("admin_telegram_id", None, cast_type=int) or 0
+    except Exception as exc:
+        return {"configured": False,
+                "reason": "BACKUPS_TOPIC_ID is not configured and the backups topic "
+                          f"setting is unreadable ({type(exc).__name__})"}
+    if group_id and topic_id:
+        return {"configured": True, "target": "group_topic",
+                "chat_id": int(group_id), "topic_id": int(topic_id)}
+    if group_id and admin_id:
+        return {"configured": True, "target": "admin_dm",
+                "chat_id": int(admin_id), "topic_id": None}
+    return {"configured": False,
+            "reason": "BACKUPS_TOPIC_ID is not configured and no backups topic is registered"}
+
+
 def verify_backup_archive(archive_path: str) -> dict:
     """Verify ciphertext hash, authenticated archive envelope and SQLite snapshot."""
     archive_path = os.path.abspath(archive_path)
@@ -468,10 +500,11 @@ def run_backup():
         )
         upload_status = "not_configured"
         upload_error = ""
-        if BACKUPS_TOPIC_ID:
+        destination = resolve_backup_destination()
+        if destination["configured"]:
             try:
                 upload_res = backup_and_report.send_telegram_document(
-                    BACKUPS_TOPIC_ID, archive_path, caption, parse_mode="HTML"
+                    destination["topic_id"], archive_path, caption, parse_mode="HTML"
                 )
                 if isinstance(upload_res, dict) and upload_res.get("ok"):
                     upload_status = "sent"
@@ -486,7 +519,7 @@ def run_backup():
                 upload_status = "failed"
                 upload_error = str(exc)
         else:
-            upload_error = "BACKUPS_TOPIC_ID is not configured"
+            upload_error = destination["reason"]
 
         # 5. Retain only verified archives. The current valid archive is included.
         pruned = prune_old_backups(BACKUP_DIR, keep=DEFAULT_RETENTION)

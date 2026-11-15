@@ -599,7 +599,11 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
                     callback_data=f"user:do_buy:{intent_id}"
                 ),
                 InlineKeyboardButton("❌ انصراف", callback_data="user:buy_service")
-            ]
+            ],
+            [
+                InlineKeyboardButton("↩️ بازگشت به مرحله قبل", callback_data="user:buy_service"),
+                InlineKeyboardButton("🏠 منوی اصلی کاربری", callback_data="user:main"),
+            ],
         ])
         await query.edit_message_text(
             f"🛒 **تایید نهایی خرید:**\n\n"
@@ -791,11 +795,26 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
                 await query.edit_message_reply_markup(reply_markup=None)
             except BadRequest:
                 pass
+            if alloc_res.get("dispatched") is False:
+                # Nothing ever reached the panel, so this is a clean rejection and
+                # the rollback above is complete. Say so instead of implying a lock.
+                failure_text = (
+                    f"❌ سرویس صادر نشد (درخواست هرگز به پنل ارسال نشد).\n"
+                    f"• مبلغ **{price:,} تومان** کامل به کیف پول شما بازگشت داده شد.\n"
+                    f"• موجودی جدید: **{database.get_user_wallet_balance(user.id):,} تومان**"
+                )
+            else:
+                failure_text = (
+                    f"❌ صدور سرویس توسط پنل رد شد.\n"
+                    f"• مبلغ **{price:,} تومان** به کیف پول بازگشت داده شد.\n"
+                    f"• موجودی جدید: **{database.get_user_wallet_balance(user.id):,} تومان**"
+                )
             await query.message.reply_text(
-                f"❌ صدور سرویس توسط پنل رد شد. مبلغ {price:,} تومان به کیف پول بازگشت داده شد.",
+                failure_text,
+                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=build_back_to_user_keyboard(back_callback="user:wallet"),
             )
-            await query.answer("صدور سرویس ناموفق بود.", show_alert=True)
+            await query.answer("صدور سرویس ناموفق بود؛ مبلغ بازگشت داده شد.", show_alert=True)
         else:
             logger.error("Ambiguous X-UI allocation response for user %s: %r", user.id, alloc_res)
             try:
@@ -813,21 +832,66 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
     # 4. User Wallet View
     elif action == "wallet":
         bal = database.get_user_wallet_balance(user.id)
-        card_info = database.get_card_info()
+        locked = database.get_user_locked_amount(user.id)
         lines = [
             f"💳 **کیف پول من: {user.first_name}**\n",
-            f"• موجودی فعلی: **{bal:,} تومان**\n",
-            "با شارژ کیف پول می‌توانید در هر زمان به سادگی اقدام به خرید سرویس جدید یا تمدید سرویس‌های فعلی خود نمایید.",
+            f"• موجودی قابل برداشت: **{bal:,} تومان**",
         ]
+        if locked:
+            lines.append(f"• مبلغ محفوظ در تراکنش معلق: **{locked:,} تومان**")
+        lines.append("")
+        lines.append(
+            "با شارژ کیف پول می‌توانید در هر زمان به سادگی اقدام به خرید سرویس جدید "
+            "یا تمدید سرویس‌های فعلی خود نمایید."
+        )
+        if locked:
+            lines.append(
+                "\nℹ️ مبلغ محفوظ کسر شده اما سرویس آن هنوز نهایی نشده است؛ "
+                "برای مشاهده جزئیات روی «⏳ تراکنش‌های معلق» بزنید."
+            )
         extra_btns = [
             [
                 InlineKeyboardButton("➕ افزایش موجودی (کارت‌به‌کارت)", callback_data="user_deposit_start"),
                 InlineKeyboardButton("📑 سوابق پرداخت من", callback_data="user:receipts")
             ]
         ]
+        if locked:
+            extra_btns.append([
+                InlineKeyboardButton("⏳ تراکنش‌های معلق و مبلغ محفوظ", callback_data="user:pending")
+            ])
         keyboard = build_back_to_user_keyboard(extra_btns)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("کیف پول")
+
+    # 4.0 Escrowed / unresolved transactions — the customer must never think the
+    # money simply vanished; show exactly what is held and how to get it back.
+    elif action == "pending":
+        rows = database.get_user_pending_intents(user.id)
+        lines = ["⏳ **تراکنش‌های معلق و مبلغ محفوظ شما:**\n"]
+        if not rows:
+            lines.append("• در حال حاضر هیچ تراکنش معلقی ندارید؛ کل موجودی شما قابل برداشت است.")
+        else:
+            total = sum(int(r["amount"]) for r in rows)
+            lines.append(f"• مجموع مبلغ محفوظ: **{total:,} تومان**\n")
+            for r in rows:
+                label = "خرید" if r["action_type"] == "buy" else "تمدید"
+                state = ("در انتظار تعیین تکلیف مدیریت" if r["status"] == "needs_reconciliation"
+                         else "در حال پردازش")
+                lines.append(
+                    f"• `{str(r['intent_id'])[:8]}` | {label} **{r['plan_name']}**\n"
+                    f"   مبلغ: **{int(r['amount']):,} تومان** | وضعیت: {state}\n"
+                    f"   تاریخ: `{str(r['created_at'])[:16]}`"
+                )
+            lines.append(
+                "\nℹ️ مبلغ این تراکنش‌ها کسر شده اما سرویس آن هنوز نهایی نشده است. "
+                "اگر سرویس شما صادر نشده باشد، مدیریت مبلغ را به کیف پول بازمی‌گرداند."
+            )
+        keyboard = build_back_to_user_keyboard(
+            [[InlineKeyboardButton("🔄 بررسی مجدد وضعیت", callback_data="user:pending")]],
+            back_callback="user:wallet",
+        )
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await query.answer("تراکنش‌های معلق")
 
     # 4.1 User Receipts
     elif action == "receipts":
@@ -1035,7 +1099,24 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
                 await query.edit_message_reply_markup(reply_markup=None)
             except BadRequest:
                 pass
-            await query.answer("❌ پنل تمدید را رد کرد؛ مبلغ به کیف پول بازگشت داده شد.", show_alert=True)
+            if renew_res.get("dispatched") is False:
+                renew_failure = (
+                    f"❌ تمدید انجام نشد (درخواست هرگز به پنل ارسال نشد).\n"
+                    f"• مبلغ **{price:,} تومان** کامل به کیف پول شما بازگشت داده شد.\n"
+                    f"• موجودی جدید: **{database.get_user_wallet_balance(user.id):,} تومان**"
+                )
+            else:
+                renew_failure = (
+                    f"❌ پنل تمدید را رد کرد.\n"
+                    f"• مبلغ **{price:,} تومان** به کیف پول بازگشت داده شد.\n"
+                    f"• موجودی جدید: **{database.get_user_wallet_balance(user.id):,} تومان**"
+                )
+            await query.message.reply_text(
+                renew_failure,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_back_to_user_keyboard(back_callback="user:services"),
+            )
+            await query.answer("تمدید ناموفق بود؛ مبلغ بازگشت داده شد.", show_alert=True)
         else:
             logger.error("Ambiguous X-UI renewal response for %s: %r", acc_code, renew_res)
             try:

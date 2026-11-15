@@ -3,6 +3,10 @@
 A response is SUCCESS or FAILURE only when its explicit signals agree.
 Missing, malformed or contradictory signals remain UNKNOWN so callers retain
 the operation lock and reconcile instead of replaying/refunding prematurely.
+
+The one non-ambiguous UNKNOWN is an explicit ``dispatched: False`` marker: the
+request never left the process, so no remote effect can exist and the outcome is
+a definite FAILURE that must be refunded rather than locked.
 """
 
 from enum import Enum
@@ -22,6 +26,13 @@ def classify_xui_result(result) -> XUIResult:
     """Classify an external response without guessing on incomplete/conflicting data."""
     if not isinstance(result, dict):
         return XUIResult.UNKNOWN
+
+    # A pre-dispatch rejection (missing binding, unbound operation, unsupported
+    # capability, panel row unavailable) never reached the panel. Treating it as
+    # UNKNOWN strands the customer's money in a lock for a service that was never
+    # requested, so it is classified as a definite failure and refunded at once.
+    if result.get("dispatched") is False:
+        return XUIResult.FAILURE
 
     raw_status = result.get("status")
     status = raw_status.strip().lower() if isinstance(raw_status, str) else ""

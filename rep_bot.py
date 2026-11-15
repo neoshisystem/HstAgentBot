@@ -351,10 +351,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id if update.message else None
 
     await _cleanup_deposit_amount_prompt(context, chat.id)
-    context.user_data.pop("admin_state", None)
-    context.user_data.pop("rep_state", None)
-    context.user_data.pop("user_state", None)
-    context.user_data.pop("fsm_state", None)
+    _reset_all_conversation_states(user.id, _bot_id_of(context), context)
 
     if _runtime_flag("v52_multi_bot_enabled") and chat and chat.type == "private":
         try:
@@ -473,6 +470,20 @@ def _resolve_active_persona_role(user, *, base_role, base_rep):
     except Exception:
         logger.debug("persona resolution fell back to the legacy role", exc_info=True)
         return base_role, base_rep
+
+
+def _base_role_of(user, chat, thread_id):
+    """The actor's permanent role, ignoring whichever persona they are viewing.
+
+    Management notifications (receipt review, backups, alerts) are delivered to
+    the private chat and must stay actionable for the root actor even while the
+    persona switcher has them inside the representative or end-user workspace.
+    """
+    try:
+        role, rep = database.get_user_role(user.id, chat.id, thread_id)
+    except Exception:
+        return None, None
+    return role, rep
 
 
 def _persona_aware_role(user, chat, thread_id):
@@ -1525,18 +1536,29 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
             elif name == "sync_topics":
                 if persona != "admin" or not ctx.get("is_root"):
                     raise PermissionError("همگام‌سازی تاپیک‌ها فقط در اختیار root است.")
-                if not MAIN_GROUP_ID:
-                    raise ValueError("MAIN_GROUP_ID روی صفر تنظیم شده است.")
+                main_group_id = database.get_main_group_id()
+                if not main_group_id:
+                    raise ValueError("شناسه سوپرگروه اصلی در تنظیمات ثبت نشده است.")
                 result = await _sync_v52_forum_topics(
-                    context.bot, int(context.bot.id), int(MAIN_GROUP_ID),
+                    context.bot, int(context.bot.id), int(main_group_id),
                     owner_key=str(params.get("owner_key") or "root"),
                 )
                 from ui_v52 import render_page
+                lines = [
+                    f"وضعیت: {result.get('state')}",
+                    f"سوپرگروه: `{main_group_id}`",
+                    f"تاپیک‌های فعال: {result.get('active', 0)}/{result.get('topics', 0)}",
+                    f"شناسه‌های ذخیره‌شده: {result.get('settings_written', 0)}",
+                ]
+                for item in (result.get("outcomes") or [])[:10]:
+                    lines.append(
+                        f"• {item.get('topic_key')}: {item.get('state')} "
+                        f"(thread={item.get('thread_id', '-')})"
+                    )
+                if result.get("state") != "completed":
+                    lines.append(f"جزئیات: {result.get('reason', 'ثبت شد')}")
                 page = render_page(
-                    "همگام‌سازی فروم",
-                    f"وضعیت: {result.get('state')}\n"
-                    f"تاپیک‌های فعال: {result.get('active', 0)}\n"
-                    f"جزئیات: {result.get('reason', 'ثبت شد')}",
+                    "همگام‌سازی فروم", "\n".join(lines),
                     persona="admin", page_kind="result", parent_callback="v52:panels",
                 )
             elif name == "route_home":
@@ -2716,8 +2738,13 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("admin_state", None)
-    await update.message.reply_text("✅ تمام وضعیت‌های تعاملی و فرم‌های فعال لغو شدند.")
+    user = update.effective_user
+    _reset_all_conversation_states(getattr(user, "id", 0), _bot_id_of(context), context)
+    role, _rep = _persona_aware_role(user, update.effective_chat, None)
+    await update.message.reply_text(
+        "✅ تمام وضعیت‌های تعاملی و فرم‌های فعال لغو شدند.",
+        reply_markup=build_actor_navigation_keyboard(role),
+    )
 
 # --- Renewal & Reserve Queue Logic ---
 
@@ -2728,6 +2755,82 @@ def _runtime_flag(name: str) -> bool:
     except Exception:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+# Conversation state lives in two independent stores: the per-actor
+# ``context.user_data`` drafts and the TTL-bound ``v52_router.DEFAULT_FSM``. A
+# stale entry in either one consumes the next text message, so a ticket draft
+# would swallow the amount the customer types into the wallet top-up. They are
+# therefore always cleared together, never one at a time.
+CONVERSATION_STATE_KEYS = (
+    "user_state", "admin_state", "rep_state", "fsm_state",
+    "deposit_role", "deposit_amount", "deposit_form_state",
+    "active_receipt_code", "transfer_confirm",
+)
+
+# Callbacks that mean "I am leaving whatever I was doing": every main-menu entry,
+# the persona switcher and the home/back rows of any page.
+_NAVIGATION_CALLBACKS = frozenset({
+    "user:main", "user:services", "user:wallet", "user:pricing", "user:receipts",
+    "user:pending", "user:prompt_link", "admin:main", "admin:settings",
+    "rep:main", "rep:menu",
+})
+_NAVIGATION_CALLBACK_PREFIXES = (
+    "v52:home:", "v52:back:", "v52:persona:", "v52:shop", "v52:tickets",
+    "v52:profiles", "v52:finance", "v52:orders", "v52:panels", "v52:bots",
+    "v52:domains", "v52:cards", "v52:plans", "v52:ops", "v52:abuse:list",
+)
+
+# Callbacks that start a fresh workflow: any pending draft from another module
+# must be dropped before this one begins collecting input.
+_WORKFLOW_START_PREFIXES = (
+    "user:deposit_start", "user:buy_service", "user:do_buy", "user:do_renew",
+    "user:renew_plans", "rep:deposit_start", "rep:issue_acc", "rep:renew",
+    "v52:newticket", "v52:abuse", "v52:support:",
+    "admin:prompt_", "rep:prompt_", "v52:panelnew", "v52:panelconfig:",
+    "v52:domain:", "v52:bot:", "v52:inventory:", "v52:poolimport:",
+)
+
+
+def _bot_id_of(context) -> int:
+    """Telegram bot id from a real or fake context; 0 when it cannot be resolved."""
+    try:
+        return int(getattr(getattr(context, "bot", None), "id", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_navigation_callback(data: str) -> bool:
+    text = str(data or "")
+    return text in _NAVIGATION_CALLBACKS or text.startswith(_NAVIGATION_CALLBACK_PREFIXES)
+
+
+def _is_workflow_start_callback(data: str) -> bool:
+    return str(data or "").startswith(_WORKFLOW_START_PREFIXES)
+
+
+def _reset_all_conversation_states(user_id, bot_id, context) -> dict:
+    """Drop every pending conversation state for one actor in both stores.
+
+    Called on /start, /cancel, every main-menu/persona/home/back button and at the
+    start of each new workflow, so no module can steal another module's input.
+    """
+    cleared: list = []
+    if context is not None and getattr(context, "user_data", None) is not None:
+        for key in CONVERSATION_STATE_KEYS:
+            if context.user_data.pop(key, None) is not None:
+                cleared.append(key)
+    fsm_cleared = False
+    try:
+        actor = int(user_id or 0)
+        bot = int(bot_id or 0)
+        if actor > 0 and bot > 0:
+            fsm_cleared = bool(v52_router.DEFAULT_FSM.clear(
+                {"bot_id": bot, "actor_tg_id": actor, "chat_id": actor}
+            ))
+    except Exception:
+        logger.exception("Could not clear the v5.2 draft FSM for actor %s", user_id)
+    return {"cleared_keys": cleared, "fsm_cleared": fsm_cleared}
 
 
 def _is_root_personal_renewal(user, role, account) -> bool:
@@ -4184,6 +4287,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = query.data or ""
+    # Leaving a workflow (menu/home/back/persona) or entering a new one must drop
+    # every pending draft in both state stores, or the previous module steals the
+    # next text message the customer sends.
+    if _is_navigation_callback(data) or _is_workflow_start_callback(data):
+        _reset_all_conversation_states(user.id, _bot_id_of(context), context)
     if data.startswith("v52:"):
         await _dispatch_v52_callback(update, context, role=role, rep=rep)
         return
@@ -4212,9 +4320,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # A settled receipt's status chip is inert by design: pressing it must never
+    # re-run the review or query the panel again.
+    if data == "noop":
+        await query.answer("این فیش قبلاً تعیین تکلیف شده است.")
+        return
+
     # Admin Receipt Verification Callbacks
     if data.startswith("admin_approve_rcp_"):
-        if role != "super_admin":
+        if _base_role_of(user, chat, thread_id)[0] != "super_admin":
             await query.answer("⛔️ این عملیات فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
             return
         raw_id = data.replace("admin_approve_rcp_", "")
@@ -4224,14 +4338,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if rcp.get("status") != "approved":
                 status = rcp.get("status", "unknown")
                 await query.edit_message_reply_markup(
-                    reply_markup=finance_manager.build_admin_reviewed_keyboard(status)
+                    reply_markup=finance_manager.build_admin_reviewed_keyboard(
+                        status, rcp.get("user_id"))
                 )
                 await query.answer(
                     f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {status}",
                     show_alert=True
                 )
                 return
-            await query.edit_message_reply_markup(reply_markup=finance_manager.build_admin_reviewed_keyboard("approved"))
+            await query.edit_message_reply_markup(
+                reply_markup=finance_manager.build_admin_reviewed_keyboard("approved", rcp.get("user_id"))
+            )
             await query.answer(f"✅ فیش {rcp['tracking_code']} تایید شد.")
             
             try:
@@ -4254,7 +4371,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("admin_reject_rcp_"):
-        if role != "super_admin":
+        if _base_role_of(user, chat, thread_id)[0] != "super_admin":
             await query.answer("⛔️ این عملیات فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
             return
         raw_id = data.replace("admin_reject_rcp_", "")
@@ -4264,14 +4381,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if rcp.get("status") != "rejected":
                 status = rcp.get("status", "unknown")
                 await query.edit_message_reply_markup(
-                    reply_markup=finance_manager.build_admin_reviewed_keyboard(status)
+                    reply_markup=finance_manager.build_admin_reviewed_keyboard(
+                        status, rcp.get("user_id"))
                 )
                 await query.answer(
                     f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {status}",
                     show_alert=True
                 )
                 return
-            await query.edit_message_reply_markup(reply_markup=finance_manager.build_admin_reviewed_keyboard("rejected"))
+            await query.edit_message_reply_markup(
+                reply_markup=finance_manager.build_admin_reviewed_keyboard("rejected", rcp.get("user_id"))
+            )
             await query.answer(f"❌ فیش {rcp['tracking_code']} رد شد.")
             
             try:
@@ -4293,7 +4413,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("admin_detail_rcp_"):
-        if role != "super_admin":
+        if _base_role_of(user, chat, thread_id)[0] != "super_admin":
             await query.answer("⛔️ این عملیات فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
             return
         raw_id = data.replace("admin_detail_rcp_", "")
@@ -4324,7 +4444,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
             ]
         else:
-            btns = [[InlineKeyboardButton(status_fa, callback_data="noop")]]
+            btns = [
+                [InlineKeyboardButton(status_fa, callback_data="noop")],
+                [InlineKeyboardButton(
+                    "👤 مشاهده پروفایل کاربر",
+                    callback_data=f"admin:user_detail:{int(rcp['user_id'])}")],
+                [InlineKeyboardButton("👑 بازگشت به میز مدیر کل", callback_data="admin:main")],
+            ]
         await finance_manager.reply_with_receipt_detail(
             query.message,
             rcp,
@@ -5317,12 +5443,21 @@ async def _sync_v52_forum_topics(bot_api, bot_id: int, group_chat_id: int, *, ow
         if not permission.get("allowed"):
             return {"state": "skipped", "reason": permission.get("reason"), "active": 0}
         with database.get_db() as conn:
-            outcomes = forum_manager.sync_report_topics(
+            result = forum_manager.provision_standard_topics(
                 conn, api, bot_id=int(bot_id), group_chat_id=int(group_chat_id),
                 now=int(time.time()), owner_key=owner_key,
             )
-        return {"state": "completed", "topics": len(outcomes),
-                "active": sum(1 for item in outcomes if item.get("state") == "active")}
+        # Persist the real message_thread_id so log/receipt/backup routing targets
+        # the topic Telegram actually created instead of a hard-coded guess.
+        written = database.apply_forum_topic_settings(result.get("settings") or {})
+        return {
+            "state": "completed",
+            "topics": result.get("total", 0),
+            "active": result.get("active", 0),
+            "settings_written": written,
+            "thread_ids": result.get("settings") or {},
+            "outcomes": result.get("outcomes") or [],
+        }
 
     return await asyncio.to_thread(sync)
 
@@ -5337,10 +5472,11 @@ async def _bootstrap_v52_startup(application: Application) -> None:
         bot_id=int(me.id), username=str(getattr(me, "username", "") or ""), token=BOT_TOKEN,
     )
     logger.info("v5.2 bootstrap completed: %s", result)
-    if MAIN_GROUP_ID:
+    main_group_id = database.get_main_group_id()
+    if main_group_id:
         try:
             topic_result = await _sync_v52_forum_topics(
-                application.bot, int(me.id), int(MAIN_GROUP_ID), owner_key="root",
+                application.bot, int(me.id), int(main_group_id), owner_key="root",
             )
             logger.info("v5.2 startup forum synchronization: %s", topic_result)
         except Exception:

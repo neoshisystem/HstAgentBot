@@ -53,6 +53,8 @@ DEFAULT_SETTINGS = [
     ("rep_logs_topic_id", "0", "تاپیک لاگ نمایندگی", "شناسه تاپیک اختصاصی لاگ‌های نماینده"),
     ("backups_topic_id", str(BACKUPS_TOPIC_ID), "تاپیک بکاپ‌ها", "شناسه تاپیک آپلود خودکار فایل‌های پشتیبان"),
     ("admin_dm_topic_id", str(ADMIN_DM_LOGS_TOPIC_ID), "تاپیک پیوی ادمین", "شناسه تاپیک میرور گزارشات در پیوی ادمین"),
+    ("pending_receipts_topic_id", "0", "تاپیک فیش‌ها و امور مالی", "شناسه تاپیک تایید فیش‌ها و عملیات مالی"),
+    ("support_tickets_topic_id", "0", "تاپیک تیکت‌ها و گزارش تخلف", "شناسه تاپیک تیکت‌ها و گزارش تخلف"),
     ("admin_telegram_id", str(ADMIN_TELEGRAM_ID), "شناسه تلگرام ادمین کل", "شناسه عددی ادمین اصلی سیستم")
 ]
 
@@ -958,6 +960,10 @@ def get_setting(key: str, default=None, cast_type=None):
 
 def set_setting(key: str, value, actor_id=0, actor_name="admin"):
     str_val = str(value).strip()
+    if key in GROUP_ID_SETTING_KEYS:
+        # A bare ``100…`` id is a supergroup id missing its minus; storing it raw
+        # makes every send target a chat that does not exist.
+        str_val = str(normalize_group_chat_id(str_val))
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE system_settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?", (str_val, key))
@@ -968,6 +974,109 @@ def set_setting(key: str, value, actor_id=0, actor_name="admin"):
         result_status="success"
     )
     return str_val
+
+GROUP_ID_SETTING_KEYS = frozenset({
+    "main_group_id", "sandbox_group_id", "end_user_sandbox_group_id",
+})
+
+
+def normalize_group_chat_id(value) -> int:
+    """Return Telegram's signed group form; ``1004377897090`` -> ``-1004377897090``.
+
+    Kept in ``database`` so the settings writer can canonicalise on save without
+    importing the forum manager (which owns the Telegram-facing copy).
+    """
+    if isinstance(value, bool) or value is None:
+        raise ValueError("group id must be an integer")
+    text = str(value).strip().replace(" ", "")
+    if not text:
+        raise ValueError("group id must be an integer")
+    try:
+        number = int(text)
+    except (TypeError, ValueError):
+        raise ValueError("group id must be an integer") from None
+    return 0 if number == 0 else -abs(number)
+
+
+def get_main_group_id() -> int:
+    """Canonical main supergroup id, read from settings and never trusted raw."""
+    raw = get_setting("main_group_id", str(MAIN_GROUP_ID))
+    try:
+        return normalize_group_chat_id(raw)
+    except ValueError:
+        return 0
+
+
+def list_unresolved_user_action_intents(limit: int = 30, user_id: int | None = None) -> list:
+    """Purchase/renewal intents still holding a customer's money.
+
+    ``processing`` means the panel call was never resolved; ``needs_reconciliation``
+    means the outcome is genuinely ambiguous. Both keep the debit and the
+    operation lock, so they are the queue the admin must settle by hand.
+    """
+    try:
+        with get_db() as conn:
+            params: list = []
+            where = "i.status IN ('processing', 'needs_reconciliation')"
+            if user_id is not None:
+                where += " AND i.user_id = ?"
+                params.append(int(user_id))
+            params.append(max(1, int(limit)))
+            rows = conn.execute(
+                "SELECT i.intent_id, i.user_id, i.action_type, i.plan_name, i.plan_code, "
+                "i.gb, i.days, i.amount, i.status, i.result_note, i.created_at, "
+                "i.operation_lock_key, "
+                "COALESCE(u.full_name, '') AS full_name, COALESCE(u.username, '') AS username "
+                "FROM user_action_intents i "
+                "LEFT JOIN bot_users u ON u.telegram_id = i.user_id "
+                f"WHERE {where} ORDER BY i.created_at DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+            return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
+def get_unresolved_user_action_intent(intent_id: str) -> dict | None:
+    """One unresolved intent with its payer identity, for the admin card."""
+    key = str(intent_id or "").strip()
+    if not key:
+        return None
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT i.*, COALESCE(u.full_name, '') AS full_name, "
+                "COALESCE(u.username, '') AS username "
+                "FROM user_action_intents i "
+                "LEFT JOIN bot_users u ON u.telegram_id = i.user_id "
+                "WHERE i.intent_id = ? "
+                "AND i.status IN ('processing', 'needs_reconciliation')",
+                (key,),
+            ).fetchone()
+            return dict(row) if row else None
+    except sqlite3.OperationalError:
+        return None
+
+
+def apply_forum_topic_settings(mapping) -> int:
+    """Persist provisioned topic thread ids without touching unrelated settings."""
+    if not isinstance(mapping, dict):
+        raise ValueError("topic settings mapping must be a dict")
+    written = 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        for key, value in mapping.items():
+            thread_id = int(value)
+            if thread_id <= 0:
+                continue
+            cur.execute(
+                "UPDATE system_settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?",
+                (str(thread_id), str(key)),
+            )
+            written += cur.rowcount
+        conn.commit()
+    return written
+
 
 def get_all_settings():
     with get_db() as conn:
@@ -2759,6 +2868,42 @@ def get_user_wallet_balance(user_id: int) -> int:
         cur = conn.cursor()
         row = cur.execute("SELECT balance_toman FROM user_wallets WHERE user_id = ?", (user_id,)).fetchone()
         return row["balance_toman"] if row else 0
+
+
+def get_user_locked_amount(user_id: int) -> int:
+    """Wallet debits still escrowed by an unresolved purchase/renewal intent.
+
+    ``begin_user_action_intent`` debits the wallet before the panel is contacted,
+    so an intent that never reached a terminal state is money the customer has
+    paid but cannot spend. The wallet view must show it separately.
+    """
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS locked FROM user_action_intents "
+                "WHERE user_id = ? AND status IN ('processing', 'needs_reconciliation')",
+                (int(user_id),),
+            ).fetchone()
+            return int(row["locked"] or 0) if row else 0
+    except sqlite3.OperationalError:
+        # A pre-v5.2 database has no intent table, so nothing can be escrowed.
+        return 0
+
+
+def get_user_pending_intents(user_id: int, limit: int = 20) -> list:
+    """Unresolved purchase/renewal intents that still hold the customer's money."""
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT intent_id, action_type, plan_name, gb, days, amount, status, "
+                "result_note, created_at FROM user_action_intents "
+                "WHERE user_id = ? AND status IN ('processing', 'needs_reconciliation') "
+                "ORDER BY created_at DESC LIMIT ?",
+                (int(user_id), max(1, int(limit))),
+            ).fetchall()
+            return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
 
 def record_user_payment(user_id: int, amount: int, description: str, actor_id: int, actor_name: str = "") -> int:
     """Credit a user wallet and ledger in one serialized SQLite transaction."""
