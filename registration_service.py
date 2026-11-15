@@ -241,6 +241,47 @@ def _apply_status(
     )
 
 
+def _is_privileged(
+    conn: sqlite3.Connection, actor: int, row: dict[str, Any], root_id: int | None = None,
+) -> bool:
+    """Root and any active representative bypass the registration policy."""
+    if str(row.get("role") or "") in ("super_admin", "rep"):
+        return True
+    if root_id is None:
+        try:
+            import config
+            root_id = int(getattr(config, "ADMIN_TELEGRAM_ID", 0) or 0)
+        except Exception:
+            root_id = 0
+    if root_id and int(actor) == root_id:
+        return True
+    if not _table_exists(conn, "representatives"):
+        return False
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM representatives WHERE telegram_id=? AND is_active=1 "
+            "AND deleted_at IS NULL LIMIT 1", (int(actor),),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return found is not None
+
+
+def _stamp_privileged(conn: sqlite3.Connection, actor: int) -> None:
+    """Keep a privileged actor's row permanently approved and decided.
+
+    Heals a row that an earlier policy run left in ``awaiting_referral`` or
+    ``pending_approval``, so the operator is never asked for a referral code by
+    his own bot again.
+    """
+    conn.execute(
+        "UPDATE bot_users SET registration_status='approved', "
+        "registration_decided_at=COALESCE(registration_decided_at, CURRENT_TIMESTAMP) "
+        "WHERE telegram_id=? AND registration_status<>'approved'",
+        (int(actor),),
+    )
+
+
 def register(
     conn: sqlite3.Connection,
     *,
@@ -252,6 +293,7 @@ def register(
     invite_code: Any = None,
     typed_code: Any = None,
     now: int | None = None,
+    root_id: int | None = None,
 ) -> dict[str, Any]:
     """Apply the tenant's registration policy to one ``/start``.
 
@@ -266,8 +308,13 @@ def register(
         raise RegistrationError("actor row must exist before registration is decided")
 
     status = str(row.get("registration_status") or STATUS_APPROVED)
+
     # Root and representatives are provisioned by the operator, never queued.
-    if str(row.get("role") or "") in ("super_admin", "rep"):
+    # Two independent signals, because ``bot_users.role`` is written as
+    # ``end_user`` when the row is first created and must not be trusted alone:
+    # the configured root id, and an active ``representatives`` row.
+    if _is_privileged(conn, actor, row, root_id):
+        _stamp_privileged(conn, actor)
         return {"status": STATUS_APPROVED, "mode": mode, "changed": False,
                 "referrer": None, "privileged": True}
 
@@ -276,6 +323,13 @@ def register(
     # (``registration_decided_at`` is NULL) is therefore *not* approved yet: the
     # tenant policy decides it now.
     fresh = status == STATUS_APPROVED and not row.get("registration_decided_at")
+
+    # An already-decided approved actor is never re-gated. Flipping the tenant to
+    # ``referral_only`` must not retroactively demand a referral code from a
+    # customer who was admitted under the previous policy.
+    if status == STATUS_APPROVED and not fresh:
+        return {"status": STATUS_APPROVED, "mode": mode, "changed": False,
+                "referrer": None, "privileged": False}
 
     supplied = invite_code if invite_code is not None else typed_code
     referrer = find_referrer_by_code(conn, supplied) if supplied else None

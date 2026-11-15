@@ -119,24 +119,33 @@ def _canonical_host(canonical_host: str | None = None) -> str:
 
 
 def _profile_host(conn, profile, canonical_host: str | None = None) -> str | None:
+    """Prefer the representative's active registered domain, else the canonical host.
+
+    A branded profile resolves to its own active ``sub_domains`` row (primary
+    first) via ``domain_service.resolve_profile_host``; with no registered
+    domain it falls back to the configured canonical host, preserving the
+    previous behaviour. The default profile stays canonical-only.
+    """
     canonical = _canonical_host(canonical_host)
-    if not canonical:
-        return None
     try:
+        domain_service.ensure_domain_columns(conn)
         if bool(profile["is_default"]):
-            return canonical if domain_service.resolve_profile_host(conn, profile, canonical, canonical) else None
+            return canonical if canonical and domain_service.resolve_profile_host(
+                conn, profile, canonical, canonical) else None
         brand_id = profile["brand_rep_id"]
         if brand_id is not None:
             row = conn.execute(
                 "SELECT hostname FROM sub_domains WHERE rep_id=? AND status='active' "
-                "ORDER BY verified_at DESC,domain_id DESC LIMIT 1",
+                "ORDER BY is_primary DESC, verified_at DESC, domain_id DESC LIMIT 1",
                 (int(brand_id),),
             ).fetchone()
             if row is not None:
                 host = str(row["hostname"])
-                if domain_service.resolve_profile_host(conn, profile, host, canonical):
+                if domain_service.resolve_profile_host(conn, profile, host, canonical or host):
                     return host
-        return canonical if domain_service.resolve_profile_host(conn, profile, canonical, canonical) else None
+        if canonical and domain_service.resolve_profile_host(conn, profile, canonical, canonical):
+            return canonical
+        return None
     except Exception:
         return None
 

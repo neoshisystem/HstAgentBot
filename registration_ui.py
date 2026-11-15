@@ -248,6 +248,17 @@ def build_registration_settings_page(
             f"⏳ درخواست‌های عضویت در انتظار ({pending})",
             callback_data=f"{prefix}:pending_reg")],
     ]
+    # Standard navigation so this submenu is never a dead end: back to the parent
+    # settings centre and straight home. The representative workspace has no
+    # settings centre, so it only gets the home row.
+    if scope == "admin":
+        rows.append([InlineKeyboardButton(
+            "🔙 بازگشت به تنظیمات پیشرفته", callback_data="admin:settings")])
+        rows.append([InlineKeyboardButton(
+            "🏠 بازگشت به منوی اصلی", callback_data="admin:main")])
+    else:
+        rows.append([InlineKeyboardButton(
+            "🏠 بازگشت به منوی اصلی", callback_data="rep:main")])
     return text, InlineKeyboardMarkup(rows)
 
 

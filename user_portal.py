@@ -259,13 +259,18 @@ async def show_user_portal(update: Update, context: ContextTypes.DEFAULT_TYPE, e
     )
     keyboard = build_user_portal_keyboard(base_role=role)
     if _v52_ui_enabled():
+        # ``InlineKeyboardMarkup.inline_keyboard`` is a tuple in python-telegram-bot
+        # v20+, so appending to it raised AttributeError and the portal button did
+        # nothing at all. Rebuild the markup from a list instead of mutating it.
+        rows = list(keyboard.inline_keyboard)
         for account in linked_accs:
             account_id = account.get("id") if isinstance(account, dict) else None
             if isinstance(account_id, int) and account_id > 0:
                 label = str(account.get("account_code") or f"سرویس {account_id}")[:20]
-                keyboard.inline_keyboard.append([
+                rows.append([
                     InlineKeyboardButton(f"🎫 تیکت {label}", callback_data=f"v52:support:{account_id}")
                 ])
+        keyboard = InlineKeyboardMarkup(rows)
 
     if edit_message and update.callback_query:
         try:

@@ -97,38 +97,239 @@ def build_settings_category_page(cat_key: str):
     return "\n".join(lines), rows
 
 
+def profile_origin_callback(origin: str = "", ref: str = "") -> str:
+    """Encode where a profile page was opened from so its back button returns there.
+
+    ``origin`` names the surface (``tx``, ``rcp``, ``ticket``) and ``ref`` its id.
+    An unknown or empty origin falls back to the user list, so the button is never
+    a dead end.
+    """
+    surface = str(origin or "").strip()
+    if surface not in PROFILE_ORIGINS:
+        return ""
+    reference = str(ref or "").strip()
+    if not reference:
+        return ""
+    return f"{surface}:{reference}"
+
+
+def build_profile_callback(user_id: int, origin: str = "", ref: str = "") -> str:
+    """Callback that opens a user profile and remembers the page it came from."""
+    base = f"admin:user_detail:{int(user_id)}"
+    encoded = profile_origin_callback(origin, ref)
+    return f"{base}:{encoded}" if encoded else base
+
+
+def _profile_back_row(origin: str, ref: str) -> list:
+    """The single back button a profile page shows for its originating surface."""
+    if origin == "tx" and ref:
+        return [InlineKeyboardButton("🔙 بازگشت به تراکنش معلق",
+                                     callback_data=f"admin:pending_tx:{ref}")]
+    if origin == "rcp" and ref:
+        return [InlineKeyboardButton("🔙 بازگشت به فیش واریزی",
+                                     callback_data=f"admin_detail_rcp_{ref}")]
+    if origin == "ticket" and ref:
+        return [InlineKeyboardButton("🔙 بازگشت به تیکت",
+                                     callback_data=f"v52:support:ticket:{ref}")]
+    if origin == "reg" and ref:
+        return [InlineKeyboardButton("🔙 بازگشت به صف تایید عضویت",
+                                     callback_data="admin:pending_reg")]
+    return [InlineKeyboardButton("🔙 بازگشت به فهرست کاربران",
+                                 callback_data="admin:users:1")]
+
+
+def _base_role_of(user, chat, thread_id=None) -> tuple[str, dict | None]:
+    """The actor's PERMANENT role, ignoring any persona override.
+
+    Management guards must use this: the resolved persona changes with the
+    workspace switcher, so a super admin viewing the end-user workspace would
+    otherwise be refused by their own admin surfaces.
+    """
+    try:
+        return database.get_user_role(
+            getattr(user, "id", None), getattr(chat, "id", None), thread_id)
+    except Exception:
+        logger.debug("Base-role resolution failed", exc_info=True)
+        return "end_user", None
+
+
+def _profile_identity_lines(u_info: dict) -> list[str]:
+    """Identity block shared by every profile surface."""
+    lines = [
+        f"• **نام:** {escape_markdown(u_info.get('full_name') or 'ثبت نشده')}",
+    ]
+    if u_info.get("username"):
+        lines.append(f"• **یوزرنیم:** @{escape_markdown(u_info.get('username'))}")
+    else:
+        lines.append("• **یوزرنیم:** ندارد")
+    lines.append(f"• **شناسه تلگرام:** `{int(u_info.get('telegram_id') or 0)}`")
+    lines.append(f"• **نقش پایه:** {escape_markdown(u_info.get('role') or 'end_user')}")
+    referrer = u_info.get("referred_by_user_id")
+    if referrer:
+        lines.append(
+            f"• **معرف:** `{int(referrer)}` (کد `{escape_markdown(u_info.get('referred_by_code') or '—')}`)")
+    else:
+        lines.append("• **معرف:** ندارد")
+    if u_info.get("assigned_rep_id"):
+        lines.append(f"• **نماینده بالاسری:** `{int(u_info['assigned_rep_id'])}`")
+    status_map = {
+        "approved": "✅ تاییدشده", "pending_approval": "⏳ در انتظار تایید",
+        "awaiting_referral": "🎁 در انتظار کد معرف", "rejected": "❌ ردشده",
+    }
+    lines.append(
+        "• **وضعیت عضویت:** "
+        + status_map.get(str(u_info.get("registration_status") or "approved"), "نامشخص"))
+    return lines
+
+
+def build_user_profile_page(
+    user_id: int, *, origin: str = "", ref: str = "",
+    allow_management: bool = True,
+):
+    """360° profile card: identity, money, services, tickets and the way back.
+
+    ``origin``/``ref`` remember the surface the profile was opened from so the
+    back button returns to that exact transaction, receipt or ticket instead of
+    dumping the operator in the user list. ``allow_management`` is False for a
+    representative viewing a downstream user: read-only, no wallet or block
+    controls, and never a link to a higher authority's profile.
+    """
+    user_id = int(user_id)
+    u_info = database.get_bot_user_by_tg_id(user_id) or {}
+    if not u_info:
+        return "", []
+    wallet = int(u_info.get("wallet_balance") or 0)
+    try:
+        locked = int(database.get_user_locked_amount(user_id) or 0)
+    except Exception:
+        locked = 0
+    is_blocked = int(u_info.get("is_blocked") or 0) == 1
+    lines = ["👤 **پروفایل ۳۶۰ درجه کاربر:**\n"]
+    lines.extend(_profile_identity_lines(u_info))
+    lines.append(f"• **وضعیت دسترسی:** {'🔴 مسدود' if is_blocked else '🟢 فعال'}")
+    lines.append("")
+    lines.append(f"💰 **کیف پول:**")
+    lines.append(f"   • موجودی قابل برداشت: **{wallet:,} تومان**")
+    lines.append(f"   • مبلغ محفوظ در تراکنش معلق: **{locked:,} تومان**")
+    lines.append(f"   • تعداد اکانت‌های متصل: **{int(u_info.get('linked_accounts_count') or 0)}**")
+
+    try:
+        accounts = database.get_user_accounts(user_id) or []
+    except Exception:
+        accounts = []
+    if accounts:
+        lines.append("")
+        lines.append("📡 **سرویس‌ها:**")
+        for account in accounts[:5]:
+            state = "🟢 فعال" if account.get("enable") else "🔴 غیرفعال"
+            lines.append(
+                f"   • `{escape_markdown_code(account.get('account_code') or '—')}` | "
+                f"{escape_markdown(account.get('email') or '—')} | {state}")
+    else:
+        lines.append("")
+        lines.append("📡 **سرویس‌ها:** هیچ سرویسی ثبت نشده است.")
+
+    try:
+        ledger = database.get_recent_ledger_entries(limit=5) or []
+    except Exception:
+        ledger = []
+    mine = [row for row in ledger if int(row.get("user_id") or 0) == user_id][:5]
+    lines.append("")
+    lines.append("🧾 **۵ تراکنش آخر:**")
+    if mine:
+        for row in mine:
+            lines.append(
+                f"   • {escape_markdown(str(row.get('transaction_type') or '—'))} | "
+                f"**{int(row.get('amount') or 0):,} ت** | "
+                f"`{escape_markdown_code(str(row.get('created_at') or '')[:19])}`")
+    else:
+        lines.append("   • تراکنشی ثبت نشده است.")
+
+    try:
+        with database.get_db() as conn:
+            ticket_rows = conn.execute(
+                "SELECT ticket_id, status FROM support_tickets WHERE sender_tg_id=? "
+                "AND ticket_type<>'abuse_report' ORDER BY created_at DESC LIMIT 5",
+                (user_id,),
+            ).fetchall()
+    except Exception:
+        ticket_rows = []
+    lines.append("")
+    lines.append(f"🎫 **تیکت‌ها ({len(ticket_rows)} مورد آخر):**")
+    if ticket_rows:
+        for row in ticket_rows:
+            lines.append(
+                f"   • `{escape_markdown_code(str(row['ticket_id']))}` | "
+                f"{escape_markdown(str(row['status']))}")
+    else:
+        lines.append("   • تیکتی ثبت نشده است.")
+
+    rows = []
+    if allow_management:
+        toggle = "🟢 رفع مسدودی" if is_blocked else "🚫 مسدود کردن"
+        rows.append([
+            InlineKeyboardButton("💰 شارژ / کسر کیف پول",
+                                 callback_data=f"admin:prompt_charge_user:{user_id}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(toggle,
+                                 callback_data=f"admin:set_block_user:{user_id}:{0 if is_blocked else 1}"),
+            InlineKeyboardButton("✏️ تغییر Telegram ID",
+                                 callback_data=f"admin:prompt_edit_user_id:{user_id}"),
+        ])
+        rows.append([
+            InlineKeyboardButton("➕ اتصال اکانت",
+                                 callback_data=f"admin:prompt_link_user_id:{user_id}"),
+            InlineKeyboardButton("❌ قطع اتصال اکانت",
+                                 callback_data=f"admin:prompt_unlink_user_acc:{user_id}"),
+        ])
+        rows.append([
+            InlineKeyboardButton("🗑 حذف کاربر",
+                                 callback_data=f"admin:confirm_del_user:{user_id}"),
+        ])
+    rows.append(_profile_back_row(origin, ref))
+    return "\n".join(lines), rows
+
+
 def _pending_intent_card(intent: dict):
-    """Readable card for one locked transaction plus its resolution buttons."""
+    """Readable card for one locked transaction plus its resolution buttons.
+
+    Every dynamic value is escaped: the intent note carries panel text such as
+    ``EVIDENCE_REQUIRED``, whose lone underscore used to open an italic entity
+    that never closed, so Telegram rejected the whole message with
+    ``Can't parse entities`` and the caller surfaced a generic crash alert.
+    """
     intent_id = str(intent["intent_id"])
     label = "خرید" if intent.get("action_type") == "buy" else "تمدید"
-    payer = intent.get("full_name") or intent.get("username") or "—"
+    payer = escape_markdown(intent.get("full_name") or intent.get("username") or "—")
     state_fa = ("در انتظار تعیین تکلیف مدیریت" if intent.get("status") == "needs_reconciliation"
                 else "در حال پردازش")
     lines = [
         f"⏳ **تراکنش معلق و قفل‌شده:**\n",
-        f"• شناسه: `{intent_id}`",
-        f"• نوع: **{label}** | بسته: **{intent.get('plan_name') or '—'}**",
+        f"• شناسه: `{escape_markdown_code(intent_id)}`",
+        f"• نوع: **{label}** | بسته: **{escape_markdown(intent.get('plan_name') or '—')}**",
         f"• مبلغ قفل‌شده: **{int(intent.get('amount') or 0):,} تومان**",
         f"• پرداخت‌کننده: **{payer}** (`{int(intent.get('user_id') or 0)}`)",
         f"• وضعیت: **{state_fa}**",
-        f"• قفل عملیات: `{intent.get('operation_lock_key') or '—'}`",
-        f"• تاریخ: `{str(intent.get('created_at') or '')[:19]}`",
+        f"• قفل عملیات: `{escape_markdown_code(intent.get('operation_lock_key') or '—')}`",
+        f"• تاریخ: `{escape_markdown_code(str(intent.get('created_at') or '')[:19])}`",
     ]
     note = str(intent.get("result_note") or "").strip()
     if note:
-        lines.append(f"• یادداشت سیستم: {note[:220]}")
+        lines.append(f"• یادداشت سیستم: {escape_markdown(note[:220])}")
     lines.append(
         "\nℹ️ «تایید تحویل» برداشت را نهایی و قفل را آزاد می‌کند؛ "
         "«لغو و بازگشت وجه» مبلغ را اتمیک به کیف پول کاربر برمی‌گرداند."
     )
     rows = [
         [InlineKeyboardButton("👤 مشاهده پروفایل کاربر",
-                              callback_data=f"admin:user_detail:{int(intent.get('user_id') or 0)}")],
+                              callback_data=build_profile_callback(
+                                  int(intent.get("user_id") or 0), "tx", intent_id))],
         [InlineKeyboardButton("🔄 استعلام مجدد از پنل",
                               callback_data=f"admin:pending_recheck:{intent_id}")],
-        [InlineKeyboardButton("✅ تایید تحویل و نهایی‌سازی",
+        [InlineKeyboardButton("✅ پذیرش و تایید نهایی تراکنش",
                               callback_data=f"admin:pending_confirm:{intent_id}")],
-        [InlineKeyboardButton("💸 لغو و بازگشت وجه به کیف پول",
+        [InlineKeyboardButton("↩️ رد تراکنش و عودت وجه (Refund)",
                               callback_data=f"admin:pending_refund:{intent_id}")],
         [InlineKeyboardButton("↩️ بازگشت به صف تراکنش‌های معلق",
                               callback_data="admin:pending_tx")],
@@ -140,7 +341,8 @@ def _pending_intent_confirm_card(intent: dict, action: str):
     """Two-step confirmation before any money moves."""
     intent_id = str(intent["intent_id"])
     amount = int(intent.get("amount") or 0)
-    payer = intent.get("full_name") or intent.get("username") or str(intent.get("user_id"))
+    payer = escape_markdown(
+        intent.get("full_name") or intent.get("username") or str(intent.get("user_id")))
     if action == "apply":
         title = "✅ **تایید تحویل و نهایی‌سازی تراکنش**"
         consequence = (
@@ -159,7 +361,7 @@ def _pending_intent_confirm_card(intent: dict, action: str):
         confirm_label = "💸 بله، وجه را برگردان"
     text = (
         f"{title}\n\n"
-        f"• تراکنش: `{intent_id}`\n"
+        f"• تراکنش: `{escape_markdown_code(intent_id)}`\n"
         f"• پرداخت‌کننده: **{payer}**\n"
         f"• مبلغ: **{amount:,} تومان**\n\n"
         f"⚠️ {consequence}\n\nآیا مطمئن هستید؟"
@@ -183,13 +385,15 @@ def build_pending_transactions_page(user_id: int | None = None):
         lines.append(f"• تعداد: **{len(rows_data)}** | مجموع مبلغ قفل‌شده: **{total:,} تومان**\n")
         for item in rows_data:
             label = "خرید" if item.get("action_type") == "buy" else "تمدید"
-            payer = item.get("full_name") or item.get("username") or "—"
+            payer = escape_markdown(item.get("full_name") or item.get("username") or "—")
             lines.append(
-                f"• `{str(item['intent_id'])[:10]}` | {label} **{item.get('plan_name') or '—'}** | "
+                f"• `{escape_markdown_code(str(item['intent_id'])[:10])}` | {label} "
+                f"**{escape_markdown(item.get('plan_name') or '—')}** | "
                 f"**{int(item.get('amount') or 0):,} ت** | {payer}"
             )
             buttons.append([InlineKeyboardButton(
-                f"⏳ {label} {int(item.get('amount') or 0):,} ت — {payer}"[:60],
+                f"⏳ {label} {int(item.get('amount') or 0):,} ت — "
+                f"{item.get('full_name') or item.get('username') or '—'}"[:60],
                 callback_data=f"admin:pending_tx:{item['intent_id']}",
             )])
     return "\n".join(lines), buttons
@@ -368,6 +572,9 @@ def build_back_to_admin_keyboard(
         InlineKeyboardButton("↩️ بازگشت به پنل مدیریت ادمین", callback_data="admin:main")
     ])
     return InlineKeyboardMarkup(keyboard)
+
+
+PROFILE_ORIGINS = ("tx", "rcp", "ticket", "reg")
 
 
 def escape_markdown(value) -> str:
@@ -857,34 +1064,19 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
 
     elif action == "user_detail":
         user_id = int(sub_action)
-        u_info = database.get_bot_user_by_tg_id(user_id)
-        if not u_info:
+        origin = parts[3] if len(parts) > 3 else ""
+        origin_ref = parts[4] if len(parts) > 4 else ""
+        base_role, _base_rep = _base_role_of(user, chat, None)
+        text, rows = build_user_profile_page(
+            user_id, origin=origin, ref=origin_ref,
+            allow_management=(base_role == "super_admin"))
+        if not text:
             await query.answer("❌ کاربر یافت نشد.", show_alert=True)
             return
-
-        is_blocked = u_info.get("is_blocked", 0) == 1
-        block_text = "🔴 مسدود (Blocked)" if is_blocked else "🟢 فعال (Active)"
-        toggle_btn_text = "🟢 رفع مسدودی" if is_blocked else "🚫 مسدود کردن"
-
-        lines = [
-            f"👤 **شناسنامه کاربر نهایی:**\n",
-            f"• **نام:** {escape_markdown(u_info.get('full_name') or 'ثبت نشده')}",
-            f"• **یوزرنیم:** @{escape_markdown(u_info.get('username'))}" if u_info.get("username") else "• **یوزرنیم:** ندارد",
-            f"• **شناسه تلگرام:** `{u_info['telegram_id']}`",
-            f"• **وضعیت دسترسی:** **{block_text}**",
-            f"• **موجود کیف پول:** **{u_info['wallet_balance']:,} تومان**",
-            f"• **تعداد اکانت‌های متصل:** **{u_info['linked_accounts_count']}**"
-        ]
-        keyboard = build_back_to_admin_keyboard([
-            [InlineKeyboardButton("💰 شارژ / کسر کیف پول", callback_data=f"admin:prompt_charge_user:{user_id}")],
-            [InlineKeyboardButton(toggle_btn_text, callback_data=f"admin:set_block_user:{user_id}:{0 if is_blocked else 1}"),
-             InlineKeyboardButton("✏️ تغییر Telegram ID", callback_data=f"admin:prompt_edit_user_id:{user_id}")],
-            [InlineKeyboardButton("➕ اتصال اکانت", callback_data=f"admin:prompt_link_user_id:{user_id}"),
-             InlineKeyboardButton("❌ قطع اتصال اکانت", callback_data=f"admin:prompt_unlink_user_acc:{user_id}")],
-            [InlineKeyboardButton("🗑 حذف کاربر", callback_data=f"admin:confirm_del_user:{user_id}")]
-        ], parent_cb="admin:users:1")
-        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        await query.answer()
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(rows))
+        await query.answer("پروفایل ۳۶۰ درجه")
 
     elif action == "toggle_block_user":
         await query.answer(

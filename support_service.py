@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from collections.abc import Mapping
 import json
+import logging
 import secrets
 import sqlite3
 import time
@@ -14,6 +15,8 @@ import database
 from access_service import authorize_account
 from crypto_store import decrypt_secret, encrypt_secret
 from outbox_service import enqueue_delivery
+
+logger = logging.getLogger("HstAgentBot.Support")
 
 _LABEL = "hstagent/columns/v1"
 _TICKET_TYPES = frozenset({"general", "finance", "disorder", "delete_request"})
@@ -281,6 +284,93 @@ def _assignment(conn: sqlite3.Connection, account, *, sender_is_rep: bool = Fals
     return "root", None
 
 
+TICKET_CODE_FLOOR = 10001
+
+# The three standard lifecycle states the operator sees. ``unseen`` and
+# ``escalated`` are both "open"; ``answered`` is "in progress".
+TICKET_STATUS_LABELS: dict[str, str] = {
+    "unseen": "🟢 باز (Open)",
+    "escalated": "🟢 باز (Open)",
+    "answered": "🟡 در حال بررسی / پاسخ‌داده‌شده",
+    "closed": "🔴 بسته شده (Closed)",
+}
+TICKET_OPEN_STATUSES = ("unseen", "escalated")
+
+
+def ticket_code_label(ticket_id: Any) -> str:
+    """Human-facing ticket code: ``#10001`` for the sequential ids."""
+    text = str(ticket_id or "").strip()
+    return f"#{text}" if text.isdigit() else text
+
+
+def ticket_status_label(status: Any) -> str:
+    """Persian lifecycle label for a raw status value."""
+    return TICKET_STATUS_LABELS.get(str(status or "").strip().lower(), "نامشخص")
+
+
+def _next_ticket_code(conn: sqlite3.Connection) -> str:
+    """Monotonic sequential ticket code starting at 10001.
+
+    Five digits for the foreseeable range and six or more automatically once the
+    sequence passes 99999, so the code stays a short, quotable reference instead
+    of the 24-character random token it replaced. The counter lives in
+    ``system_settings`` and is advanced inside the caller's transaction, and the
+    highest existing numeric id is consulted as well so a restored backup can
+    never hand out a code that is already taken.
+    """
+    row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='ticket_code_seq'").fetchone()
+    stored = 0
+    if row is not None:
+        raw = row["value"] if not isinstance(row, tuple) else row[0]
+        if str(raw or "").strip().isdigit():
+            stored = int(str(raw).strip())
+    highest = conn.execute(
+        "SELECT COALESCE(MAX(CAST(ticket_id AS INTEGER)), 0) AS top FROM support_tickets "
+        "WHERE ticket_id GLOB '[0-9]*'").fetchone()
+    top = int(highest["top"] or 0) if highest is not None else 0
+    nxt = max(stored, top, TICKET_CODE_FLOOR - 1) + 1
+    conn.execute(
+        "INSERT INTO system_settings(key,value,label,description) "
+        "VALUES('ticket_code_seq',?,'','') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(nxt),))
+    return str(nxt)
+
+
+def migrate_legacy_ticket_codes(conn: sqlite3.Connection) -> int:
+    """Rewrite long random legacy ticket ids as sequential five-digit codes.
+
+    Idempotent: only ids that are not already numeric are touched, and the
+    message rows are re-pointed in the same transaction so no thread is orphaned.
+    Returns the number of tickets migrated.
+    """
+    rows = conn.execute(
+        "SELECT ticket_id FROM support_tickets WHERE ticket_id NOT GLOB '[0-9]*' "
+        "ORDER BY created_at ASC, ticket_id ASC").fetchall()
+    if not rows:
+        return 0
+    # ``support_messages.ticket_id`` references ``support_tickets.ticket_id``, so a
+    # plain UPDATE of either side trips the constraint. Copy the parent to its new
+    # id first, re-point the children, then drop the old parent: every intermediate
+    # state satisfies the foreign key, with no reliance on deferred checking.
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(support_tickets)")]
+    others = [name for name in columns if name != "ticket_id"]
+    select_others = ", ".join(others)
+    migrated = 0
+    for row in rows:
+        old = str(row["ticket_id"])
+        new = _next_ticket_code(conn)
+        conn.execute(
+            f"INSERT INTO support_tickets(ticket_id,{select_others}) "
+            f"SELECT ?,{select_others} FROM support_tickets WHERE ticket_id=?",
+            (new, old),
+        )
+        conn.execute("UPDATE support_messages SET ticket_id=? WHERE ticket_id=?", (new, old))
+        conn.execute("DELETE FROM support_tickets WHERE ticket_id=?", (old,))
+        migrated += 1
+    return migrated
+
+
 def create_ticket(
     ctx: Any, account_id: int | None = None, body: str = "", *,
     ticket_type: str = "disorder", attachment_file_id: str | None = None,
@@ -320,11 +410,11 @@ def create_ticket(
     else:
         snapshot = {"account_id": None, "state": "not_applicable", "unavailable": False}
         snapshot_cipher = None
-    ticket_id = secrets.token_urlsafe(18)
     source_bot = _positive(attachment_bot_id, "attachment_bot_id") if attachment_bot_id is not None else bot_id
 
     with database.get_db() as conn, _atomic(conn):
         _validate_bot(conn, bot_id)
+        ticket_id = _next_ticket_code(conn)
         sender_is_rep = _sender_is_rep(conn, ctx)
         if exact_id:
             account = conn.execute(
@@ -564,14 +654,22 @@ def reply_ticket(
             attachment_bot_id=attachment_bot_id or _bot_id(ctx),
             now=timestamp,
         )
-        # An operator's customer-visible answer moves the ticket out of the open
-        # queue; internal notes and customer follow-ups leave the status alone, and
-        # a closed ticket is never silently reopened by a later reply.
-        next_status = "answered" if (operator and selected_visibility == "customer") else None
-        if next_status is not None:
+        # Lifecycle transitions, in one place:
+        #  * the ticket AUTHOR writing again reopens a closed ticket, because the
+        #    conversation is demonstrably still live;
+        #  * an operator's customer-visible answer moves it to ``answered``;
+        #  * an operator replying to a closed ticket does NOT silently reopen it —
+        #    that is what the explicit reopen button is for;
+        #  * internal notes never move the status.
+        current_status = str(ticket["status"])
+        next_status = current_status
+        if sender and current_status == "closed":
+            next_status = "unseen"
+        elif operator and selected_visibility == "customer" and current_status != "closed":
+            next_status = "answered"
+        if next_status != current_status:
             conn.execute(
-                "UPDATE support_tickets SET updated_at=?,"
-                "status=CASE WHEN status='closed' THEN status ELSE ? END WHERE ticket_id=?",
+                "UPDATE support_tickets SET updated_at=?,status=? WHERE ticket_id=?",
                 (timestamp, next_status, str(ticket_id)),
             )
         else:
@@ -653,8 +751,66 @@ def close_ticket(ctx: Any, ticket_id: str, *, reason: str | None = None,
             "assigned_key": str(ticket["assigned_key"])}
 
 
+def reopen_ticket(ctx: Any, ticket_id: str, *, now: int | None = None) -> dict:
+    """Reopen a closed ticket. Its author, the assigned seller and root may do it.
+
+    Reopening an already-open ticket is an idempotent no-op rather than an error,
+    so a double click cannot surface a failure to the operator.
+    """
+    timestamp = _timestamp(now)
+    exact = str(ticket_id or "").strip()
+    if not exact or len(exact.encode("utf-8")) > 64:
+        raise SupportError("ticket_id is invalid")
+    with database.get_db() as conn, _atomic(conn):
+        ticket = conn.execute(
+            "SELECT * FROM support_tickets WHERE ticket_id=? AND ticket_type<>'abuse_report'",
+            (exact,),
+        ).fetchone()
+        if ticket is None:
+            raise SupportError("support ticket does not exist")
+        operator = _operator_for_ticket(conn, ctx, ticket)
+        sender = int(ticket["sender_tg_id"]) == _actor_id(ctx)
+        if not operator and not sender:
+            raise PermissionError("actor cannot reopen this support ticket")
+        current = str(ticket["status"])
+        if current != "closed":
+            return {"ticket_id": exact, "status": current, "changed": False,
+                    "assigned_key": str(ticket["assigned_key"])}
+        changed = conn.execute(
+            "UPDATE support_tickets SET status='unseen',updated_at=? "
+            "WHERE ticket_id=? AND ticket_type<>'abuse_report' AND status='closed'",
+            (timestamp, exact),
+        ).rowcount
+        if changed != 1:
+            raise SupportError("ticket reopen lost a concurrent update")
+        _insert_message(
+            conn, ticket_id=exact, actor_tg_id=_actor_id(ctx),
+            visibility="internal", body="reopened", attachment_file_id=None,
+            attachment_bot_id=None, now=timestamp,
+        )
+    return {"ticket_id": exact, "status": "unseen", "changed": True,
+            "assigned_key": str(ticket["assigned_key"])}
+
+
+def ensure_ticket_codes() -> int:
+    """Apply the five-digit ticket-code migration once, idempotently.
+
+    Called from the support entry point so an upgraded deployment rewrites its
+    legacy random ids without a nineteenth migration file.
+    """
+    try:
+        with database.get_db() as conn, _atomic(conn):
+            return migrate_legacy_ticket_codes(conn)
+    except Exception:
+        logger.debug("Legacy ticket-code migration skipped", exc_info=True)
+        return 0
+
+
 __all__ = [
     "SupportError", "build_diagnostic_snapshot", "create_ticket",
     "list_tickets", "count_tickets", "search_tickets", "list_ticket_messages",
     "export_ticket", "reply_ticket", "escalate_ticket", "close_ticket",
+    "reopen_ticket", "migrate_legacy_ticket_codes", "ensure_ticket_codes",
+    "ticket_code_label", "ticket_status_label", "TICKET_STATUS_LABELS",
+    "TICKET_OPEN_STATUSES", "TICKET_CODE_FLOOR",
 ]

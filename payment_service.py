@@ -1,6 +1,10 @@
 """Offline-safe bank-card selection, receipt submission and atomic review."""
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger("HstAgentBot.Payment")
+
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -438,10 +442,22 @@ def submit_receipt(
                 from order_service import release_order_resources
                 release_order_resources(conn, order_id=str(attempt[1]), now=now)
 
+        # Resolve the finance topic destination NOW, from the live settings and
+        # forum bindings. Reading the config constants captured at import time is
+        # what left every receipt in the Super Admin DM while the group topic sat
+        # empty: the constants are zero at startup and never refreshed.
+        mirror_chat_id, mirror_thread_id = None, None
+        try:
+            import forum_manager
+            mirror_chat_id, mirror_thread_id = forum_manager.resolve_topic_destination(
+                "pendingreceipts", conn=conn)
+        except Exception:
+            logger.debug("Finance topic destination unavailable", exc_info=True)
         conn.execute(
-            "INSERT OR IGNORE INTO receipt_notification_outbox(receipt_id,status,next_attempt_at) "
-            "VALUES(?,'pending',0)",
-            (receipt_id,),
+            "INSERT OR IGNORE INTO receipt_notification_outbox("
+            "receipt_id,recipient_chat_id,recipient_thread_id,status,next_attempt_at) "
+            "VALUES(?,?,?,'pending',0)",
+            (receipt_id, mirror_chat_id, mirror_thread_id),
         )
         return {
             "receipt_id": receipt_id, "tracking_code": tracking_code,

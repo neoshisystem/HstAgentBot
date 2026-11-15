@@ -330,7 +330,9 @@ def test_pending_transaction_card_offers_profile_reconcile_apply_and_refund(s50)
     asyncio.run(admin_panel.handle_admin_callbacks(update, make_context()))
 
     callbacks = _callbacks(query.edits[-1][1]["reply_markup"])
-    assert f"admin:user_detail:{PAYER_TG_ID}" in callbacks
+    # S52 made the profile callback carry the surface it was opened from so its
+    # back button returns to this very transaction.
+    assert any(cb.startswith(f"admin:user_detail:{PAYER_TG_ID}") for cb in callbacks)
     assert f"admin:pending_recheck:{intent_id}" in callbacks
     assert f"admin:pending_confirm:{intent_id}" in callbacks
     assert f"admin:pending_refund:{intent_id}" in callbacks
@@ -413,7 +415,9 @@ def test_reviewed_receipt_keyboard_keeps_profile_and_admin_home():
     markup = finance_manager.build_admin_reviewed_keyboard("approved", PAYER_TG_ID)
     callbacks = _callbacks(markup)
     assert "noop" in callbacks
-    assert f"admin:user_detail:{PAYER_TG_ID}" in callbacks
+    # S52 made the profile callback carry the surface it was opened from so its
+    # back button returns to this very transaction.
+    assert any(cb.startswith(f"admin:user_detail:{PAYER_TG_ID}") for cb in callbacks)
     assert "admin:main" in callbacks
 
 

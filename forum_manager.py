@@ -1,8 +1,14 @@
 """Idempotent Telegram forum-topic provisioning with timeout-safe repair state."""
 from __future__ import annotations
 
+import logging
 import sqlite3
 from typing import Any, Iterable
+
+import config
+import database
+
+logger = logging.getLogger("HstAgentBot.Forum")
 
 TOPIC_TITLES = {
     # --- standard report topics provisioned by the settings centre ---
@@ -268,8 +274,68 @@ def provision_standard_topics(
     }
 
 
+def resolve_topic_destination(
+    topic_key: str, *, conn: sqlite3.Connection | None = None, owner_key: str = "root",
+) -> tuple[int, int] | tuple[None, None]:
+    """Resolve ``(group_chat_id, thread_id)`` for a topic AT SEND TIME.
+
+    Reads the live values instead of the ``config`` constants captured at import:
+    ``main_group_id`` comes from ``system_settings`` (normalised to its negative
+    supergroup form) and the thread id from ``forum_topics`` first, then from the
+    ``system_settings`` key ``provision_standard_topics`` wrote. Returns
+    ``(None, None)`` when either half is missing, so the caller falls back instead
+    of sending a topic-less message into a group.
+    """
+    key = str(topic_key or "").strip()
+    setting_key = dict((k, sk) for k, _t, sk in STANDARD_TOPICS).get(key)
+    if not setting_key:
+        return None, None
+    own = conn is None
+    handle = None
+    try:
+        if own:
+            handle = database.get_db()
+            conn = handle.__enter__()
+        group_id = database.get_main_group_id()
+        if not group_id:
+            return None, None
+        group_id = normalize_group_chat_id(group_id)
+        if not group_id:
+            return None, None
+        thread_id = None
+        try:
+            row = conn.execute(
+                "SELECT thread_id,state FROM forum_topics WHERE owner_key=? AND topic_key=? "
+                "AND thread_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+                (str(owner_key), key),
+            ).fetchone()
+            if row is not None and str(row["state"]) == "active":
+                thread_id = int(row["thread_id"])
+        except sqlite3.OperationalError:
+            thread_id = None
+        if thread_id is None:
+            raw = conn.execute(
+                "SELECT value FROM system_settings WHERE key=?", (setting_key,)).fetchone()
+            if raw is not None:
+                value = raw["value"] if not isinstance(raw, tuple) else raw[0]
+                if str(value or "").strip().isdigit() and int(str(value).strip()) > 0:
+                    thread_id = int(str(value).strip())
+        if thread_id is None:
+            return None, None
+        return int(group_id), int(thread_id)
+    except Exception:
+        logger.debug("Topic destination resolution failed for %s", key, exc_info=True)
+        return None, None
+    finally:
+        if own and handle is not None:
+            try:
+                handle.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
 __all__ = [
     "ForumError", "TOPIC_TITLES", "STANDARD_TOPICS", "STANDARD_TOPIC_KEYS",
     "check_forum_permissions", "sync_report_topics", "provision_standard_topics",
-    "normalize_group_chat_id",
+    "normalize_group_chat_id", "resolve_topic_destination",
 ]

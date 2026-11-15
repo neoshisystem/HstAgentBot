@@ -17,6 +17,20 @@ from ui_v52 import button, render_error, render_page
 PANEL_TYPES = ("3x-ui", "manual")
 PANEL_LIFECYCLES = ("active", "sold_out", "hidden", "drain", "maintenance")
 
+# The four core families the operator can pick in step 1 of the add/edit wizard.
+# The slug is what gets persisted in ``panels.panel_type``; the label is the exact
+# inline-button text. ``manual`` stays a valid stored type (legacy rows and the
+# pool adapter) but is no longer offered by the wizard.
+PANEL_CORE_TYPES = (
+    ("3x-ui", "🟢 3X-UI (Sanaei / Alireza)"),
+    ("marzban", "🔵 Marzban"),
+    ("hiddify", "🟣 Hiddify"),
+    ("rebecca", "🟠 Rebecca / X-UI"),
+)
+PANEL_CORE_TYPE_SLUGS = tuple(slug for slug, _label in PANEL_CORE_TYPES)
+PANEL_TYPE_LABELS = dict(PANEL_CORE_TYPES)
+_PANEL_WIZARD_HOME = "v52:home:admin"
+
 
 def _actor_id(ctx) -> int:
     if isinstance(ctx, Mapping):
@@ -86,19 +100,171 @@ def _parse_inbounds(value) -> tuple[int, ...]:
     return tuple(identifiers)
 
 
-def begin_add_panel(ctx, *, parent_callback: str = "v52:panels"):
-    """Start the root-only panel wizard; the new panel is not sold or defaulted."""
+def _wizard_nav(back_callback: str, card_callback: str | None = None) -> list[list]:
+    """The mandatory navigation rows every wizard step carries.
+
+    ``🔙 بازگشت به مرحله قبل`` returns to the previous step and
+    ``🏠 بازگشت به منوی اصلی`` returns to the admin home, so no step is a dead end.
+    An optional panel-card row keeps the operator one tap from the panel detail.
+    """
+    rows: list[list] = []
+    if card_callback:
+        rows.append([button("🖥 مشاهده کارت پنل", card_callback)])
+    rows.append([button("🔙 بازگشت به مرحله قبل", back_callback)])
+    rows.append([button("🏠 بازگشت به منوی اصلی", _PANEL_WIZARD_HOME)])
+    return rows
+
+
+def _core_type_label(slug: str) -> str:
+    return PANEL_TYPE_LABELS.get(str(slug or "").strip().lower(), str(slug or ""))
+
+
+def render_panel_type_step(ctx, *, panel_id=None, parent_callback: str = "v52:panels"):
+    """Step 1 of 4 — pick the panel core type.
+
+    In add mode (``panel_id is None``) the choice creates the draft row; in edit
+    mode it updates the existing row. Both modes share this single builder so the
+    add and edit flows cannot diverge.
+    """
     if not _is_root(ctx):
-        return render_error("افزودن پنل فقط در اختیار root است.", persona="admin",
+        return render_error("افزودن/ویرایش پنل فقط در اختیار root است.", persona="admin",
                             parent_callback=parent_callback)
-    return render_page(
-        "افزودن پنل جدید",
-        "نوع پنل را انتخاب کنید. آزمون اتصال در مرحله‌ای جدا و خارج از تراکنش پایگاه داده اجرا می‌شود. "
-        "پنل جدید به‌صورت پیش‌فرض فروشی نیست و به هیچ plan متصل نمی‌شود.",
-        persona="admin", page_kind="wizard", parent_callback=parent_callback,
-        rows=[[button("3X-UI", "v52:panelnew:3x-ui"),
-               button("Manual / Pool", "v52:panelnew:manual")]],
+    rows = []
+    for slug, label in PANEL_CORE_TYPES:
+        if panel_id is None:
+            callback = f"v52:panelnew:type:{slug}"
+        else:
+            callback = f"v52:panelsettype:{int(panel_id)}:{slug}"
+        rows.append([button(label, callback)])
+    back = f"v52:panel:{int(panel_id)}" if panel_id is not None else "v52:panels"
+    rows.extend(_wizard_nav(back))
+    body = (
+        "نوع هستهٔ پنل را انتخاب کنید. نوع انتخابی روی رکورد پنل ذخیره می‌شود و مشخص "
+        "می‌کند کدام درایور برای آزمون ورود استفاده شود. پنل جدید به‌صورت پیش‌فرض "
+        "فروشی نیست و به هیچ تعرفه‌ای متصل نمی‌شود.\n"
+        "مرحله ۱ از ۴: نوع هسته"
     )
+    return render_page("افزودن/ویرایش پنل", body, persona="admin", page_kind="wizard",
+                       root=True, rows=rows)
+
+
+def render_panel_name_step(ctx, panel_id, *, error: str | None = None,
+                           parent_callback: str = "v52:panels"):
+    """Step 2 of 4 — the human-readable display name."""
+    if not _is_root(ctx):
+        return render_error("افزودن/ویرایش پنل فقط در اختیار root است.", persona="admin",
+                            parent_callback=parent_callback)
+    pid = int(panel_id)
+    rows = _wizard_nav(f"v52:panelconfig:{pid}", f"v52:panel:{pid}")
+    body = "نام نمایشی پنل را ارسال کنید (مثلاً «سرور آلمان ۱»). بین ۱ تا ۱۰۰ نویسه."
+    if error:
+        body = f"❌ {error}\n\n{body}"
+    body += "\nمرحله ۲ از ۴: نام نمایشی"
+    return render_page("افزودن/ویرایش پنل", body, persona="admin", page_kind="form",
+                       root=True, rows=rows)
+
+
+def render_panel_url_step(ctx, panel_id, *, error: str | None = None,
+                          parent_callback: str = "v52:panels"):
+    """Step 3 of 4 — the panel URL, validated as an http(s) origin."""
+    if not _is_root(ctx):
+        return render_error("افزودن/ویرایش پنل فقط در اختیار root است.", persona="admin",
+                            parent_callback=parent_callback)
+    pid = int(panel_id)
+    rows = _wizard_nav(f"v52:panelname:{pid}", f"v52:panel:{pid}")
+    body = ("نشانی کامل پنل را بدون نام کاربری/رمز، query یا fragment ارسال کنید. "
+            "فقط نشانی معتبر http یا https پذیرفته می‌شود.")
+    if error:
+        body = f"❌ {error}\n\n{body}"
+    body += "\nمرحله ۳ از ۴: نشانی پنل"
+    return render_page("افزودن/ویرایش پنل", body, persona="admin", page_kind="form",
+                       root=True, rows=rows)
+
+
+def render_panel_credential_step(ctx, panel_id, *, error: str | None = None,
+                                 parent_callback: str = "v52:panels"):
+    """Step 4 of 4 — the credential, then the live login probe."""
+    if not _is_root(ctx):
+        return render_error("افزودن/ویرایش پنل فقط در اختیار root است.", persona="admin",
+                            parent_callback=parent_callback)
+    from panel_adapters.credentials import credential_help_text
+    pid = int(panel_id)
+    rows = _wizard_nav(f"v52:panelurl:{pid}", f"v52:panel:{pid}")
+    body = credential_help_text()
+    if error:
+        body = f"❌ {error}\n\n{body}"
+    body += "\nمرحله ۴ از ۴: اعتبارنامه"
+    return render_page("افزودن/ویرایش پنل", body, persona="admin", page_kind="form",
+                       root=True, rows=rows)
+
+
+def render_panel_connection_result(ctx, panel_id, *, panel_type: str, reachable: bool,
+                                   reason: str | None = None):
+    """Render the outcome of the step-4 live login probe with the next action.
+
+    On success the operator can pick the default inbound from the panel's real
+    inbound list (``v52:panelinbound``); on failure every retry path is offered so
+    the message is never a dead end.
+    """
+    if not _is_root(ctx):
+        return render_error("افزودن/ویرایش پنل فقط در اختیار root است.", persona="admin",
+                            parent_callback="v52:panels")
+    pid = int(panel_id)
+    if reachable:
+        body = (f"✅ اتصال پنل {pid} ذخیره شد و آزمون ورود موفق بود. "
+                "اکنون inbound پیش‌فرض ساخت اکانت را از فهرست واقعی پنل انتخاب کنید.")
+        rows = [
+            [button("🧩 انتخاب Inbound پیش‌فرض ساخت اکانت", f"v52:panelinbound:{pid}")],
+            [button("⚡ تست اتصال و فعال‌سازی خودکار", f"v52:panelauto:{pid}")],
+            [button("🧪 آزمایش اتصال پنل", f"v52:paneltest:{pid}")],
+            [button("🟢 فعال‌سازی پس از آزمایش", f"v52:life:{pid}:active")],
+            [button("🖥 مشاهده کارت پنل", f"v52:panel:{pid}")],
+            [button("🔙 بازگشت به مرحله قبل", f"v52:panelcred:{pid}")],
+            [button("🏠 بازگشت به منوی اصلی", _PANEL_WIZARD_HOME)],
+        ]
+        return render_page("نتیجهٔ اتصال پنل", body, persona="admin", page_kind="result",
+                           root=True, rows=rows)
+    detail = str(reason or "").strip() or "پاسخ قابل‌اتکا از پنل دریافت نشد"
+    body = (f"✅ اتصال پنل {pid} ذخیره شد، اما آزمون ورود ناموفق بود: {detail}\n"
+            "وضعیت پنل تغییر نکرد. اعتبارنامه را اصلاح کنید یا دوباره آزمایش کنید.")
+    rows = [
+        [button("✏️ اصلاح اعتبارنامه", f"v52:panelcred:{pid}")],
+        [button("✏️ ویرایش اتصال", f"v52:panelconfig:{pid}")],
+        [button("🔁 آزمایش مجدد اتصال", f"v52:paneltest:{pid}")],
+        [button("⚡ تست اتصال و فعال‌سازی خودکار", f"v52:panelauto:{pid}")],
+        [button("🟢 فعال‌سازی پس از آزمایش", f"v52:life:{pid}:active")],
+        [button("🖥 مشاهده کارت پنل", f"v52:panel:{pid}")],
+        [button("🏠 بازگشت به منوی اصلی", _PANEL_WIZARD_HOME)],
+    ]
+    return render_page("نتیجهٔ اتصال پنل", body, persona="admin", page_kind="result",
+                       root=True, rows=rows)
+
+
+def render_panel_connection_saved(ctx, panel_id, *, panel_type: str,
+                                  parent_callback: str = "v52:panels"):
+    """Credential saved for a non-3X-UI type: the live probe is not wired yet."""
+    if not _is_root(ctx):
+        return render_error("افزودن/ویرایش پنل فقط در اختیار root است.", persona="admin",
+                            parent_callback=parent_callback)
+    pid = int(panel_id)
+    label = _core_type_label(panel_type)
+    body = (f"✅ اتصال پنل {pid} ({label}) ذخیره شد. آزمون زندهٔ ورود در این نسخه فقط برای "
+            "پنل 3X-UI پیاده‌سازی شده است؛ پس از تأیید درایور این نوع پنل، اتصال را آزمایش کنید.")
+    rows = [
+        [button("🧪 آزمایش اتصال پنل", f"v52:paneltest:{pid}")],
+        [button("⚡ تست اتصال و فعال‌سازی خودکار", f"v52:panelauto:{pid}")],
+        [button("🟢 فعال‌سازی پس از آزمایش", f"v52:life:{pid}:active")],
+        [button("🖥 مشاهده کارت پنل", f"v52:panel:{pid}")],
+        [button("🔙 بازگشت به مرحله قبل", f"v52:panelcred:{pid}")],
+        [button("🏠 بازگشت به منوی اصلی", _PANEL_WIZARD_HOME)],
+    ]
+    return render_page("اتصال پنل ذخیره شد", body, persona="admin", page_kind="result",
+                       root=True, rows=rows)
+
+
+def begin_add_panel(ctx, *, parent_callback: str = "v52:panels"):
+    """Start the root-only add-panel wizard at step 1 (core type)."""
+    return render_panel_type_step(ctx, panel_id=None, parent_callback=parent_callback)
 
 
 def preview_panel_config(
@@ -329,5 +495,8 @@ def edit_panel_policy(
         return render_error(str(exc), persona="admin", parent_callback=parent_callback)
 
 
-__all__ = ["PANEL_TYPES", "PANEL_LIFECYCLES", "begin_add_panel",
+__all__ = ["PANEL_TYPES", "PANEL_LIFECYCLES", "PANEL_CORE_TYPES", "PANEL_CORE_TYPE_SLUGS",
+           "PANEL_TYPE_LABELS", "begin_add_panel", "render_panel_type_step",
+           "render_panel_name_step", "render_panel_url_step", "render_panel_credential_step",
+           "render_panel_connection_result", "render_panel_connection_saved",
            "preview_panel_config", "lifecycle_flags", "preview_lifecycle", "edit_panel_policy"]

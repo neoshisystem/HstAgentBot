@@ -95,6 +95,7 @@ def build_rep_main_keyboard(base_role: str | None = None) -> InlineKeyboardMarku
             [InlineKeyboardButton("👤 پروفایل‌ها", callback_data="v52:profiles"),
              InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
             [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets")],
+            [InlineKeyboardButton("🌐 مدیریت دامنه‌ها", callback_data="v52:domains")],
             # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
             [InlineKeyboardButton("🔍 جستجو و استعلام اکانت", callback_data="rep:prompt_search"),
              InlineKeyboardButton("💰 کیف پول و صورت‌حساب", callback_data="rep:wallet")],

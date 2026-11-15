@@ -74,7 +74,11 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:panels$"), "list_panels", "root", lambda m: {}),
     (re.compile(r"^v52:panel$"), "list_panels", "root", lambda m: {}),
     (re.compile(r"^v52:panelnew$"), "begin_add_panel", "root", lambda m: {}),
-    (re.compile(r"^v52:panelnew:(3x-ui|manual)$"), "begin_panel_draft", "root", lambda m: {"panel_type": m[1]}),
+    (re.compile(r"^v52:panelnew:(?:type:)?(3x-ui|marzban|hiddify|rebecca|manual)$"), "begin_panel_draft", "root", lambda m: {"panel_type": m[1]}),
+    (re.compile(r"^v52:panelsettype:([1-9][0-9]{0,17}):(3x-ui|marzban|hiddify|rebecca|manual)$"), "set_panel_type", "root", lambda m: {"panel_id": int(m[1]), "panel_type": m[2]}),
+    (re.compile(r"^v52:panelname:([1-9][0-9]{0,17})$"), "begin_panel_name", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:panelurl:([1-9][0-9]{0,17})$"), "begin_panel_url", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:panelcred:([1-9][0-9]{0,17})$"), "begin_panel_credential", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:panelnew:(test|confirm)$"), "confirm_panel_draft", "root", lambda m: {"step": m[1]}),
     (re.compile(r"^v52:panelpolicy:([1-9][0-9]{0,17})$"), "preview_panel_policy", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:panelinbound:([1-9][0-9]{0,17})$"), "choose_panel_inbound", "root", lambda m: {"panel_id": int(m[1])}),
@@ -82,6 +86,21 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:bots$"), "list_bots", "root", lambda m: {}),
     (re.compile(r"^v52:bot:(primary|rep)$"), "begin_register_bot", "root", lambda m: {"kind": m[1]}),
     (re.compile(r"^v52:domains$"), "list_domains", "root", lambda m: {}),
+    # v5.2 domain-management surface: list -> detail -> DNS/SSL, lifecycle, delete,
+    # and the four-step register wizard (hostname text, then role/panel/primary).
+    (re.compile(r"^v52:domainnew$"), "begin_domain_register", "root/same rep", lambda m: {}),
+    (re.compile(r"^v52:domainnew:([1-9][0-9]{0,17})$"), "domain_register_rep", "root", lambda m: {"rep_id": int(m[1])}),
+    (re.compile(r"^v52:domaindetail:([1-9][0-9]{0,17})$"), "show_domain", "owner/root", lambda m: {"domain_id": int(m[1])}),
+    (re.compile(r"^v52:domainrole:(subscription|node)$"), "domain_register_role", "owner/root", lambda m: {"role": m[1]}),
+    (re.compile(r"^v52:domainpanel:(none|[1-9][0-9]{0,17})$"), "domain_register_panel", "owner/root", lambda m: {"panel_id": None if m[1] == "none" else int(m[1])}),
+    (re.compile(r"^v52:domainprimary:(0|1)$"), "domain_register_primary", "owner/root", lambda m: {"is_primary": m[1] == "1"}),
+    (re.compile(r"^v52:domainverify:([1-9][0-9]{0,17})$"), "domain_verify", "owner/root", lambda m: {"domain_id": int(m[1])}),
+    (re.compile(r"^v52:domainactivate:([1-9][0-9]{0,17})$"), "domainactivate", "owner/root", lambda m: {"domain_id": int(m[1])}),
+    (re.compile(r"^v52:domainlife:([1-9][0-9]{0,17})$"), "preview_domain_lifecycle", "owner/root", lambda m: {"domain_id": int(m[1])}),
+    (re.compile(r"^v52:domainlife:([1-9][0-9]{0,17}):(active|drain|disabled)$"), "preview_domain_lifecycle", "owner/root", lambda m: {"domain_id": int(m[1]), "state": m[2]}),
+    (re.compile(r"^v52:domainlifeok:([1-9][0-9]{0,17}):(active|drain|disabled)$"), "confirm_domain_lifecycle", "owner/root", lambda m: {"domain_id": int(m[1]), "state": m[2]}),
+    (re.compile(r"^v52:domaindel:([1-9][0-9]{0,17})$"), "preview_domain_delete", "owner/root", lambda m: {"domain_id": int(m[1])}),
+    (re.compile(r"^v52:domaindelok:([1-9][0-9]{0,17})$"), "confirm_domain_delete", "owner/root", lambda m: {"domain_id": int(m[1])}),
     (re.compile(r"^v52:cards$"), "list_cards", "root", lambda m: {}),
     (re.compile(r"^v52:plans$"), "list_plans", "root", lambda m: {}),
     (re.compile(r"^v52:finance$"), "show_finance", "root", lambda m: {}),
@@ -103,6 +122,18 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:shop$"), "show_catalog", "actor", lambda m: {}),
     (re.compile(r"^v52:goods:([1-9][0-9]{0,17})$"), "preview_product", "actor+seller", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:fulfill:([A-Za-z0-9._:-]{1,36})$"), "prepare_manual_delivery", "assigned seller/root", lambda m: {"order_id": m[1]}),
+    # Admin shop-management surface. Every callback emitted by goods_ui's admin
+    # pages must resolve here or the button dead-ends in the "W18 bridge" error.
+    (re.compile(r"^v52:shop:catalog$"), "view_catalog", "actor", lambda m: {}),
+    (re.compile(r"^v52:shop:new$"), "begin_product_wizard", "root", lambda m: {}),
+    (re.compile(r"^v52:shop:wiz:(delivery|audience):([a-z_]+)$"), "product_wizard_choice", "root", lambda m: {"field": m[1], "value": m[2]}),
+    (re.compile(r"^v52:shop:product:([1-9][0-9]{0,17})$"), "admin_product_detail", "root", lambda m: {"product_id": int(m[1])}),
+    (re.compile(r"^v52:shop:stock:([1-9][0-9]{0,17})$"), "begin_product_stock", "root", lambda m: {"product_id": int(m[1])}),
+    (re.compile(r"^v52:shop:edit:([1-9][0-9]{0,17})$"), "begin_product_edit", "root", lambda m: {"product_id": int(m[1])}),
+    (re.compile(r"^v52:shop:toggle:([1-9][0-9]{0,17})$"), "toggle_product", "root", lambda m: {"product_id": int(m[1])}),
+    (re.compile(r"^v52:shop:price:([1-9][0-9]{0,17})$"), "begin_product_price", "root", lambda m: {"product_id": int(m[1])}),
+    (re.compile(r"^v52:shop:delete:([1-9][0-9]{0,17}):confirm$"), "confirm_product_delete", "root", lambda m: {"product_id": int(m[1])}),
+    (re.compile(r"^v52:shop:delete:([1-9][0-9]{0,17})$"), "preview_product_delete", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:tickets$"), "list_tickets", "actor", lambda m: {}),
     (re.compile(r"^v52:tickets:(open|answered|closed|all)$"), "list_tickets", "actor", lambda m: {"group": m[1]}),
     (re.compile(r"^v52:newticket$"), "begin_new_ticket", "actor", lambda m: {}),
@@ -110,6 +141,7 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:abuse$"), "begin_abuse", "all actors; private root destination", lambda m: {}),
     (re.compile(r"^v52:abuse:list$"), "list_abuse", "root", lambda m: {}),
     (re.compile(r"^v52:close:([A-Za-z0-9_-]{1,32})$"), "close_ticket", "ticket scope", lambda m: {"ticket_id": m[1]}),
+    (re.compile(r"^v52:reopen:([A-Za-z0-9_-]{1,32})$"), "reopen_ticket", "ticket scope", lambda m: {"ticket_id": m[1]}),
     (re.compile(r"^v52:ticket:([A-Za-z0-9_-]{1,32})$"), "reply_or_escalate", "ticket scope", lambda m: {"ticket_id": m[1]}),
     (re.compile(r"^v52:escalate:([A-Za-z0-9_-]{1,32})$"), "reply_or_escalate", "assigned seller/root", lambda m: {"ticket_id": m[1], "action": "escalate"}),
     (re.compile(r"^v52:transfer:([1-9][0-9]{0,17})$"), "reply_or_escalate", "root preview", lambda m: {"account_id": int(m[1]), "action": "transfer"}),
@@ -173,7 +205,9 @@ class DraftFSM:
         if selected not in {"goods_manual_secret", "support_ticket_body", "support_reply",
                             "panel_connection_url", "panel_connection_token",
                             "inventory_manual_batch", "inventory_digital_batch",
-                            "ownership_transfer"}:
+                            "ownership_transfer", "goods_product_draft",
+                            "goods_product_price", "panel_connection_name",
+                            "domain_hostname"}:
             raise ValueError("unknown v5.2 FSM state")
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:
             raise ValueError("now must be non-negative epoch seconds")
@@ -199,7 +233,9 @@ class DraftFSM:
         accepted = {"text": {"goods_manual_secret", "support_ticket_body", "support_reply",
                              "panel_connection_url", "panel_connection_token",
                              "inventory_manual_batch", "inventory_digital_batch",
-                             "ownership_transfer"},
+                             "ownership_transfer", "goods_product_draft",
+                             "goods_product_price", "panel_connection_name",
+                             "domain_hostname"},
                     "photo": {"support_ticket_body", "support_reply"}}
         if event not in accepted or entry.state not in accepted[event]:
             return None

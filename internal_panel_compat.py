@@ -91,6 +91,12 @@ def _factory():
             actual = str(row["kind"]).casefold()
             requested = str(operation_kind).casefold()
             aliases = {
+                # The adapter asks for "client_create" while the provisioning
+                # service persists kind="create_client"; without this pair the
+                # preflight refused every creation and the purchase ended in
+                # definite_failure before any request left the process.
+                "client_create": {"client_create", "create_client"},
+                "create_client": {"create_client", "client_create"},
                 "renew_client": {"renew", "renew_client", "vpn_renew"},
                 "set_client_enabled": {"set_client_enabled", "enable", "suspend", "activate"},
                 "rotate_subscription_url": {"rotate_subscription_url", "reset_sub", "subscription_reset"},

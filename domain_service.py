@@ -82,23 +82,102 @@ def _actor(conn: sqlite3.Connection, actor_tg_id: int, rep_id: int):
     return row
 
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def ensure_domain_columns(conn: sqlite3.Connection) -> None:
+    """Add the v5.2 domain-management columns and the ``drain`` state on demand.
+
+    ``sub_domains`` is created by migration 014; a nineteenth migration file
+    would change the frozen ``schema_migrations`` count, so the schema is
+    upgraded lazily and idempotently here instead. The caller owns the commit.
+    """
+    if not _table_exists(conn, "sub_domains"):
+        return
+    info = {row[1] for row in conn.execute("PRAGMA table_info(sub_domains)")}
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sub_domains'"
+    ).fetchone()
+    table_sql = str(row[0] or "") if row is not None else ""
+    if "drain" not in table_sql:
+        # SQLite cannot ALTER a CHECK constraint in place, so the table is
+        # rebuilt once with the full v5.2 schema; existing rows are preserved.
+        conn.execute(
+            "CREATE TABLE sub_domains_v52 ("
+            " domain_id INTEGER PRIMARY KEY,"
+            " rep_id INTEGER NOT NULL REFERENCES representatives(id),"
+            " hostname TEXT NOT NULL UNIQUE COLLATE NOCASE,"
+            " challenge TEXT NOT NULL,"
+            " status TEXT NOT NULL CHECK(status IN('pending','verified','active','drain','disabled')),"
+            " role TEXT NOT NULL DEFAULT 'subscription' CHECK(role IN('subscription','node')),"
+            " panel_id INTEGER REFERENCES panels(id),"
+            " is_primary INTEGER NOT NULL DEFAULT 0 CHECK(is_primary IN(0,1)),"
+            " verified_at INTEGER, tls_checked_at INTEGER, created_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sub_domains_v52("
+            " domain_id,rep_id,hostname,challenge,status,verified_at,tls_checked_at,created_at)"
+            " SELECT domain_id,rep_id,hostname,challenge,status,verified_at,tls_checked_at,created_at"
+            " FROM sub_domains"
+        )
+        conn.execute("DROP TABLE sub_domains")
+        conn.execute("ALTER TABLE sub_domains_v52 RENAME TO sub_domains")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_active_rep_domain "
+                     "ON sub_domains(rep_id) WHERE status='active'")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_primary_rep_domain "
+                     "ON sub_domains(rep_id) WHERE is_primary=1")
+        return
+    if "role" not in info:
+        conn.execute("ALTER TABLE sub_domains ADD COLUMN role TEXT NOT NULL DEFAULT 'subscription'")
+    if "panel_id" not in info:
+        conn.execute("ALTER TABLE sub_domains ADD COLUMN panel_id INTEGER")
+    if "is_primary" not in info:
+        conn.execute("ALTER TABLE sub_domains ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_primary_rep_domain "
+                 "ON sub_domains(rep_id) WHERE is_primary=1")
+
+
 def register_domain(
     conn: sqlite3.Connection, actor_tg_id: int, rep_id: int, hostname: str,
     *, now: int | None = None, challenge: str | None = None,
+    role: str = "subscription", panel_id: int | None = None, is_primary: bool = False,
 ) -> DomainResult:
-    """Create a pending domain and return its random TXT ownership challenge."""
+    """Create a pending domain and return its random TXT ownership challenge.
+
+    ``role`` is ``subscription`` (a subscription-gateway host) or ``node`` (a
+    node/panel-connect host). ``is_primary`` promotes the new domain to the
+    representative's primary host, demoting any previous primary in the same
+    transaction so the partial unique index never conflicts.
+    """
     selected = normalize_hostname(hostname)
+    selected_role = str(role or "subscription").strip().lower()
+    if selected_role not in {"subscription", "node"}:
+        raise DomainError("domain role must be subscription or node")
+    if panel_id is not None:
+        panel_id = int(panel_id)
+        if panel_id <= 0:
+            raise DomainError("panel_id must be a positive integer")
     timestamp = int(time.time()) if now is None else int(now)
+    ensure_domain_columns(conn)
     with conn:
         rep = _actor(conn, actor_tg_id, rep_id)
         nonce = challenge or secrets.token_urlsafe(32)
         if not isinstance(nonce, str) or not 32 <= len(nonce) <= 128:
             raise DomainError("domain challenge must contain 32..128 characters")
+        if is_primary:
+            conn.execute(
+                "UPDATE sub_domains SET is_primary=0 WHERE rep_id=? AND is_primary=1",
+                (int(rep["id"]),),
+            )
         try:
             cur = conn.execute(
-                "INSERT INTO sub_domains(rep_id,hostname,challenge,status,created_at) "
-                "VALUES(?,?,?,'pending',?)",
-                (int(rep["id"]), selected, nonce, timestamp),
+                "INSERT INTO sub_domains(rep_id,hostname,challenge,status,role,panel_id,is_primary,created_at) "
+                "VALUES(?,?,?,'pending',?,?,?,?)",
+                (int(rep["id"]), selected, nonce, selected_role, panel_id,
+                 1 if is_primary else 0, timestamp),
             )
         except sqlite3.IntegrityError:
             raise DomainError("hostname is already registered") from None
@@ -307,6 +386,74 @@ def disable_domain(
                             str(row["challenge"]), "disabled", row["verified_at"], row["tls_checked_at"])
 
 
+_LIVE_STATUSES = ("active", "drain", "disabled")
+
+
+def set_domain_status(
+    conn: sqlite3.Connection, actor_tg_id: int, domain_id: int, *, status: str,
+) -> DomainResult:
+    """Move a live domain between active, drain and disabled.
+
+    Mirrors ``disable_domain``: the ownership check runs inside a short
+    ``BEGIN IMMEDIATE`` transaction and a compare-and-swap on the prior status
+    raises ``DomainError`` when a concurrent writer already changed the row.
+    """
+    target = str(status or "").strip().lower()
+    if target not in _LIVE_STATUSES:
+        raise DomainError("domain status must be active, drain or disabled")
+    ensure_domain_columns(conn)
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM sub_domains WHERE domain_id=?", (int(domain_id),)).fetchone()
+        if row is None:
+            raise DomainError("domain does not exist")
+        current = str(row["status"])
+        if current not in _LIVE_STATUSES:
+            raise DomainError("only a live (active/drain/disabled) domain can change state")
+        _require_owner(conn, actor_tg_id, int(row["rep_id"]))
+        if current == target:
+            raise DomainError("domain already has this status")
+        changed = conn.execute(
+            "UPDATE sub_domains SET status=? WHERE domain_id=? AND status=?",
+            (target, int(domain_id), current),
+        ).rowcount
+        if changed != 1:
+            raise DomainError("domain state changed during update")
+        return DomainResult(int(row["domain_id"]), int(row["rep_id"]), str(row["hostname"]),
+                            str(row["challenge"]), target, row["verified_at"], row["tls_checked_at"])
+
+
+def delete_domain(
+    conn: sqlite3.Connection, actor_tg_id: int, domain_id: int,
+) -> DomainResult:
+    """Hard-delete a domain after an ownership check.
+
+    ``sub_domains`` has no ``deleted_at`` column and its ``status`` CHECK does
+    not admit a tombstone value, so a soft delete is not representable; the row
+    is removed. The delete follows ``disable_domain``: ownership via
+    ``_require_owner``, a short ``BEGIN IMMEDIATE`` transaction, and a
+    compare-and-swap on the prior status that raises ``DomainError`` on a lost
+    concurrent update.
+    """
+    ensure_domain_columns(conn)
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM sub_domains WHERE domain_id=?", (int(domain_id),)).fetchone()
+        if row is None:
+            raise DomainError("domain does not exist")
+        _require_owner(conn, actor_tg_id, int(row["rep_id"]))
+        changed = conn.execute(
+            "DELETE FROM sub_domains WHERE domain_id=? AND status=?",
+            (int(domain_id), str(row["status"])),
+        ).rowcount
+        if changed != 1:
+            raise DomainError("domain state changed during deletion")
+        return DomainResult(int(row["domain_id"]), int(row["rep_id"]), str(row["hostname"]),
+                            str(row["challenge"]), "deleted", row["verified_at"], row["tls_checked_at"])
+
+
 def resolve_profile_host(
     conn: sqlite3.Connection, profile: Any, host: str, canonical_host: str,
 ) -> bool:
@@ -343,5 +490,6 @@ def active_domain_rep(conn: sqlite3.Connection, host: str) -> int | None:
 
 
 __all__ = ["DomainError", "DomainPermissionError", "DomainProofError", "DomainResult",
-           "normalize_hostname", "register_domain", "verify_domain", "activate_domain",
-           "disable_domain", "resolve_profile_host", "active_domain_rep"]
+           "normalize_hostname", "ensure_domain_columns", "register_domain", "verify_domain",
+           "activate_domain", "disable_domain", "set_domain_status", "delete_domain",
+           "resolve_profile_host", "active_domain_rep"]

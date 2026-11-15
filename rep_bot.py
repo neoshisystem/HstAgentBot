@@ -370,8 +370,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     else:
         role, rep = database.get_user_role(user.id, chat.id, thread_id)
-        if chat and chat.type == "private" and _runtime_flag("v52_persona_switcher_enabled"):
-            role, rep = _resolve_active_persona_role(user, base_role=role, base_rep=rep)
+
+    # The PERMANENT role, captured before the persona switcher can downgrade it.
+    # The registration gate must consult this: root browsing the end-user
+    # workspace is still root and must never be asked for a referral code.
+    base_role, base_rep = role, rep
+    if chat and chat.type == "private" and _runtime_flag("v52_persona_switcher_enabled"):
+        role, rep = _resolve_active_persona_role(user, base_role=role, base_rep=rep)
 
     if await _submit_v52_order_receipt(update, context, role):
         return
@@ -380,7 +385,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if database.is_user_blocked(user.id):
         await update.message.reply_text("⛔️ دسترسی حساب شما به این بات توسط مدیریت مسدود شده است.")
         return
-    if await _apply_registration_gate(update, context, role, rep):
+    if await _apply_registration_gate(
+            update, context, role, rep, base_role=base_role, base_rep=base_rep):
         return
     if role == "super_admin":
         await admin_panel.show_admin_dashboard(update, context)
@@ -625,6 +631,17 @@ def _load_digital_product(product_id: int) -> dict | None:
             "SELECT * FROM digital_products WHERE id=?", (int(product_id),)
         ).fetchone()
     return dict(row) if row is not None else None
+
+
+def _load_digital_stock_counts() -> dict[int, int]:
+    """Available inventory count per product, so the catalogue reports real stock."""
+    with database.get_db() as conn:
+        rows = conn.execute(
+            "SELECT p.id AS product_id, COUNT(i.id) AS count FROM digital_products p "
+            "LEFT JOIN digital_inventory i ON i.product_id=p.id AND i.status='available' "
+            "GROUP BY p.id"
+        ).fetchall()
+    return {int(row["product_id"]): int(row["count"]) for row in rows}
 
 
 def _load_v52_order(order_id: str) -> dict | None:
@@ -931,9 +948,23 @@ def _v52_new_panel_code(conn) -> str:
     return f"panel-{index}"
 
 
+_V52_PANEL_TYPE_ALIASES = {
+    "3x-ui": "3x-ui", "3xui": "3x-ui", "xui": "3x-ui", "3x_ui": "3x-ui",
+    "marzban": "marzban", "hiddify": "hiddify",
+    "rebecca": "rebecca", "x-ui": "rebecca", "rebecca-xui": "rebecca",
+    "manual": "manual", "manual-pool": "manual", "pool": "manual",
+}
+
+
+def _v52_normalize_panel_type(panel_type) -> str:
+    """Map a wizard/registry slug onto the canonical ``panels.panel_type`` value."""
+    key = str(panel_type or "").strip().lower().replace("_", "-")
+    return _V52_PANEL_TYPE_ALIASES.get(key, "manual")
+
+
 def _v52_create_panel_draft(panel_type: str) -> int:
     """Insert a maintenance-mode, non-default, non-sellable panel row for the wizard."""
-    selected = "3x-ui" if str(panel_type).lower() in {"3x-ui", "3xui", "xui"} else "manual"
+    selected = _v52_normalize_panel_type(panel_type)
     now = int(time.time())
     with database.get_db() as conn:
         code = _v52_new_panel_code(conn)
@@ -946,26 +977,120 @@ def _v52_create_panel_draft(panel_type: str) -> int:
         return int(cursor.lastrowid)
 
 
+def _v52_begin_panel_name(ctx, panel_id: int):
+    """Step 2: ask for the panel display name and arm the name FSM state."""
+    import panel_admin_ui
+    pid = int(panel_id)
+    v52_router.DEFAULT_FSM.set(
+        ctx, "panel_connection_name", payload={"panel_id": pid},
+        parent_callback=f"v52:panelconfig:{pid}", now=int(time.time()),
+    )
+    return panel_admin_ui.render_panel_name_step(ctx, pid)
+
+
 def _v52_begin_panel_draft(ctx, panel_type: str):
-    """Start the URL draft for a brand-new panel; the row is created but not sellable."""
-    from ui_v52 import render_page
+    """Step 1 → 2: create the draft row for the chosen core type, then ask the name."""
     if not ctx.get("is_root"):
         raise PermissionError("افزودن پنل فقط در اختیار root است.")
-    selected = "3x-ui" if str(panel_type).lower() in {"3x-ui", "3xui", "xui"} else "manual"
+    selected = _v52_normalize_panel_type(panel_type)
     panel_id = _v52_create_panel_draft(selected)
+    return _v52_begin_panel_name(ctx, panel_id)
+
+
+def _v52_set_panel_type(ctx, panel_id: int, panel_type: str):
+    """Step 1 (edit): persist the chosen core type on an existing row, then ask the name."""
+    if not ctx.get("is_root"):
+        raise PermissionError("ویرایش پنل فقط در اختیار root است.")
+    pid = int(panel_id)
+    selected = _v52_normalize_panel_type(panel_type)
+    with database.get_db() as conn:
+        row = conn.execute("SELECT id FROM panels WHERE id=?", (pid,)).fetchone()
+        if row is None:
+            raise ValueError("پنل موردنظر وجود ندارد.")
+        conn.execute("UPDATE panels SET panel_type=?, revision=revision+1 WHERE id=?", (selected, pid))
+        conn.commit()
+    return _v52_begin_panel_name(ctx, pid)
+
+
+def _v52_begin_panel_url(ctx, panel_id: int):
+    """Step 3: ask for the panel URL and arm the URL FSM state."""
+    import panel_admin_ui
+    pid = int(panel_id)
+    with database.get_db() as conn:
+        exists = conn.execute("SELECT 1 FROM panels WHERE id=?", (pid,)).fetchone()
+    if exists is None:
+        raise ValueError("پنل موردنظر وجود ندارد.")
     v52_router.DEFAULT_FSM.set(
-        ctx, "panel_connection_url",
-        payload={"panel_id": panel_id, "new_panel": True, "panel_type": selected},
-        parent_callback="v52:panels", now=int(time.time()),
+        ctx, "panel_connection_url", payload={"panel_id": pid},
+        parent_callback=f"v52:panelname:{pid}", now=int(time.time()),
     )
-    return render_page(
-        "افزودن پنل جدید",
-        f"نوع انتخابی: {selected}\nشناسه پنل ساخته‌شده: {panel_id}\n"
-        "نشانی کامل پنل را بدون نام کاربری/رمز، query یا fragment ارسال کنید. "
-        "در مرحله بعد اعتبارنامه (توکن API یا «نام کاربری:رمز عبور») ذخیره می‌شود. "
-        "پنل جدید در وضعیت maintenance است، پیش‌فرض نیست و به هیچ تعرفه‌ای متصل نمی‌شود.",
-        persona="admin", page_kind="form", parent_callback="v52:panels",
+    return panel_admin_ui.render_panel_url_step(ctx, pid)
+
+
+def _v52_begin_panel_credential(ctx, panel_id: int):
+    """Step 4: ask for the credential; falls back to step 3 when no URL is saved yet."""
+    import panel_admin_ui
+    pid = int(panel_id)
+    with database.get_db() as conn:
+        row = conn.execute("SELECT raw_url FROM panels WHERE id=?", (pid,)).fetchone()
+    if row is None:
+        raise ValueError("پنل موردنظر وجود ندارد.")
+    normalized_url = str(row["raw_url"] or "")
+    if not normalized_url:
+        return _v52_begin_panel_url(ctx, pid)
+    v52_router.DEFAULT_FSM.set(
+        ctx, "panel_connection_token",
+        payload={"panel_id": pid, "normalized_url": normalized_url},
+        parent_callback=f"v52:panelurl:{pid}", now=int(time.time()),
     )
+    return panel_admin_ui.render_panel_credential_step(ctx, pid)
+
+
+def _v52_panel_probe_reason(exc) -> str:
+    """A concrete, secret-free Persian reason for a failed live login probe."""
+    lowered = str(exc or "").strip().lower()
+    if "login was rejected" in lowered or "no session cookie" in lowered:
+        return "ورود به پنل رد شد؛ نام کاربری/رمز یا توکن نامعتبر است."
+    if "could not be decrypted" in lowered or "credential is invalid" in lowered \
+            or "credential is missing" in lowered or "does not match its declared auth_type" in lowered:
+        return "اعتبارنامهٔ ذخیره‌شده قابل رمزگشایی یا استفاده نیست."
+    if "transport failed" in lowered or "timed out" in lowered or "connection" in lowered \
+            or "name or service" in lowered or "resolve" in lowered:
+        return "اتصال شبکه به پنل برقرار نشد."
+    if "unsupported panel type" in lowered or "not verified" in lowered:
+        return "این نوع پنل در نسخهٔ فعلی پشتیبانی نمی‌شود."
+    if "non-success or malformed" in lowered:
+        return "پنل پاسخ موفق/معتبری برای ورود برنگرداند (احتمالاً اعتبارنامه نادرست است)."
+    return "پاسخ قابل‌اتکا از پنل دریافت نشد."
+
+
+async def _v52_probe_panel_connection(panel_id: int):
+    """Best-effort live login probe for a 3X-UI panel.
+
+    Returns ``(None, None)`` when the panel type has no wired probe, ``(True, None)``
+    on a verified reachable read, and ``(False, reason)`` on any failure. Never
+    raises and never opens a socket for a non-3X-UI type.
+    """
+    with database.get_db() as conn:
+        row = conn.execute("SELECT * FROM panels WHERE id=?", (int(panel_id),)).fetchone()
+    if row is None:
+        return False, "پنل موردنظر وجود ندارد."
+    panel_record = dict(row)
+    kind = str(panel_record.get("panel_type") or "").lower().replace("_", "-")
+    if kind not in {"3x-ui", "3xui", "xui"}:
+        return None, None
+    try:
+        import requests
+        from panel_adapters.xui_openapi import XUIOpenAPIAdapter
+        adapter = XUIOpenAPIAdapter(panel_record, requests.Session(),
+                                    transaction_probe=lambda: False)
+        status = await adapter.verify_connection()
+        if bool(getattr(status, "reachable", False)):
+            return True, None
+        return False, "پاسخ قابل‌اتکا از پنل دریافت نشد."
+    except Exception as exc:  # noqa: BLE001 - the probe must never escape the wizard
+        logger.debug("Panel login probe failed for panel %s", panel_id, exc_info=True)
+        return False, _v52_panel_probe_reason(exc)
 
 
 def _v52_confirm_panel_draft(ctx, step: str):
@@ -1195,6 +1320,39 @@ async def _load_v52_receipt_page(update, context, attempt_id, ctx):
                          "فقط یک تصویر رسید برای همین سفارش ارسال کنید.")
 
 
+def _v52_domain_draft(context) -> dict:
+    """Read the in-progress domain-register draft for this actor."""
+    draft = context.user_data.get("v52_domain_draft")
+    return dict(draft) if isinstance(draft, dict) else {}
+
+
+def _v52_set_domain_draft(context, draft: dict) -> None:
+    context.user_data["v52_domain_draft"] = dict(draft)
+
+
+def _v52_clear_domain_draft(context) -> None:
+    context.user_data.pop("v52_domain_draft", None)
+
+
+def _v52_actor_rep_id(ctx) -> int:
+    """The representative bound to the acting persona, or a permission error."""
+    try:
+        selected = int(ctx.get("rep_id"))
+    except (TypeError, ValueError):
+        selected = 0
+    if selected <= 0:
+        raise PermissionError("این حساب به هیچ نماینده‌ای متصل نیست.")
+    return selected
+
+
+def _v52_run_domain_verify(domain_id: int):
+    """Blocking DNS/TLS verification; callers must run it off the event loop."""
+    import domain_service
+    with database.get_db() as conn:
+        domain_service.ensure_domain_columns(conn)
+        return domain_service.verify_domain(conn, int(domain_id))
+
+
 async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
     query = getattr(update, "callback_query", None)
     if query is None:
@@ -1267,14 +1425,6 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
             elif data == "v52:bot:primary":
                 import bot_admin_ui
                 page = bot_admin_ui.begin_register_bot(ctx, rep_id=None, is_primary=True, chat_type="private")
-            elif data == "v52:domains":
-                from ui_v52 import render_page, button
-                reps = database.get_all_active_reps()
-                body = "دامنه‌ها به هویت نمایندهٔ مالک متصل می‌شوند؛ ثبت فقط پس از بررسی و اثبات دامنه انجام می‌شود."
-                buttons = [[button("ثبت دامنه برای نماینده " + str(rep_item.get("id")),
-                                   "v52:domain:" + str(int(rep_item["id"])))]
-                           for rep_item in reps]
-                page = render_page("مدیریت دامنه‌ها", body, persona="admin", rows=buttons)
             elif data == "v52:cards":
                 import finance_admin_ui
                 page = finance_admin_ui.edit_bank_card(ctx)
@@ -1399,23 +1549,15 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
             elif name == "begin_panel_config":
                 if persona != "admin" or not ctx.get("is_root") or getattr(update.effective_chat, "type", "") != "private":
                     raise PermissionError("تنظیم اتصال پنل فقط در پیوی root مجاز است.")
-                from ui_v52 import render_page
+                import panel_admin_ui
                 panel_id = int(params["panel_id"])
                 with database.get_db() as conn:
                     exists = conn.execute("SELECT 1 FROM panels WHERE id=?", (panel_id,)).fetchone()
                 if exists is None:
                     raise ValueError("پنل موردنظر وجود ندارد.")
-                v52_router.DEFAULT_FSM.set(
-                    ctx, "panel_connection_url", payload={"panel_id": panel_id},
-                    parent_callback=data, now=int(time.time()),
-                )
-                page = render_page(
-                    "تنظیم اتصال پنل",
-                    "آدرس کامل پنل 3X-UI را بدون نام کاربری/رمز، query یا fragment ارسال کنید. "
-                    "در مرحله بعد اعتبارنامه ذخیره می‌شود: توکن API، یا «نام کاربری:رمز عبور»، "
-                    "یا قالب JSON — هر سه شکل پذیرفته و رمزنگاری می‌شوند.",
-                    persona="admin", page_kind="form", parent_callback="v52:panels",
-                )
+                # The edit path enters the very same step-1 builder as the add flow,
+                # so add and edit can never diverge.
+                page = panel_admin_ui.render_panel_type_step(ctx, panel_id=panel_id)
             elif name == "test_panel_connection":
                 if persona != "admin" or not ctx.get("is_root"):
                     raise PermissionError("آزمایش اتصال پنل فقط در اختیار root است.")
@@ -1509,6 +1651,157 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         rows=[[button("🖥 مشاهده کارت پنل", f"v52:panel:{panel_id}")],
                               [button("🏠 بازگشت به منوی اصلی", "v52:home:admin")]],
                     )
+            elif name == "list_domains":
+                import domain_ui
+                page = domain_ui.domains_page(ctx, scope="admin" if ctx.get("is_root") else "rep")
+            elif name == "show_domain":
+                import domain_ui
+                page = domain_ui.domain_detail_page(
+                    int(params["domain_id"]), ctx=ctx, persona=persona,
+                    parent_callback="v52:domains")
+            elif name == "begin_domain_register":
+                import domain_ui
+                if ctx.get("is_root"):
+                    page = domain_ui.rep_picker_page(ctx, persona=persona, parent_callback="v52:domains")
+                else:
+                    rep_id = _v52_actor_rep_id(ctx)
+                    v52_router.DEFAULT_FSM.set(
+                        ctx, "domain_hostname", payload={"rep_id": rep_id},
+                        parent_callback="v52:domains", now=int(time.time()))
+                    page = domain_ui.register_hostname_prompt(
+                        ctx, rep_id, persona=persona, parent_callback="v52:domains")
+            elif name == "domain_register_rep":
+                import domain_ui
+                rep_id = int(params["rep_id"])
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "domain_hostname", payload={"rep_id": rep_id},
+                    parent_callback="v52:domains", now=int(time.time()))
+                page = domain_ui.register_hostname_prompt(
+                    ctx, rep_id, persona=persona, parent_callback="v52:domains")
+            elif name == "domain_register_role":
+                import domain_ui
+                draft = _v52_domain_draft(context)
+                draft["role"] = str(params["role"])
+                _v52_set_domain_draft(context, draft)
+                page = domain_ui.register_panel_step(ctx, persona=persona, parent_callback="v52:domains")
+            elif name == "domain_register_panel":
+                import domain_ui
+                draft = _v52_domain_draft(context)
+                draft["panel_id"] = params.get("panel_id")
+                _v52_set_domain_draft(context, draft)
+                page = domain_ui.register_primary_step(ctx, persona=persona, parent_callback="v52:domains")
+            elif name == "domain_register_primary":
+                import domain_ui
+                import domain_service
+                draft = _v52_domain_draft(context)
+                rep_id = int(draft.get("rep_id") or 0)
+                hostname = str(draft.get("hostname") or "")
+                if rep_id <= 0 or not hostname:
+                    raise ValueError("پیش‌نویس ثبت دامنه ناقص است؛ از ابتدا شروع کنید.")
+                with database.get_db() as conn:
+                    result = domain_service.register_domain(
+                        conn, int(ctx.get("actor_tg_id") or 0), rep_id, hostname,
+                        role=str(draft.get("role") or "subscription"),
+                        panel_id=draft.get("panel_id"),
+                        is_primary=bool(params.get("is_primary")))
+                _v52_clear_domain_draft(context)
+                v52_router.DEFAULT_FSM.clear(ctx)
+                page = domain_ui.show_verification(
+                    result, persona=persona, parent_callback="v52:domains")
+            elif name == "domain_verify":
+                from ui_v52 import render_page
+                import domain_service
+                domain_id = int(params["domain_id"])
+                with database.get_db() as conn:
+                    domain_service.ensure_domain_columns(conn)
+                    row = conn.execute(
+                        "SELECT domain_id,rep_id,hostname,status FROM sub_domains WHERE domain_id=?",
+                        (domain_id,)).fetchone()
+                if row is None:
+                    raise ValueError("دامنهٔ موردنظر ثبت نشده است.")
+                if not ctx.get("is_root") and int(row["rep_id"]) != int(ctx.get("rep_id") or 0):
+                    raise PermissionError("only the domain owner or root may verify this domain")
+                try:
+                    result = await asyncio.to_thread(_v52_run_domain_verify, domain_id)
+                    page = render_page(
+                        "بررسی وضعیت DNS و SSL دامنه",
+                        f"دامنه: {row['hostname']}\nبررسی DNS/TLS موفق بود.\n"
+                        f"وضعیت جدید: {result.status}",
+                        persona=persona, page_kind="result",
+                        parent_callback=f"v52:domaindetail:{domain_id}")
+                except domain_service.DomainError as exc:
+                    page = render_page(
+                        "بررسی وضعیت DNS و SSL دامنه",
+                        f"دامنه: {row['hostname']}\nبررسی ناموفق: {exc}\n"
+                        "رکوردهای TXT/CNAME/A و گواهی TLS را اصلاح و دوباره تلاش کنید.",
+                        persona=persona, page_kind="error",
+                        parent_callback=f"v52:domaindetail:{domain_id}")
+            elif name == "domainactivate":
+                from ui_v52 import render_page
+                import confirmation_service
+                import domain_service
+                domain_id = int(params["domain_id"])
+                actor = int(ctx.get("actor_tg_id") or 0)
+                bot_id = int(ctx.get("bot_id") or 0)
+                now = int(time.time())
+                with database.get_db() as conn:
+                    domain_service.ensure_domain_columns(conn)
+                    row = conn.execute(
+                        "SELECT domain_id,rep_id,hostname,status,tls_checked_at "
+                        "FROM sub_domains WHERE domain_id=?", (domain_id,)).fetchone()
+                    if row is None:
+                        raise ValueError("دامنهٔ موردنظر ثبت نشده است.")
+                    if not ctx.get("is_root") and int(row["rep_id"]) != int(ctx.get("rep_id") or 0):
+                        raise PermissionError("only the domain owner or root may activate this domain")
+                    if row["status"] != "verified" or row["tls_checked_at"] is None:
+                        raise domain_service.DomainProofError(
+                            "دامنه باید پیش از فعال‌سازی وضعیت verified داشته باشد.")
+                    if not conn.in_transaction:
+                        conn.execute("BEGIN IMMEDIATE")
+                    conf = confirmation_service.create_confirmation(
+                        conn, actor_tg_id=actor, bot_id=bot_id, action="domain.activate",
+                        target_type="sub_domain", target_id=domain_id,
+                        expected_revision=int(row["tls_checked_at"]), payload={}, now=now)
+                    result = domain_service.activate_domain(
+                        conn, actor, domain_id, nonce=conf["nonce"], bot_id=bot_id, now=now)
+                    conn.commit()
+                page = render_page(
+                    "دامنه فعال شد", f"دامنه {result.hostname} فعال شد.",
+                    persona=persona, page_kind="result",
+                    parent_callback=f"v52:domaindetail:{domain_id}")
+            elif name == "preview_domain_lifecycle":
+                import domain_ui
+                page = domain_ui.preview_domain_lifecycle(
+                    ctx, int(params["domain_id"]), state=params.get("state"),
+                    persona=persona, parent_callback="v52:domains")
+            elif name == "confirm_domain_lifecycle":
+                from ui_v52 import render_page
+                import domain_service
+                domain_id = int(params["domain_id"])
+                with database.get_db() as conn:
+                    result = domain_service.set_domain_status(
+                        conn, int(ctx.get("actor_tg_id") or 0), domain_id,
+                        status=str(params["state"]))
+                page = render_page(
+                    "وضعیت دامنه به‌روزرسانی شد",
+                    f"دامنه {result.hostname} · وضعیت جدید: {result.status}",
+                    persona=persona, page_kind="result",
+                    parent_callback=f"v52:domaindetail:{domain_id}")
+            elif name == "preview_domain_delete":
+                import domain_ui
+                page = domain_ui.preview_domain_delete(
+                    ctx, int(params["domain_id"]), persona=persona, parent_callback="v52:domains")
+            elif name == "confirm_domain_delete":
+                from ui_v52 import render_page
+                import domain_service
+                domain_id = int(params["domain_id"])
+                with database.get_db() as conn:
+                    result = domain_service.delete_domain(
+                        conn, int(ctx.get("actor_tg_id") or 0), domain_id)
+                page = render_page(
+                    "دامنه حذف شد",
+                    f"دامنه {result.hostname} برای همیشه حذف شد.",
+                    persona=persona, page_kind="result", parent_callback="v52:domains")
             elif name == "list_tickets":
                 import support_ui
                 page = support_ui.tickets_page(
@@ -1544,6 +1837,12 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                     ctx, str(params["ticket_id"]), action="close",
                     confirm=True, parent_callback="v52:tickets",
                 )
+            elif name == "reopen_ticket":
+                import support_ui
+                page = support_ui.reply_or_escalate(
+                    ctx, str(params["ticket_id"]), action="reopen",
+                    confirm=True, parent_callback="v52:tickets",
+                )
             elif name == "begin_ticket":
                 import support_ui
                 account_id = int(params["account_id"])
@@ -1572,7 +1871,11 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         ctx, ticket_id, action="escalate", confirm=True, parent_callback="v52:tickets",
                     )
                 else:
+                    import support_ui
                     ticket_id = str(params["ticket_id"])
+                    ticket = _ticket_row(ticket_id)
+                    if ticket is None:
+                        raise ValueError("این تیکت دیگر در دسترس نیست.")
                     messages = support_service.list_ticket_messages(ctx, ticket_id)
                     summary = "\n".join(
                         f"{item.get('visibility', 'customer')}: {str(item.get('body') or '')[:180]}"
@@ -1582,13 +1885,16 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         ctx, "support_reply", payload={"ticket_id": ticket_id},
                         parent_callback=data, now=int(time.time()),
                     )
+                    is_author = int(ticket.get("sender_tg_id") or 0) == int(ctx.get("actor_tg_id") or 0)
                     page = render_page(
-                        "پاسخ به تیکت",
-                        f"شناسه: {ticket_id}\n{summary}\n\nپاسخ خود را در پیام بعدی ارسال کنید.",
+                        "🎫 تیکت " + support_service.ticket_code_label(ticket_id),
+                        support_ui.ticket_status_header(ticket.get("status"), ticket_id)
+                        + "\n\n" + summary
+                        + "\n\nپاسخ خود را در پیام بعدی ارسال کنید.",
                         persona=persona, page_kind="form",
-                        rows=[[button("⬆️ ارجاع تیکت به مدیریت کل", "v52:escalate:" + ticket_id)],
-                              [button("✅ بستن تیکت", "v52:close:" + ticket_id)],
-                              [button("بازگشت به تیکت‌ها", "v52:tickets")]],
+                        rows=support_ui.ticket_lifecycle_rows(
+                            ticket_id, ticket.get("status"),
+                            is_operator=(persona in ("admin", "rep")), is_author=is_author),
                     )
             elif name == "sync_topics":
                 if persona != "admin" or not ctx.get("is_root"):
@@ -1727,6 +2033,22 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 page = panel_admin_ui.begin_add_panel(ctx)
             elif name == "begin_panel_draft":
                 page = _v52_begin_panel_draft(ctx, str(params["panel_type"]))
+            elif name == "set_panel_type":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("ویرایش پنل فقط در اختیار root است.")
+                page = _v52_set_panel_type(ctx, int(params["panel_id"]), str(params["panel_type"]))
+            elif name == "begin_panel_name":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("افزودن/ویرایش پنل فقط در اختیار root است.")
+                page = _v52_begin_panel_name(ctx, int(params["panel_id"]))
+            elif name == "begin_panel_url":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("افزودن/ویرایش پنل فقط در اختیار root است.")
+                page = _v52_begin_panel_url(ctx, int(params["panel_id"]))
+            elif name == "begin_panel_credential":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("افزودن/ویرایش پنل فقط در اختیار root است.")
+                page = _v52_begin_panel_credential(ctx, int(params["panel_id"]))
             elif name == "confirm_panel_draft":
                 page = _v52_confirm_panel_draft(ctx, str(params["step"]))
             elif name == "preview_panel_policy":
@@ -1750,7 +2072,64 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 page = subscription_ui.show_profile(ctx, params["profile_id"])
             elif name == "show_catalog":
                 import goods_ui
-                page = goods_ui.show_catalog(ctx, _load_digital_products())
+                from ui_v52 import render_page
+                if persona == "admin":
+                    text, rows = goods_ui.admin_shop_page(ctx)
+                    page = render_page("🛍 مدیریت فروشگاه", text, persona="admin",
+                                       rows=rows, parent_callback="v52:home:admin")
+                else:
+                    page = goods_ui.show_catalog(
+                        ctx, _load_digital_products(), stock_counts=_load_digital_stock_counts())
+            elif name == "view_catalog":
+                import goods_ui
+                page = goods_ui.show_catalog(
+                    ctx, _load_digital_products(), stock_counts=_load_digital_stock_counts())
+            elif name == "begin_product_wizard":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.begin_product_wizard(ctx)
+                page = render_page("➕ افزودن محصول", text, persona="admin", rows=rows)
+            elif name == "product_wizard_choice":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.handle_product_wizard_choice(
+                    ctx, str(params["field"]), str(params["value"]))
+                page = render_page("➕ افزودن محصول", text, persona="admin", rows=rows)
+            elif name == "admin_product_detail":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.admin_product_detail(ctx, int(params["product_id"]))
+                page = render_page("📦 جزئیات محصول", text, persona="admin", rows=rows)
+            elif name == "begin_product_stock":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.begin_stock_import(ctx, int(params["product_id"]))
+                page = render_page("📦 ورود موجودی", text, persona="admin", rows=rows)
+            elif name == "begin_product_edit":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.begin_product_edit(ctx, int(params["product_id"]))
+                page = render_page("✏️ ویرایش محصول", text, persona="admin", rows=rows)
+            elif name == "toggle_product":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.toggle_product_active(ctx, int(params["product_id"]))
+                page = render_page("📦 جزئیات محصول", text, persona="admin", rows=rows)
+            elif name == "begin_product_price":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.begin_product_price(ctx, int(params["product_id"]))
+                page = render_page("💵 تغییر قیمت", text, persona="admin", rows=rows)
+            elif name == "preview_product_delete":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.preview_product_delete(ctx, int(params["product_id"]))
+                page = render_page("🗑 حذف محصول", text, persona="admin", rows=rows)
+            elif name == "confirm_product_delete":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.confirm_product_delete(ctx, int(params["product_id"]))
+                page = render_page("🗑 حذف محصول", text, persona="admin", rows=rows)
             elif name == "preview_product":
                 import goods_ui
                 from ui_v52 import render_error
@@ -1948,38 +2327,99 @@ async def _route_v52_fsm_text(update, context):
     ctx = _v52_actor_context(update, context, persona, rep_actor)
     text_value = str(route.params.get("text") or "").strip()
     try:
-        if route.name in {"panel_connection_url", "panel_connection_token"}:
+        if route.name in {"panel_connection_name", "panel_connection_url", "panel_connection_token"}:
             if persona != "admin" or not ctx.get("is_root") or chat.type != "private":
                 raise PermissionError("تنظیم اتصال پنل فقط در پیوی root مجاز است.")
+        if route.name == "panel_connection_name":
+            import panel_admin_ui
+            pid = int(payload["panel_id"])
+            display_name = text_value
+            if not display_name or len(display_name) > 100:
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "panel_connection_name", payload={"panel_id": pid},
+                    parent_callback=f"v52:panelconfig:{pid}", now=int(time.time()),
+                )
+                page = panel_admin_ui.render_panel_name_step(
+                    ctx, pid, error="نام پنل باید بین ۱ تا ۱۰۰ نویسه باشد.")
+            else:
+                with database.get_db() as conn:
+                    conn.execute("UPDATE panels SET name=?, revision=revision+1 WHERE id=?",
+                                 (display_name, pid))
+                    conn.commit()
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "panel_connection_url", payload={"panel_id": pid},
+                    parent_callback=f"v52:panelname:{pid}", now=int(time.time()),
+                )
+                page = panel_admin_ui.render_panel_url_step(ctx, pid)
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
         if route.name == "panel_connection_url":
+            import panel_admin_ui
             from panel_adapters.url_parser import parse_panel_url
-            endpoint = parse_panel_url(text_value)
+            pid = int(payload["panel_id"])
+            try:
+                endpoint = parse_panel_url(text_value)
+            except ValueError:
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "panel_connection_url", payload={"panel_id": pid},
+                    parent_callback=f"v52:panelname:{pid}", now=int(time.time()),
+                )
+                page = panel_admin_ui.render_panel_url_step(
+                    ctx, pid,
+                    error="نشانی نامعتبر است؛ یک نشانی کامل http یا https بدون query/نام کاربری بفرستید.")
+                await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+                return True
             v52_router.DEFAULT_FSM.set(
                 ctx, "panel_connection_token",
-                payload={"panel_id": int(payload["panel_id"]), "normalized_url": endpoint.normalized_url},
-                parent_callback=route.params.get("parent_callback"), now=int(time.time()),
+                payload={"panel_id": pid, "normalized_url": endpoint.normalized_url},
+                parent_callback=f"v52:panelurl:{pid}", now=int(time.time()),
             )
-            from panel_adapters.credentials import credential_help_text
-            await message.reply_text(
-                "✅ آدرس پنل معتبر است؛ اکنون اعتبارنامه را ارسال کنید.\n\n"
-                + credential_help_text(),
-                reply_markup=build_panel_credential_wizard_keyboard(int(payload["panel_id"])),
-            )
+            page = panel_admin_ui.render_panel_credential_step(ctx, pid)
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
             return True
         if route.name == "panel_connection_token":
+            import panel_admin_ui
             try:
                 await message.delete()
             except Exception:
                 logger.debug("Could not delete the private panel credential message")
-            result = database.update_panel_connection(
-                int(payload["panel_id"]), str(payload["normalized_url"]), text_value,
-            )
-            await message.reply_text(
-                f"✅ اتصال پنل {result['panel_id']} ذخیره شد. اعتبارنامه "
-                f"({result['auth_type']}) رمزنگاری شد؛ وضعیت پنل همچنان "
-                f"{result['lifecycle']} است. ابتدا اتصال را آزمایش کنید.",
-                reply_markup=build_panel_wizard_keyboard(int(result["panel_id"])),
-            )
+            pid = int(payload["panel_id"])
+            normalized_url = str(payload.get("normalized_url") or "")
+            try:
+                database.update_panel_connection(pid, normalized_url, text_value)
+            except ValueError as exc:
+                # A malformed credential is a correctable step, not a dead end:
+                # re-render step 4 with the concrete reason and keep the flow armed.
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "panel_connection_token",
+                    payload={"panel_id": pid, "normalized_url": normalized_url},
+                    parent_callback=f"v52:panelurl:{pid}", now=int(time.time()),
+                )
+                page = panel_admin_ui.render_panel_credential_step(
+                    ctx, pid, error=str(exc) or "اعتبارنامه نامعتبر است.")
+                await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+                return True
+            with database.get_db() as conn:
+                type_row = conn.execute("SELECT panel_type FROM panels WHERE id=?", (pid,)).fetchone()
+            panel_type = str(type_row["panel_type"]) if type_row is not None else ""
+            reachable, reason = await _v52_probe_panel_connection(pid)
+            if reachable is None:
+                page = panel_admin_ui.render_panel_connection_saved(ctx, pid, panel_type=panel_type)
+            else:
+                page = panel_admin_ui.render_panel_connection_result(
+                    ctx, pid, panel_type=panel_type, reachable=reachable, reason=reason)
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "domain_hostname":
+            import domain_service
+            import domain_ui
+            rep_id = int(payload.get("rep_id") or 0)
+            if rep_id <= 0:
+                raise ValueError("نمایندهٔ مالک مشخص نشده است؛ از ابتدا شروع کنید.")
+            hostname = domain_service.normalize_hostname(text_value)
+            _v52_set_domain_draft(context, {"rep_id": rep_id, "hostname": hostname})
+            page = domain_ui.register_role_step(ctx, persona=persona, parent_callback="v52:domains")
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
             return True
         if route.name == "support_ticket_body":
             import support_ui
@@ -2057,6 +2497,24 @@ async def _route_v52_fsm_text(update, context):
                 raise ValueError("هیچ قلمی ارسال نشد.")
             page = inventory_admin_ui.begin_digital_import(
                 ctx, int(payload.get("product_id", 0)), items, parent_callback="v52:shop")
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "goods_product_draft":
+            import goods_ui
+            from ui_v52 import render_page
+            text, rows = goods_ui.build_product_wizard_step(
+                ctx, payload, value=text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:shop"))
+            page = render_page("➕ افزودن محصول", text, persona="admin", rows=rows)
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "goods_product_price":
+            import goods_ui
+            from ui_v52 import render_page
+            text, rows = goods_ui.apply_product_price(
+                ctx, payload, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:shop"))
+            page = render_page("💵 تغییر قیمت", text, persona="admin", rows=rows)
             await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
             return True
         await message.reply_text(
@@ -2830,10 +3288,10 @@ CONVERSATION_STATE_KEYS = (
 _NAVIGATION_CALLBACKS = frozenset({
     "user:main", "user:services", "user:wallet", "user:pricing", "user:receipts",
     "user:pending", "user:prompt_link", "admin:main", "admin:settings",
-    "rep:main", "rep:menu",
+    "rep:main", "rep:menu", "v52:shop",
 })
 _NAVIGATION_CALLBACK_PREFIXES = (
-    "v52:home:", "v52:back:", "v52:persona:", "v52:shop", "v52:tickets",
+    "v52:home:", "v52:back:", "v52:persona:", "v52:tickets",
     "v52:profiles", "v52:finance", "v52:orders", "v52:panels", "v52:bots",
     "v52:domains", "v52:cards", "v52:plans", "v52:ops", "v52:abuse:list",
 )
@@ -2845,7 +3303,8 @@ _WORKFLOW_START_PREFIXES = (
     "user:renew_plans", "rep:deposit_start", "rep:issue_acc", "rep:renew",
     "v52:newticket", "v52:abuse", "v52:support:",
     "admin:prompt_", "rep:prompt_", "v52:panelnew", "v52:panelconfig:",
-    "v52:domain:", "v52:bot:", "v52:inventory:", "v52:poolimport:",
+    "v52:domain:", "v52:domainnew", "v52:bot:", "v52:inventory:", "v52:poolimport:",
+    "v52:shop:new",
 )
 
 
@@ -2884,18 +3343,108 @@ async def _notify_registration_owner(update, context, user_row, rep_id) -> None:
         logger.exception("Could not deliver the registration approval card")
 
 
-async def _apply_registration_gate(update, context, role, rep) -> bool:
+def _is_privileged_actor(actor_id, rep=None) -> bool:
+    """Root and any active representative are provisioned, never queued.
+
+    Two independent signals so the bypass cannot depend on a single stale row:
+    the configured root id, and an active ``representatives`` row for this actor.
+    """
+    try:
+        if actor_id is not None and int(actor_id) == int(ADMIN_TELEGRAM_ID):
+            return True
+    except (TypeError, ValueError):
+        pass
+    if isinstance(rep, dict) and rep.get("id"):
+        return True
+    try:
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM representatives WHERE telegram_id=? AND is_active=1 "
+                "AND deleted_at IS NULL LIMIT 1", (int(actor_id),),
+            ).fetchone()
+        return row is not None
+    except Exception:
+        logger.debug("Privileged-actor probe failed", exc_info=True)
+        return False
+
+
+def _ticket_row(ticket_id: str) -> dict | None:
+    """Read one support ticket row for the lifecycle view."""
+    try:
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT ticket_id,sender_tg_id,status,assigned_key FROM support_tickets "
+                "WHERE ticket_id=?", (str(ticket_id),)).fetchone()
+        return dict(row) if row is not None else None
+    except Exception:
+        logger.debug("Ticket row read failed", exc_info=True)
+        return None
+
+
+def _rep_may_open_profile(data: str, rep) -> bool:
+    """True when a representative may reach this admin callback.
+
+    A representative gets exactly one admin surface: the profile of a user inside
+    their own scope. Everything else in the ``admin:`` namespace stays root-only,
+    so widening this guard can never widen a rep's reach.
+    """
+    if not rep:
+        return False
+    parts = str(data or "").split(":")
+    if len(parts) < 3 or parts[1] != "user_detail":
+        return False
+    try:
+        target = int(parts[2])
+    except (TypeError, ValueError):
+        return False
+    return _rep_owns_user(target, rep)
+
+
+def _rep_owns_user(target_user_id: int, rep) -> bool:
+    """Scope check: is this user inside the representative's own tenant?
+
+    The user must be attached to the rep (``assigned_rep_id``) or have arrived
+    through one of the rep's own bots (``origin_bot_id``). An unattached user is
+    never in scope, so the check fails closed.
+    """
+    try:
+        rep_id = int(rep.get("id"))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    try:
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM bot_users u WHERE u.telegram_id=? AND ("
+                "u.assigned_rep_id=? OR u.origin_bot_id IN "
+                "(SELECT bot_id FROM bot_registry WHERE rep_id=?)) LIMIT 1",
+                (int(target_user_id), rep_id, rep_id),
+            ).fetchone()
+        return row is not None
+    except Exception:
+        logger.debug("Representative profile scope check failed", exc_info=True)
+        return False
+
+
+async def _apply_registration_gate(
+    update, context, role, rep, *, base_role=None, base_rep=None,
+) -> bool:
     """Apply the tenant registration policy; True when the actor is held back.
 
     Root and representatives are provisioned by the operator and never queued.
-    Every other actor is classified by the tenant's mode, and a not-yet-approved
-    actor sees the holding page instead of the portal.
+    The bypass reads the actor's PERMANENT role (``base_role``), not the resolved
+    persona: a super admin who switched into the end-user workspace used to be
+    asked for a referral code by his own bot. Every other actor is classified by
+    the tenant's mode, and a not-yet-approved actor sees the holding page instead
+    of the portal.
     """
     import registration_service
     import registration_ui
     user = update.effective_user
     chat = update.effective_chat
-    if role in ("super_admin", "rep", "unauthorized_group") or user is None:
+    permanent_role = base_role if base_role is not None else role
+    if permanent_role in ("super_admin", "rep", "unauthorized_group") or user is None:
+        return False
+    if _is_privileged_actor(user.id, base_rep if base_rep is not None else rep):
         return False
     bot_id = _bot_id_of(context)
     rep_id = rep.get("id") if isinstance(rep, dict) else None
@@ -5003,11 +5552,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = "qrenew_execute"
 
     # 0. Admin Navigation
+    #
+    # The guard reads the actor's PERMANENT role, never the resolved persona: a
+    # super admin who switched into the representative or end-user workspace must
+    # still reach the admin surfaces (a receipt's profile button used to dead-end
+    # with «دسترسی فقط برای ادمین کل سیستم مجاز است»). A representative is admitted
+    # only for the scoped profile view of their own downstream users.
     if action == "admin":
-        if role != "super_admin":
-            await query.answer("⛔️ دسترسی فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
+        base_role, base_rep = _base_role_of(user, chat, thread_id)
+        if base_role == "super_admin":
+            await admin_panel.handle_admin_callbacks(update, context)
             return
-        await admin_panel.handle_admin_callbacks(update, context)
+        if base_role == "rep" and _rep_may_open_profile(data, base_rep):
+            await admin_panel.handle_admin_callbacks(update, context)
+            return
+        await query.answer("⛔️ دسترسی فقط برای ادمین کل سیستم مجاز است.", show_alert=True)
         return
 
     # 0.1 Rep Dashboard Navigation

@@ -171,6 +171,38 @@ def begin_abuse(
         return render_error(str(exc), persona=_persona(ctx), parent_callback=parent_callback)
 
 
+def ticket_status_header(status: Any, ticket_id: Any = None) -> str:
+    """One-line lifecycle header shown at the top of every ticket view."""
+    import support_service
+    label = support_service.ticket_status_label(status)
+    code = support_service.ticket_code_label(ticket_id) if ticket_id is not None else ""
+    prefix = f"تیکت {code} — " if code else ""
+    return f"{prefix}{label}"
+
+
+def ticket_lifecycle_rows(
+    ticket_id: str, status: Any, *, is_operator: bool = True, is_author: bool = False,
+) -> list:
+    """Action rows that match the ticket's lifecycle state.
+
+    A closed ticket never offers «بستن تیکت» again — that button re-ran the close
+    mutation and surfaced a misleading failure. It offers «بازگشایی مجدد» instead,
+    and an open or answered ticket offers close.
+    """
+    import support_service
+    closed = str(status or "").strip().lower() == "closed"
+    rows = []
+    if is_operator:
+        rows.append([button("⬆️ ارجاع تیکت به مدیریت کل", "v52:escalate:" + str(ticket_id))])
+    if closed:
+        if is_operator or is_author:
+            rows.append([button("🔓 بازگشایی مجدد تیکت", "v52:reopen:" + str(ticket_id))])
+    else:
+        rows.append([button("🔒 بستن تیکت", "v52:close:" + str(ticket_id))])
+    rows.append([button("بازگشت به تیکت‌ها", "v52:tickets")])
+    return rows
+
+
 def reply_or_escalate(
     ctx: Any,
     ticket_id: str | None = None,
@@ -205,17 +237,30 @@ def reply_or_escalate(
             )
         if not exact or len(exact.encode("utf-8")) > 64:
             raise ValueError("ticket_id is invalid")
-        if mode not in {"reply", "escalate", "transfer", "suspend", "close"}:
+        if mode not in {"reply", "escalate", "transfer", "suspend", "close", "reopen"}:
             raise ValueError("unsupported support action")
         if mode == "close":
             if service is None:
                 import support_service as service
             result = service.close_ticket(ctx, exact, reason=reason, now=now)
             return render_page(
-                "تیکت بسته شد",
-                f"تیکت: {exact}\nوضعیت: {result['status']}\n"
-                "پاسخ‌های بعدی این تیکت وضعیت آن را بازنمی‌گردانند.",
+                "🔴 تیکت بسته شد",
+                f"{ticket_status_header(result['status'], exact)}\n\n"
+                "پاسخ بعدی خودِ نویسنده تیکت را به‌صورت خودکار بازگشایی می‌کند.",
                 persona=_persona(ctx), page_kind="result", parent_callback=parent_callback,
+                rows=[[button("🔓 بازگشایی مجدد تیکت", "v52:reopen:" + exact)],
+                      [button("بازگشت به تیکت‌ها", "v52:tickets")]],
+            )
+        if mode == "reopen":
+            if service is None:
+                import support_service as service
+            result = service.reopen_ticket(ctx, exact, now=now)
+            return render_page(
+                "🟢 تیکت بازگشایی شد" if result.get("changed") else "تیکت از قبل باز است",
+                f"{ticket_status_header(result['status'], exact)}",
+                persona=_persona(ctx), page_kind="result", parent_callback=parent_callback,
+                rows=[[button("🔒 بستن تیکت", "v52:close:" + exact)],
+                      [button("بازگشت به تیکت‌ها", "v52:tickets")]],
             )
         if mode in {"transfer", "suspend"}:
             if not _root(ctx):

@@ -138,6 +138,50 @@ async def _deliver_admin_receipt_notification(bot, item: dict) -> str:
         ) from fallback_error
 
 
+async def mirror_receipt_to_finance_topic(bot, item: dict) -> str:
+    """Mirror one receipt into the finance topic of the main supergroup.
+
+    The destination is resolved at send time from the live settings and forum
+    bindings, so a group id or topic created after startup is honoured. This is a
+    best-effort secondary copy: the Super Admin DM is the authoritative delivery,
+    and a group failure is logged and reported, never raised, so a missing topic
+    can never block or retry the real notification.
+    """
+    try:
+        import forum_manager
+        chat_id, thread_id = forum_manager.resolve_topic_destination("pendingreceipts")
+    except Exception as error:
+        logger.warning("Finance topic resolution failed for receipt %s: %s",
+                       item.get("tracking_code"), error)
+        return "unresolved"
+    if not chat_id or not thread_id:
+        return "unconfigured"
+    receipt = {
+        "id": item["receipt_id"], "tracking_code": item["tracking_code"],
+        "role": item["role"], "user_id": item["user_id"],
+        "amount_toman": item["amount_toman"], "receipt_note": item.get("receipt_note"),
+        "created_at": item.get("created_at") or "",
+    }
+    text = finance_manager.format_admin_receipt_card(
+        receipt, item.get("sender_name") or "", item.get("sender_username") or "")
+    common = {
+        "chat_id": int(chat_id), "message_thread_id": int(thread_id),
+        "parse_mode": ParseMode.MARKDOWN,
+        "reply_markup": finance_manager.build_admin_receipt_review_keyboard(
+            int(item["receipt_id"])),
+    }
+    try:
+        if item.get("receipt_photo_id"):
+            await bot.send_photo(**common, photo=item["receipt_photo_id"], caption=text)
+        else:
+            await bot.send_message(**common, text=text)
+        return "mirrored"
+    except Exception as error:
+        logger.warning("Finance topic mirror failed for receipt %s: %s",
+                       item.get("tracking_code"), error)
+        return f"failed:{type(error).__name__}"
+
+
 async def process_receipt_notification_outbox(bot, limit: int = 10, now: float | None = None) -> dict:
     """Attempt due notifications; failures remain durable with exponential backoff."""
     attempted = 0
@@ -153,6 +197,13 @@ async def process_receipt_notification_outbox(bot, limit: int = 10, now: float |
                 item["notification_id"], item["lease_token"], method
             ):
                 sent += 1
+                # Secondary copy into the finance supergroup topic. Best-effort:
+                # the durable DM delivery above is already finalised.
+                mirror = await mirror_receipt_to_finance_topic(bot, item)
+                if mirror != "mirrored":
+                    logger.info(
+                        "Receipt %s was not mirrored to the finance topic (%s)",
+                        item.get("tracking_code"), mirror)
             else:
                 logger.error(
                     "Receipt notification %s was sent but its lease could not be finalized",

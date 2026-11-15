@@ -359,6 +359,27 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             adapter_revision=self.ADAPTER_REVISION,
         )
 
+    # 3X-UI answers a missing record with HTTP 200 and a well-formed error
+    # envelope, while a genuinely unknown route answers 404. Verified against a
+    # live panel: ``inbounds/get/999999`` and ``clients/get/<unknown>`` both return
+    # ``{"success": false, "msg": "Obtain (record not found)"}`` with status 200,
+    # whereas ``totally/bogus/route`` returns 404.
+    _MISSING_RECORD_MARKERS = ("record not found", "not found", "no such")
+
+    @classmethod
+    def _is_missing_record(cls, result: "_HttpResult") -> bool:
+        """True when the panel authoritatively reported that the record is absent.
+
+        Classifying this as ``unavailable`` made every create abort at the
+        collision pre-read with ``unknown``, so the purchase locked the customer's
+        money without ever attempting the write.
+        """
+        payload = getattr(result, "payload", None)
+        if not isinstance(payload, Mapping) or payload.get("success") is not False:
+            return False
+        message = str(payload.get("msg") or "").strip().lower()
+        return any(marker in message for marker in cls._MISSING_RECORD_MARKERS)
+
     async def _get_wire_client(self, email: str) -> tuple[str, Mapping[str, Any] | None, _HttpResult | None]:
         try:
             result = await self._request("GET", f"clients/get/{quote(email, safe='')}")
@@ -369,8 +390,20 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         if result.status_code >= 500 or result.status_code < 200 or result.status_code >= 300:
             return "unavailable", None, result
         if not self._api_ok(result):
+            if self._is_missing_record(result):
+                return "not_found", None, result
             return "unavailable", None, result
         obj = result.payload.get("obj")
+        # ``clients/get`` wraps the record: obj == {"client": {...}, "inboundIds": [...]}.
+        # Unwrapping is mandatory — reading ``email`` straight off the envelope found
+        # nothing and reported an existing client as unavailable. The envelope-level
+        # ``inboundIds`` is read-only telemetry the read-back verification needs, so
+        # it is carried onto the unwrapped mapping rather than lost.
+        if isinstance(obj, Mapping) and isinstance(obj.get("client"), Mapping):
+            envelope = obj
+            obj = dict(envelope["client"])
+            if "inboundIds" not in obj and "inboundIds" in envelope:
+                obj["inboundIds"] = envelope["inboundIds"]
         if not isinstance(obj, Mapping) or obj.get("email") != email:
             return "unavailable", None, result
         return "found", obj, result
