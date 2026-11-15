@@ -6387,6 +6387,9 @@ def main():
         startup_sync = database.sync_all_active_reps_detailed()
         if startup_sync.get("status") != "success":
             logger.error("Initial panel-scoped database sync failed: %s", startup_sync.get("message"))
+        elif startup_sync.get("skipped"):
+            logger.warning("Panel-scoped sync skipped %s panel(s): %s",
+                           len(startup_sync["skipped"]), startup_sync["skipped"])
         try:
             asyncio.run(_run_multi_bot_runtime())
         except KeyboardInterrupt:
@@ -6396,6 +6399,11 @@ def main():
     startup_sync = database.sync_all_active_reps_detailed()
     if startup_sync.get("status") != "success":
         logger.error("Initial panel-scoped database sync failed: %s", startup_sync.get("message"))
+    elif startup_sync.get("skipped"):
+        # A half-configured or unreachable panel is skipped, never fatal; the
+        # remaining panels are still imported. Surface it without an ERROR.
+        logger.warning("Panel-scoped sync skipped %s panel(s): %s",
+                       len(startup_sync["skipped"]), startup_sync["skipped"])
 
     async def post_init(application: Application):
         await _bootstrap_v52_startup(application)

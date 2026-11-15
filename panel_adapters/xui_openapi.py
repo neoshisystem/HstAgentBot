@@ -306,7 +306,19 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             return None
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
-    def _canonical(self, wire: Mapping[str, Any]) -> CanonicalClient:
+    def _canonical(self, wire: Mapping[str, Any], *, discovery: bool = False) -> CanonicalClient:
+        """Normalize one panel client row into the canonical shape.
+
+        ``discovery`` is set only by :meth:`list_clients`. An administrator who
+        attaches an existing 3X-UI panel starts with an empty local ``accounts``
+        table while the panel already carries hundreds of live clients, and the
+        whole purpose of the panel-scoped sync is to INSERT those clients for the
+        first time. A discovery read therefore emits the sentinel ``account_id``
+        ``0`` ("not yet bound locally") instead of aborting the entire listing.
+        Every single-record operation (``get_client``, ``renew_client``,
+        ``set_client_enable``, ``set_traffic`` and the create read-backs) keeps
+        the strict contract and still fails closed.
+        """
         email = wire.get("email")
         if not isinstance(email, str) or not email:
             raise AdapterUnavailable("client response has no valid email")
@@ -341,7 +353,12 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
         except Exception:
             raise AdapterUnavailable("canonical account_id mapping failed") from None
         if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
-            raise AdapterUnavailable("canonical account_id mapping is unavailable")
+            if not discovery:
+                raise AdapterUnavailable("canonical account_id mapping is unavailable")
+            # Discovery sentinel: the client exists on the panel but has no local
+            # accounts row yet. _sync_panel_rows inserts it with an auto-assigned
+            # id (NULL into an INTEGER PRIMARY KEY AUTOINCREMENT column).
+            account_id = 0
         return CanonicalClient(
             ref=(account_id, self.panel_id, email),
             enabled=enabled,
@@ -455,7 +472,7 @@ class XUIOpenAPIAdapter(BasePanelAdapter):
             obj = self._obj(result)
             if not isinstance(obj, list):
                 raise AdapterUnavailable("clients/list returned a malformed collection")
-            clients = [self._canonical(row) for row in obj if isinstance(row, Mapping)]
+            clients = [self._canonical(row, discovery=True) for row in obj if isinstance(row, Mapping)]
             if len(clients) != len(obj):
                 raise AdapterUnavailable("clients/list contains malformed client rows")
             if scope_filter:

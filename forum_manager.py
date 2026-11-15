@@ -135,6 +135,20 @@ def _topic_thread_id(result: Any) -> int:
     return _positive(value, "message_thread_id")
 
 
+_TOPIC_UNCHANGED_MARKERS = ("topic_not_modified", "not modified")
+
+
+def _is_topic_unchanged(exc: BaseException) -> bool:
+    """True when Telegram refused the edit only because nothing changed.
+
+    ``editForumTopic`` answers ``400 Bad Request: TOPIC_NOT_MODIFIED`` whenever
+    the topic already carries the requested name. That is the steady state on
+    every restart after the first successful provision, so it must be recorded
+    as a verified-unchanged outcome rather than ``edit_failed``.
+    """
+    return any(marker in str(exc).strip().casefold() for marker in _TOPIC_UNCHANGED_MARKERS)
+
+
 def sync_report_topics(
     conn: sqlite3.Connection,
     api: Any,
@@ -180,7 +194,7 @@ def sync_report_topics(
         inserted = cursor.rowcount == 1
         conn.commit()  # Durable intent before the external API request.
         row = conn.execute(
-            "SELECT id,thread_id,state FROM forum_topics WHERE owner_key=? AND bot_id=? "
+            "SELECT id,thread_id,state,title_fa FROM forum_topics WHERE owner_key=? AND bot_id=? "
             "AND group_chat_id=? AND generation=? AND topic_key=?",
             (owner_key, selected_bot, chat_id, int(generation), key),
         ).fetchone()
@@ -190,14 +204,36 @@ def sync_report_topics(
         state = str(row["state"])
 
         if thread_id is not None and state == "active":
+            # The database row may have been provisioned under an older title.
+            # Avoid sending the edit when it already matches; if Telegram still
+            # replies TOPIC_NOT_MODIFIED, treat that as a verified unchanged
+            # state rather than an operational failure.
+            if str(row["title_fa"] or "") == title:
+                outcomes.append({"topic_key": key, "state": "active",
+                                 "thread_id": int(thread_id), "action": "unchanged"})
+                continue
             try:
                 api.edit_forum_topic(chat_id=chat_id, message_thread_id=int(thread_id), name=title)
+                conn.execute(
+                    "UPDATE forum_topics SET title_fa=?,updated_at=? WHERE id=? AND state='active'",
+                    (title, now, int(row["id"])),
+                )
+                conn.commit()
                 outcomes.append({"topic_key": key, "state": "active",
                                  "thread_id": int(thread_id), "action": "edited"})
             except Exception as exc:
-                outcomes.append({"topic_key": key, "state": "active",
-                                 "thread_id": int(thread_id), "action": "edit_failed",
-                                 "error_type": type(exc).__name__})
+                if _is_topic_unchanged(exc):
+                    conn.execute(
+                        "UPDATE forum_topics SET title_fa=?,updated_at=? WHERE id=? AND state='active'",
+                        (title, now, int(row["id"])),
+                    )
+                    conn.commit()
+                    outcomes.append({"topic_key": key, "state": "active",
+                                     "thread_id": int(thread_id), "action": "unchanged"})
+                else:
+                    outcomes.append({"topic_key": key, "state": "active",
+                                     "thread_id": int(thread_id), "action": "edit_failed",
+                                     "error_type": type(exc).__name__})
             continue
 
         if not inserted:

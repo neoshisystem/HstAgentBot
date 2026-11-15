@@ -81,8 +81,8 @@ def test_permission_and_create_timeout():
             conn, supergroup, bot_id=700, group_chat_id=-10001,
             now=101, topic_keys=("buyreport",),
         )
-        assert replay[0]["action"] == "edited"
-        assert supergroup.creates == 1 and supergroup.edits == 1
+        assert replay[0]["action"] == "unchanged"
+        assert supergroup.creates == 1 and supergroup.edits == 0
 
         timeout = FakeForum(conn, timeout=True)
         first = sync_report_topics(

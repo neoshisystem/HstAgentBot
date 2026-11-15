@@ -2474,7 +2474,10 @@ def _sync_client_identity(client, expected_panel_id):
     if not isinstance(ref, (tuple, list)) or len(ref) < 3:
         raise ValueError("panel adapter returned a client without canonical (account,panel,email) identity")
     account_id, panel_id, email = ref[0], ref[1], ref[2]
-    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+    # ``0`` is the discovery sentinel emitted by list_clients for a panel client
+    # that has no local accounts row yet (an admin attaching an existing panel).
+    # A negative or non-integer id is still malformed and rejected.
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id < 0:
         raise ValueError("panel adapter returned a client without canonical account_id")
     if isinstance(panel_id, bool) or int(panel_id) != int(expected_panel_id):
         raise ValueError("panel adapter returned a client from another panel")
@@ -2484,11 +2487,12 @@ def _sync_client_identity(client, expected_panel_id):
 
 
 def _sync_panel_rows(target_reps):
-    """Read every panel through its own adapter, then persist in one short DB transaction."""
-    if not target_reps:
-        return {"status": "success", "count": 0, "ambiguous": 0, "unmatched": 0,
-                "message": "No active representatives"}
+    """Read every panel through its own adapter, then persist in one short DB transaction.
 
+    This is also the initial inventory import for a newly attached panel. It must
+    run with no active representatives so existing clients can be discovered and
+    stored as unassigned platform-pool accounts (``rep_id IS NULL``).
+    """
     with get_db() as conn:
         panel_ids = [
             int(row["id"]) for row in conn.execute("SELECT id FROM panels ORDER BY id").fetchall()
@@ -2499,6 +2503,7 @@ def _sync_panel_rows(target_reps):
                 "message": "No registered panels are available for adapter sync"}
 
     panel_clients = {}
+    skipped_panels = []
     for panel_id in panel_ids:
         try:
             adapter = _get_panel_adapter(panel_id)
@@ -2507,8 +2512,16 @@ def _sync_panel_rows(target_reps):
                 raise TypeError("panel adapter list_clients must return a list")
             panel_clients[panel_id] = clients
         except Exception as exc:
-            return {"status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
-                    "message": f"Panel {panel_id} adapter read failed ({type(exc).__name__})"}
+            # A panel that is not configured yet (no URL or credential) or is
+            # temporarily unreachable must not abort the import of every other
+            # panel. Record it and continue; only an all-panel failure is fatal.
+            skipped_panels.append({"panel_id": panel_id, "reason": type(exc).__name__})
+
+    if not panel_clients:
+        return {"status": "error", "count": 0, "ambiguous": 0, "unmatched": 0,
+                "skipped": skipped_panels,
+                "message": "no panel could be read through its adapter "
+                           f"({len(skipped_panels)} skipped)"}
 
     rep_scopes = []
     for rep in target_reps:
@@ -2551,9 +2564,17 @@ def _sync_panel_rows(target_reps):
                     else:
                         ambiguous += 1
                         continue
-                else:
+                elif prior is not None:
+                    # A previously assigned account may no longer match the current
+                    # rep scope; keep its existing owner unless a new unique scope
+                    # claimed it above.
                     unmatched += 1
                     selected_rep_id = previous_rep_id
+                else:
+                    # No rep owns this discovered client. Persist it as an unassigned
+                    # pool/account row instead of dropping it or aborting the panel sync.
+                    unmatched += 1
+                    selected_rep_id = None
 
                 quota_mode = _sync_client_value(client, "quota_mode", "unknown")
                 quota_bytes = _sync_client_value(client, "quota_bytes")
@@ -2584,6 +2605,11 @@ def _sync_panel_rows(target_reps):
                 customer_name = str(prior.get("customer_name") or "") if prior else ""
                 owner_tg_id = prior.get("owner_tg_id") if prior else None
 
+                # A discovered client (account_id 0) has no local row yet: pass
+                # NULL so the INTEGER PRIMARY KEY AUTOINCREMENT column assigns
+                # the real id. An already-bound client keeps its explicit id and
+                # the ON CONFLICT(panel_id,email) branch leaves it untouched.
+                insert_id = account_id if account_id > 0 else None
                 conn.execute(
                     "INSERT INTO accounts(id,rep_id,account_code,email,customer_name,sub_id,enable,"
                     "total_gb,expiry_time,owner_tg_id,panel_id,updated_at) "
@@ -2596,13 +2622,13 @@ def _sync_panel_rows(target_reps):
                     "enable=excluded.enable,total_gb=excluded.total_gb,expiry_time=excluded.expiry_time, "
                     "owner_tg_id=CASE WHEN excluded.owner_tg_id IS NOT NULL THEN excluded.owner_tg_id ELSE accounts.owner_tg_id END, "
                     "updated_at=CURRENT_TIMESTAMP",
-                    (account_id, selected_rep_id, account_code, email, customer_name, sub_id,
+                    (insert_id, selected_rep_id, account_code, email, customer_name, sub_id,
                      enabled, total_gb, expiry_time, owner_tg_id, panel_id),
                 )
                 count += 1
 
     return {"status": "success", "count": count, "ambiguous": ambiguous,
-            "unmatched": unmatched,
+            "unmatched": unmatched, "skipped": skipped_panels,
             "message": "Reconciliation completed through panel-scoped adapters without network in a DB transaction"}
 
 

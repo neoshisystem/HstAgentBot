@@ -85,7 +85,16 @@ class BasePanelAdapter(ABC):
     async def get_client(self, identifier: str) -> LookupResult: ...
 
     @abstractmethod
-    async def list_clients(self, scope_filter: str | None = None) -> list[CanonicalClient]: ...
+    async def list_clients(self, scope_filter: str | None = None) -> list[CanonicalClient]:
+        """Discover panel clients, including those not yet bound in local storage.
+
+        For discovery-only rows an adapter may use ``client.ref[0] == 0`` as the
+        explicit "no local account id yet" sentinel. Consumers that reconcile
+        panel inventory must insert such rows and let the local database assign
+        the primary key. Single-client reads and mutation paths retain the
+        positive, locally-bound account-id requirement.
+        """
+        ...
 
     @abstractmethod
     async def get_client_configs(self, identifier: str) -> list[NodeConfig]: ...
