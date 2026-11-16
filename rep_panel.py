@@ -21,7 +21,9 @@ from telegram.ext import ContextTypes
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import database
+import message_edit
 import nlp_matcher
+import profile_360
 import finance_manager
 from xui_result import XUIResult, classify_xui_result
 
@@ -101,6 +103,7 @@ def build_rep_main_keyboard(base_role: str | None = None) -> InlineKeyboardMarku
              InlineKeyboardButton("💰 کیف پول و صورت‌حساب", callback_data="rep:wallet")],
             [InlineKeyboardButton("⏳ صف بسته‌های رزرو من", callback_data="rep:reserves"),
              InlineKeyboardButton("📊 آمار کلی اکانت‌ها", callback_data="rep:stats")],
+            [InlineKeyboardButton("👥 کاربران و زیرنماینده‌های من", callback_data="rep:my_network")],
             [InlineKeyboardButton("🏷 تعرفه‌های همکاری", callback_data="rep:pricing")],
         ]
         rows.extend(_persona_switch_rows(base_role))
@@ -112,6 +115,7 @@ def build_rep_main_keyboard(base_role: str | None = None) -> InlineKeyboardMarku
          InlineKeyboardButton("💰 کیف پول و صورت‌حساب", callback_data="rep:wallet")],
         [InlineKeyboardButton("⏳ صف بسته‌های رزرو من", callback_data="rep:reserves"),
          InlineKeyboardButton("📊 آمار کلی اکانت‌ها", callback_data="rep:stats")],
+        [InlineKeyboardButton("👥 کاربران و زیرنماینده‌های من", callback_data="rep:my_network")],
         [InlineKeyboardButton("🏷 تعرفه‌های همکاری", callback_data="rep:pricing")],
     ]
     rows.extend(_persona_switch_rows(base_role))
@@ -160,6 +164,64 @@ async def show_rep_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
+async def _show_rep_network(update: Update, context: ContextTypes.DEFAULT_TYPE, rep: dict):
+    """The representative's own downstream tree: customers and sub-resellers.
+
+    Scoped strictly to ``parent_rep_id = this rep`` and to customers whose
+    ``assigned_rep_id`` is this rep, so a representative can never enumerate a
+    peer's book. Every row opens that person's 360-degree profile, which carries
+    the scoped read-only view.
+    """
+    query = update.callback_query
+    try:
+        rep_id = int(rep.get("id") or 0)
+    except (TypeError, ValueError):
+        rep_id = 0
+    customers, children = [], []
+    if rep_id > 0:
+        try:
+            with database.get_db() as conn:
+                customers = conn.execute(
+                    "SELECT telegram_id, full_name, username FROM bot_users "
+                    "WHERE assigned_rep_id=? ORDER BY id DESC LIMIT 25", (rep_id,),
+                ).fetchall()
+                children = conn.execute(
+                    "SELECT id, name, rep_code, tier FROM representatives "
+                    "WHERE parent_rep_id=? AND deleted_at IS NULL ORDER BY id LIMIT 25",
+                    (rep_id,),
+                ).fetchall()
+        except Exception:
+            logger.debug("Representative network query failed", exc_info=True)
+
+    lines = ["👥 **کاربران و زیرنماینده‌های من:**", ""]
+    lines.append(f"🧑‍💼 **زیرنماینده‌های مستقیم ({len(children)}):**")
+    rows: list[list[InlineKeyboardButton]] = []
+    if children:
+        for child in children:
+            lines.append(f"   • {child['name']} (`{child['rep_code']}`) | {child['tier']}")
+            rows.append([InlineKeyboardButton(
+                f"🧑‍💼 {str(child['name'] or child['id'])[:26]}",
+                callback_data=f"admin:rep_detail:{int(child['id'])}")])
+    else:
+        lines.append("   • زیرنماینده‌ای ثبت نشده است.")
+    lines.append("")
+    lines.append(f"👤 **کاربران زیرمجموعه ({len(customers)}):**")
+    if customers:
+        for customer in customers:
+            lines.append(f"   • {customer['full_name'] or '—'} (`{int(customer['telegram_id'])}`)")
+            rows.append([InlineKeyboardButton(
+                f"👤 {str(customer['full_name'] or customer['telegram_id'])[:26]}",
+                callback_data=profile_360.profile_callback(
+                    "view", int(customer["telegram_id"]), "repnet", str(rep_id)))])
+    else:
+        lines.append("   • کاربری ثبت نشده است.")
+    rows.append([InlineKeyboardButton("🔙 بازگشت به پیشخوان نماینده", callback_data="rep:main")])
+    await message_edit.render_page(
+        query, text="\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows))
+    await query.answer()
+
+
 async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE, rep: dict):
     """Routes and handles all representative inline callbacks (data starting with rep:)."""
     query = update.callback_query
@@ -203,6 +265,11 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     if action == "main":
         await show_rep_dashboard(update, context, rep, edit_message=True)
         await query.answer("پیشخوان نماینده")
+        return
+
+    # 1.1 My network: downstream customers and sub-resellers
+    if action == "my_network":
+        await _show_rep_network(update, context, rep)
         return
 
     # 2. New Account: Plan Selection

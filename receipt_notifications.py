@@ -40,6 +40,7 @@ async def _deliver_admin_receipt_notification(bot, item: dict) -> str:
         "amount_toman": item["amount_toman"],
         "receipt_note": item.get("receipt_note"),
         "created_at": item.get("created_at") or "",
+        "status": item.get("status") or "pending",
     }
     text = finance_manager.format_admin_receipt_card(
         receipt,
@@ -47,7 +48,7 @@ async def _deliver_admin_receipt_notification(bot, item: dict) -> str:
         item.get("sender_username") or "",
     )
     keyboard = finance_manager.build_admin_receipt_review_keyboard(
-        int(item["receipt_id"])
+        int(item["receipt_id"]), int(item["user_id"])
     )
     common = {
         "chat_id": chat_id,
@@ -161,6 +162,7 @@ async def mirror_receipt_to_finance_topic(bot, item: dict) -> str:
         "role": item["role"], "user_id": item["user_id"],
         "amount_toman": item["amount_toman"], "receipt_note": item.get("receipt_note"),
         "created_at": item.get("created_at") or "",
+        "status": item.get("status") or "pending",
     }
     text = finance_manager.format_admin_receipt_card(
         receipt, item.get("sender_name") or "", item.get("sender_username") or "")
@@ -168,7 +170,7 @@ async def mirror_receipt_to_finance_topic(bot, item: dict) -> str:
         "chat_id": int(chat_id), "message_thread_id": int(thread_id),
         "parse_mode": ParseMode.MARKDOWN,
         "reply_markup": finance_manager.build_admin_receipt_review_keyboard(
-            int(item["receipt_id"])),
+            int(item["receipt_id"]), int(item["user_id"])),
     }
     try:
         if item.get("receipt_photo_id"):

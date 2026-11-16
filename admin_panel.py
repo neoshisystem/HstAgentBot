@@ -11,6 +11,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 import database
+import message_edit
 import nlp_matcher
 
 from server_integrations import load_integration
@@ -130,7 +131,7 @@ def _profile_back_row(origin: str, ref: str) -> list:
                                      callback_data=f"admin_detail_rcp_{ref}")]
     if origin == "ticket" and ref:
         return [InlineKeyboardButton("🔙 بازگشت به تیکت",
-                                     callback_data=f"v52:support:ticket:{ref}")]
+                                     callback_data=f"v52:ticket:{ref}")]
     if origin == "reg" and ref:
         return [InlineKeyboardButton("🔙 بازگشت به صف تایید عضویت",
                                      callback_data="admin:pending_reg")]
@@ -690,12 +691,14 @@ async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYP
     
     keyboard = build_admin_main_keyboard()
     if edit_message and update.callback_query:
-        try:
-            await update.callback_query.edit_message_text(
-                dashboard_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-            )
-        except BadRequest:
-            pass
+        # The dashboard is reached from a receipt, and a receipt is a PHOTO
+        # message. Editing its text is illegal, and the old `except BadRequest:
+        # pass` swallowed that rejection — the button looked completely dead.
+        # message_edit delivers the page as a new message in that case.
+        await message_edit.render_page(
+            update.callback_query, text=dashboard_text,
+            parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard,
+        )
     elif update.message:
         await update.message.reply_text(dashboard_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
@@ -778,13 +781,21 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     user = update.effective_user
     chat = update.effective_chat
+    thread_id = getattr(getattr(update, "effective_message", None), "message_thread_id", None)
     if not user or not chat or chat.type != "private":
-        await query.answer(
-            "⛔️ پنل مدیریت فقط در گفت‌وگوی خصوصی ربات قابل استفاده است.",
-            show_alert=True
-        )
-        return
-    role, _ = database.get_user_role(user.id, chat.id, None)
+        # The receipt-scoped admin callbacks — approve, reject, detail, and the
+        # profile / admin-desk buttons that receipt carries — must stay usable
+        # from the finance topic of the supergroup, which is where the receipt
+        # actually lands. Everything else under ``admin:`` keeps the private-chat
+        # requirement, because those pages expose whole-system records.
+        from rep_bot import _may_use_admin_callback_in_group
+        if not _may_use_admin_callback_in_group(user, chat, thread_id, query.data or ""):
+            await query.answer(
+                "⛔️ پنل مدیریت فقط در گفت‌وگوی خصوصی ربات قابل استفاده است.",
+                show_alert=True
+            )
+            return
+    role, _ = database.get_user_role(user.id, chat.id, thread_id)
     if role != "super_admin":
         await query.answer("⛔️ دسترسی فقط برای مدیریت کل سیستم مجاز است.", show_alert=True)
         return
@@ -1073,8 +1084,8 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         if not text:
             await query.answer("❌ کاربر یافت نشد.", show_alert=True)
             return
-        await query.edit_message_text(
-            text, parse_mode=ParseMode.MARKDOWN,
+        await message_edit.render_page(
+            query, text=text, parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(rows))
         await query.answer("پروفایل ۳۶۰ درجه")
 
@@ -1850,17 +1861,25 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             f"👤 **شناسنامه نماینده: {escape_markdown(rep.get('name') or 'بدون نام')}**\n",
             f"• کد: `{escape_markdown_code(rep.get('rep_code') or '')}` | آیدی: `{rep['telegram_id']}`",
             f"• وضعیت: {'🟢 فعال' if rep['is_active'] else '🔴 معلق'}",
+            f"• سطح تعرفه: **{escape_markdown(str(rep.get('tier') or 'normal'))}**",
             f"• سقف اعتبار: `{rep['credit_limit_toman']:,} تومان`",
             f"• بدهی جاری: `{rep['balance_toman']:,} تومان`"
         ]
+        if rep.get("parent_rep_id"):
+            lines.append(f"• نمایندهٔ والد: `{int(rep['parent_rep_id'])}`")
         keyboard = build_back_to_admin_keyboard([
+            [InlineKeyboardButton("👤 پروفایل ۳۶۰ درجه",
+                                  callback_data=f"admin:user_detail:{int(rep['telegram_id'])}:reps:{rep_id}"),
+             InlineKeyboardButton("👥 زیرنماینده‌های این نماینده",
+                                  callback_data=f"v52:subreps:{rep_id}")],
             [InlineKeyboardButton("🟢 تسویه / تعدیل تراز", callback_data=f"admin:prompt_pay:{rep['rep_code']}"),
              InlineKeyboardButton("💳 تغییر سقف اعتبار", callback_data=f"admin:prompt_edit_credit:{rep_id}")],
             [InlineKeyboardButton("✏️ ویرایش مشخصات", callback_data=f"admin:prompt_edit_rep:{rep_id}")],
             [InlineKeyboardButton("⏸ تعلیق / فعال‌سازی", callback_data=f"admin:set_rep_active:{rep_id}:{0 if rep['is_active'] else 1}"),
              InlineKeyboardButton("📦 آرشیو نماینده", callback_data=f"admin:confirm_del_rep:{rep_id}")]
         ], parent_cb="admin:reps")
-        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await message_edit.render_page(
+            query, text="\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer()
 
     elif action == "toggle_rep":
@@ -2441,6 +2460,29 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
             reply_markup=build_admin_main_keyboard())
         return True
 
+    if action == "profile_note":
+        target_uid = int(admin_state.get("target_user_id") or 0)
+        if target_uid <= 0:
+            context.user_data.pop("admin_state", None)
+            return False
+        try:
+            database.add_profile_note(
+                target_uid, update.effective_user.id,
+                update.effective_user.full_name or "Admin", text)
+        except ValueError as exc:
+            return await _reply_fsm_validation_error(
+                update, context, admin_state, f"یادداشت قابل ثبت نیست: {exc}")
+        origin = admin_state.get("origin") or ""
+        ref = admin_state.get("ref") or ""
+        context.user_data.pop("admin_state", None)
+        import profile_360
+        page_text, rows = profile_360.build_notes_page(target_uid, origin, ref)
+        await update.message.reply_text(
+            "✅ یادداشت داخلی ثبت شد.\n\n" + page_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(rows))
+        return True
+
     elif action == "charge_user":
         target_uid = admin_state.get("target_user_id")
         try:
@@ -2814,6 +2856,7 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
         "pay", "add_rep", "edit_plan", "transfer", "transfer_user_target",
         "inspect", "add_plan", "link_user", "search_user", "edit_user_id",
         "link_user_account", "unlink_user_account", "edit_rep", "edit_plan_specs",
+        "profile_note",
     }
     state = context.user_data.get("admin_state")
     attempts_before = state.get("attempts", 0) if isinstance(state, dict) else 0

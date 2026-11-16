@@ -43,8 +43,14 @@ def build_card_payment_keyboard(tracking_code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_admin_receipt_review_keyboard(receipt_id: int) -> InlineKeyboardMarkup:
-    """Builds Super Admin inline keyboard for receipt verification."""
+def build_admin_receipt_review_keyboard(receipt_id: int, user_id: int | None = None) -> InlineKeyboardMarkup:
+    """Builds Super Admin inline keyboard for receipt verification.
+
+    The payer's profile is reachable from the very first delivery, before any
+    decision: verifying a transfer routinely requires looking at the account
+    first, and hiding the button until after the decision forced the operator to
+    either guess or hunt the user down in the user list.
+    """
     keyboard = [
         [
             InlineKeyboardButton("✅ تایید فیش", callback_data=f"admin_approve_rcp_{receipt_id}"),
@@ -54,21 +60,30 @@ def build_admin_receipt_review_keyboard(receipt_id: int) -> InlineKeyboardMarkup
             InlineKeyboardButton("👁 مشاهده جزئیات", callback_data=f"admin_detail_rcp_{receipt_id}"),
         ]
     ]
+    if user_id:
+        keyboard.append([InlineKeyboardButton(
+            "👤 مشاهده پروفایل کاربر",
+            callback_data=f"admin:user_detail:{int(user_id)}:rcp:{int(receipt_id)}")])
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_admin_reviewed_keyboard(status: str, user_id: int | None = None) -> InlineKeyboardMarkup:
+def build_admin_reviewed_keyboard(status: str, user_id: int | None = None,
+                                  receipt_id: int | None = None) -> InlineKeyboardMarkup:
     """Keyboard shown after an admin settles the receipt.
 
     The status chip is inert: pressing it must never re-run the review or query
     the panel again, it only reports that the decision is already final. The
-    payer's profile and the way back to the admin desk stay reachable.
+    payer's profile and the way back to the admin desk stay reachable, and the
+    profile remembers the receipt it was opened from so its own back button
+    returns there instead of dumping the operator in the user list.
     """
     text = "✅ تایید شده" if status == "approved" else "❌ رد شده"
     rows = [[InlineKeyboardButton(text, callback_data="noop")]]
     if user_id:
+        origin = f":rcp:{int(receipt_id)}" if receipt_id else ""
         rows.append([InlineKeyboardButton(
-            "👤 مشاهده پروفایل کاربر", callback_data=f"admin:user_detail:{int(user_id)}")])
+            "👤 مشاهده پروفایل کاربر",
+            callback_data=f"admin:user_detail:{int(user_id)}{origin}")])
     rows.append([InlineKeyboardButton("👑 بازگشت به میز مدیر کل", callback_data="admin:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -137,20 +152,47 @@ def format_card_instructions(amount_toman: int, tracking_code: str, card_info: d
     )
 
 
-def format_admin_receipt_card(receipt: dict, user_full_name: str = "", username: str = "") -> str:
-    """Formats detailed verification card delivered to Super Admin."""
+RECEIPT_STATUS_FA = {
+    "pending": "⏳ در انتظار بررسی",
+    "approved": "✅ تایید شده",
+    "rejected": "❌ رد شده",
+}
+
+
+def receipt_status_label(status) -> str:
+    """Persian label for a receipt status; an unknown value is never blank."""
+    return RECEIPT_STATUS_FA.get(str(status or "pending"), "⏳ در انتظار بررسی")
+
+
+def format_admin_receipt_card(receipt: dict, user_full_name: str = "", username: str = "",
+                              *, decided_by: str = "", decided_at: str = "") -> str:
+    """Formats the verification card delivered to Super Admin.
+
+    The card carries the current status so the SAME renderer can redraw the
+    caption after a decision: approving a receipt must actually change the text
+    from «⏳ در انتظار بررسی» to «✅ تایید شده», not only its keyboard.
+    """
     role_fa = "نماینده فروش" if receipt.get("role") == "rep" else "کاربر نهایی"
     username_display = f"@{username}" if username else "ندارد"
     note = receipt.get("receipt_note") or "بدون توضیحات"
+    status = str(receipt.get("status") or "pending")
+    status_line = f"• وضعیت فعلی: **{receipt_status_label(status)}**"
+    if status in ("approved", "rejected") and decided_by:
+        status_line += f" (توسط {decided_by}" + (f" در {decided_at}" if decided_at else "") + ")"
+    header = ("🔔 **فیش واریزی جدید جهت بررسی و تایید**" if status == "pending"
+              else "🧾 **فیش واریزی (تعیین‌تکلیف‌شده)**")
+    footer = ("جهت تایید آنی یا رد فیش، یکی از گزینه‌های زیر را انتخاب کنید:"
+              if status == "pending" else "این فیش تعیین تکلیف شده است.")
 
     return (
-        f"🔔 **فیش واریزی جدید جهت بررسی و تایید**\n\n"
+        f"{header}\n\n"
         f"• کد پیگیری: `{receipt.get('tracking_code')}`\n"
         f"• نقش واریزکننده: **{role_fa}**\n"
         f"• شناسه عددی تلگرام: `{receipt.get('user_id')}`\n"
         f"• نام فرستنده: **{user_full_name}** ({username_display})\n"
         f"• مبلغ واریزی: **{receipt.get('amount_toman', 0):,} تومان**\n"
         f"• توضیحات فرستنده: _{html.escape(note)}_\n"
-        f"• تاریخ ثبت: `{receipt.get('created_at', '')[:19]}`\n\n"
-        f"جهت تایید آنی یا رد فیش، یکی از گزینه‌های زیر را انتخاب کنید:"
+        f"• تاریخ ثبت: `{receipt.get('created_at', '')[:19]}`\n"
+        f"{status_line}\n\n"
+        f"{footer}"
     )

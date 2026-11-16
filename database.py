@@ -607,6 +607,26 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_referral_rewards_referrer "
             "ON referral_rewards(referrer_user_id, created_at)"
         )
+        # Internal, admin-only notes attached to a customer or representative
+        # profile. Created through the idempotent path on purpose: a nineteenth
+        # migration file would change the frozen schema_migrations count that the
+        # v5.2 acceptance tests assert.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS profile_admin_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_tg_id INTEGER NOT NULL,
+                author_tg_id INTEGER NOT NULL,
+                author_name TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_profile_notes_subject "
+            "ON profile_admin_notes(subject_tg_id, created_at)"
+        )
         # Per-tenant registration policy. 'inherit' falls back to the parent scope
         # so an existing deployment keeps its behaviour until it is set explicitly.
         # ``bot_registry`` is created by migration 006, which runs *after* init_db,
@@ -2011,6 +2031,112 @@ def get_recent_ledger_entries(rep_id=None, limit=10):
             query += " ORDER BY l.id DESC LIMIT ?"
             rows = cur.execute(query, (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+
+# --- Profile 360: lifetime aggregates and internal notes ---------------------
+
+_PROFILE_NOTES_DDL = """
+CREATE TABLE IF NOT EXISTS profile_admin_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_tg_id INTEGER NOT NULL,
+    author_tg_id INTEGER NOT NULL,
+    author_name TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+
+def ensure_profile_notes_table(conn) -> None:
+    """Create the internal-notes table on first use.
+
+    ``init_db`` creates it too, but a database restored from a backup, a test
+    fixture or an audit clone predates that call. A reader that assumed the
+    table exists raised ``OperationalError: no such table`` and turned the whole
+    profile page into a crash, so every accessor here guarantees it first.
+    """
+    conn.execute(_PROFILE_NOTES_DDL)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_profile_notes_subject "
+        "ON profile_admin_notes(subject_tg_id, created_at)"
+    )
+
+
+def get_profile_lifetime_totals(tg_id: int, rep_id: int | None = None) -> dict:
+    """Lifetime deposits and purchases for one person, from the append-only ledger.
+
+    A representative's money moves under ``rep_id`` and a customer's under
+    ``user_id``, and the same person only ever has one of the two, so summing
+    both keys cannot double-count. ``financial_ledger`` is append-only by trigger,
+    which makes it the only trustworthy source for a lifetime figure — a wallet
+    balance is a snapshot, not a history.
+    """
+    try:
+        subject = int(tg_id)
+    except (TypeError, ValueError):
+        return {"deposits_toman": 0, "purchases_toman": 0, "net_toman": 0}
+    try:
+        rep = int(rep_id) if rep_id else 0
+    except (TypeError, ValueError):
+        rep = 0
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN transaction_type = 'credit' THEN amount END), 0) AS credits,
+              COALESCE(SUM(CASE WHEN transaction_type = 'debit'  THEN amount END), 0) AS debits
+            FROM financial_ledger
+            WHERE (user_id = ? OR (? > 0 AND rep_id = ?))
+            """,
+            (subject, rep, rep),
+        ).fetchone()
+    credits = int(row["credits"] or 0)
+    debits = int(row["debits"] or 0)
+    return {
+        "deposits_toman": credits,
+        "purchases_toman": debits,
+        "net_toman": credits - debits,
+    }
+
+
+def add_profile_note(subject_tg_id: int, author_tg_id: int, author_name: str, body: str) -> int:
+    """Append one internal, admin-only note to a profile. Returns its id."""
+    text = str(body or "").strip()
+    if not text:
+        raise ValueError("note body must not be empty")
+    with get_db() as conn:
+        cur = conn.cursor()
+        ensure_profile_notes_table(cur)
+        cur.execute(
+            "INSERT INTO profile_admin_notes "
+            "(subject_tg_id, author_tg_id, author_name, body) VALUES (?, ?, ?, ?)",
+            (int(subject_tg_id), int(author_tg_id), str(author_name or "")[:120], text[:2000]),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_profile_notes(subject_tg_id: int, limit: int = 5) -> list:
+    """Newest-first internal notes for one profile."""
+    with get_db() as conn:
+        ensure_profile_notes_table(conn)
+        rows = conn.execute(
+            "SELECT * FROM profile_admin_notes WHERE subject_tg_id=? "
+            "ORDER BY id DESC LIMIT ?",
+            (int(subject_tg_id), max(1, int(limit))),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_profile_notes(subject_tg_id: int) -> int:
+    with get_db() as conn:
+        ensure_profile_notes_table(conn)
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM profile_admin_notes WHERE subject_tg_id=?",
+            (int(subject_tg_id),),
+        ).fetchone()
+        return int(row["n"] or 0)
 
 def get_financial_ledger_paginated(
     rep_id=None, page=1, page_size=10, *, scope=None, merchant_key=None, edge_id=None,

@@ -37,6 +37,8 @@ import rep_panel
 import user_portal
 import v52_router
 import finance_manager
+import message_edit
+import profile_360
 from receipt_notifications import process_receipt_notification_outbox
 import sub_manager
 from xui_result import XUIResult, classify_xui_result
@@ -493,6 +495,98 @@ def _base_role_of(user, chat, thread_id):
     except Exception:
         return None, None
     return role, rep
+
+
+def _is_root_actor(user) -> bool:
+    """True only for the configured root account, by permanent identity.
+
+    Deliberately independent of the resolved persona and of the chat type: a
+    receipt lands in the finance topic of the supergroup, and the root operator
+    must be able to act on it there. The id is compared against the configured
+    root, never against a stored ``bot_users.role`` — that row is seeded as
+    ``end_user`` for every new user and is therefore not a trust signal.
+    """
+    try:
+        actor_id = int(getattr(user, "id", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if actor_id <= 0:
+        return False
+    try:
+        root_id = int(ADMIN_TELEGRAM_ID or 0)
+    except (TypeError, ValueError):
+        root_id = 0
+    return root_id > 0 and actor_id == root_id
+
+
+#: Admin callbacks that stay usable from the finance topic of the supergroup.
+#: They are receipt-scoped: settling or inspecting one receipt, plus the two
+#: navigation buttons that receipt carries. Everything else under ``admin:``
+#: still requires the bot's private chat, because those pages expose whole-system
+#: financial and personal records.
+_RECEIPT_TOPIC_ADMIN_PREFIXES = (
+    "admin_approve_rcp_", "admin_reject_rcp_", "admin_detail_rcp_",
+    "admin:user_detail:", "admin:main",
+)
+
+
+def _is_receipt_topic_context(chat, thread_id) -> bool:
+    """True when the callback came from the configured receipt/finance topic.
+
+    Resolved at call time from the live forum bindings, so a group or topic
+    created after startup is honoured instead of a ``config`` constant captured
+    at import.
+    """
+    if chat is None:
+        return False
+    try:
+        import forum_manager
+        group_id, topic_id = forum_manager.resolve_topic_destination("pendingreceipts")
+    except Exception:
+        return False
+    if not group_id or not topic_id:
+        return False
+    try:
+        return int(chat.id) == int(group_id) and int(thread_id or 0) == int(topic_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def _may_use_admin_callback_in_group(user, chat, thread_id, data) -> bool:
+    """The single decision point for admin callbacks outside the private chat.
+
+    Only the configured root, only inside the receipt topic, and only for a
+    receipt-scoped callback. Everything else keeps the private-chat requirement.
+    """
+    if not _is_root_actor(user):
+        return False
+    if not _is_receipt_topic_context(chat, thread_id):
+        return False
+    return str(data or "").startswith(_RECEIPT_TOPIC_ADMIN_PREFIXES)
+
+
+async def _settle_receipt_message(query, receipt, status: str, actor) -> None:
+    """Redraw a settled receipt in place, caption included.
+
+    The notification is a PHOTO message, so the status line lives in the caption:
+    swapping only the keyboard left «⏳ در انتظار بررسی» on screen after the
+    decision was already final. ``message_edit.update_body`` writes the caption
+    for a photo and the text for a plain message; a source that cannot be edited
+    at all still receives the settled keyboard instead of a dead button.
+    """
+    decided_by = getattr(actor, "full_name", "") or getattr(actor, "username", "") or "Admin"
+    settled_keyboard = finance_manager.build_admin_reviewed_keyboard(
+        status, receipt.get("user_id"), receipt.get("id"))
+    body = finance_manager.format_admin_receipt_card(
+        {**receipt, "status": status}, decided_by=decided_by)
+    try:
+        await message_edit.update_body(
+            query, text=body, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=settled_keyboard)
+    except Exception:
+        logger.debug("Could not redraw the settled receipt body; updating the keyboard only",
+                     exc_info=True)
+        await message_edit.edit_reply_markup(query, settled_keyboard)
 
 
 def _persona_aware_role(user, chat, thread_id):
@@ -5167,14 +5261,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if database.is_user_blocked(user.id):
         await query.answer("⛔️ دسترسی شما به این بات مسدود شده است.", show_alert=True)
         return
-    if role == "super_admin" and chat.type != "private":
+    data = query.data or ""
+    # A receipt is delivered as a PHOTO into the finance topic of the supergroup,
+    # so the root operator must be able to settle it right there. Only the
+    # receipt-scoped callbacks are admitted outside the private chat; every other
+    # admin surface still requires the DM.
+    if (role == "super_admin" and chat.type != "private"
+            and not _may_use_admin_callback_in_group(user, chat, thread_id, data)):
         await query.answer(
             "⛔️ عملیات مدیریت کل فقط در گفت‌وگوی خصوصی ربات مجاز است.",
             show_alert=True
         )
         return
-
-    data = query.data or ""
     # Leaving a workflow (menu/home/back/persona) or entering a new one must drop
     # every pending draft in both state stores, or the previous module steals the
     # next text message the customer sends.
@@ -5182,6 +5280,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _reset_all_conversation_states(user.id, _bot_id_of(context), context)
     if data.startswith("v52:"):
         await _dispatch_v52_callback(update, context, role=role, rep=rep)
+        return
+    # The 360-degree profile is a legacy-surface command centre reachable from
+    # tickets, receipts, locked transactions and the user/rep lists. It renders
+    # through message_edit, so opening it from a receipt PHOTO works.
+    if data.startswith("p360:"):
+        await profile_360.handle_profile_callback(update, context, role=role, rep=rep)
         return
     v52_enabled = False
     try:
@@ -5201,7 +5305,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or data.startswith("admin_reject_rcp_")
         or data.startswith("admin_detail_rcp_")
     )
-    if admin_callback and (not chat or chat.type != "private"):
+    if (admin_callback and (not chat or chat.type != "private")
+            and not _may_use_admin_callback_in_group(user, chat, thread_id, data)):
         await query.answer(
             "⛔️ عملیات پنل مدیریت فقط در گفت‌وگوی خصوصی ربات مجاز است.",
             show_alert=True
@@ -5225,18 +5330,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rcp = database.approve_payment_receipt(target_rcp, user.id, user.full_name or "Admin")
             if rcp.get("status") != "approved":
                 status = rcp.get("status", "unknown")
-                await query.edit_message_reply_markup(
-                    reply_markup=finance_manager.build_admin_reviewed_keyboard(
-                        status, rcp.get("user_id"))
-                )
+                await _settle_receipt_message(query, rcp, status, user)
                 await query.answer(
                     f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {status}",
                     show_alert=True
                 )
                 return
-            await query.edit_message_reply_markup(
-                reply_markup=finance_manager.build_admin_reviewed_keyboard("approved", rcp.get("user_id"))
-            )
+            await _settle_receipt_message(query, rcp, "approved", user)
             await query.answer(f"✅ فیش {rcp['tracking_code']} تایید شد.")
             
             try:
@@ -5268,18 +5368,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rcp = database.reject_payment_receipt(target_rcp, user.id, "عدم تطابق با گردش حساب")
             if rcp.get("status") != "rejected":
                 status = rcp.get("status", "unknown")
-                await query.edit_message_reply_markup(
-                    reply_markup=finance_manager.build_admin_reviewed_keyboard(
-                        status, rcp.get("user_id"))
-                )
+                await _settle_receipt_message(query, rcp, status, user)
                 await query.answer(
                     f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {status}",
                     show_alert=True
                 )
                 return
-            await query.edit_message_reply_markup(
-                reply_markup=finance_manager.build_admin_reviewed_keyboard("rejected", rcp.get("user_id"))
-            )
+            await _settle_receipt_message(query, rcp, "rejected", user)
             await query.answer(f"❌ فیش {rcp['tracking_code']} رد شد.")
             
             try:
@@ -5329,14 +5424,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [
                     InlineKeyboardButton("✅ تایید فیش", callback_data=f"admin_approve_rcp_{rcp['id']}"),
                     InlineKeyboardButton("❌ رد فیش", callback_data=f"admin_reject_rcp_{rcp['id']}")
-                ]
+                ],
+                [InlineKeyboardButton(
+                    "👤 مشاهده پروفایل کاربر",
+                    callback_data=f"admin:user_detail:{int(rcp['user_id'])}:rcp:{int(rcp['id'])}")],
             ]
         else:
             btns = [
                 [InlineKeyboardButton(status_fa, callback_data="noop")],
                 [InlineKeyboardButton(
                     "👤 مشاهده پروفایل کاربر",
-                    callback_data=f"admin:user_detail:{int(rcp['user_id'])}")],
+                    callback_data=f"admin:user_detail:{int(rcp['user_id'])}:rcp:{int(rcp['id'])}")],
                 [InlineKeyboardButton("👑 بازگشت به میز مدیر کل", callback_data="admin:main")],
             ]
         await finance_manager.reply_with_receipt_detail(
