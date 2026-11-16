@@ -461,8 +461,8 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
             deliv_text = alloc_res.get("deliverable", "")
             deliv_text += (
-                f"\n\n🧾 **فاکتور:** \`{amount:,} تومان\`"
-                f" | **مانده بدهی جدید:** \`{new_bal:,} تومان\`"
+                f"\n\n🧾 **فاکتور:** `{amount:,} تومان`"
+                f" | **مانده بدهی جدید:** `{new_bal:,} تومان`"
             )
             keyboard = _build_account_keyboard(
                 code, user.id, is_enabled=True, role="rep"

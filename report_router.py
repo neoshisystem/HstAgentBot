@@ -169,4 +169,22 @@ def route_event(event: Mapping[str, Any], *, conn: sqlite3.Connection | None = N
         return _route_event(managed, event)
 
 
-__all__ = ["ReportRouteError", "route_event"]
+def primary_bot_id(conn: sqlite3.Connection) -> int:
+    """The active primary bot, for a delivery whose destination is trusted settings.
+
+    :func:`route_event` resolves both the bot and the destination from trusted
+    registries. A caller that already holds a settings-derived destination — the
+    backups topic or the super-admin direct message — still needs the bot allowed
+    to deliver into it, and must not be forced through topic registration to get
+    it. Only the bot is read here; the destination never comes from this function.
+    """
+    row = conn.execute(
+        "SELECT bot_id FROM bot_registry WHERE is_primary=1 AND status='active' "
+        "ORDER BY bot_id LIMIT 1"
+    ).fetchone()
+    if row is None:
+        raise ReportRouteError("active primary bot is unavailable")
+    return int(_get(row, "bot_id"))
+
+
+__all__ = ["ReportRouteError", "primary_bot_id", "route_event"]

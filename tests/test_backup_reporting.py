@@ -22,7 +22,27 @@ class UploadResult:
         return self.result
 
 
+def isolate_backup_environment(monkeypatch):
+    """Make these tests independent of the deployment's own .env and database.
+
+    Two pieces of ambient state decide the outcome otherwise:
+
+    * ``BACKUP_ENCRYPTION_KEY`` — when the deployment sets it, the archive is
+      encrypted and this historical plaintext harness is switched off by design,
+      so every assertion about archive contents fails. Removing it restores the
+      condition this file was written for.
+    * ``system_settings`` — ``resolve_backup_destination()`` falls back to the
+      live database when the legacy topic constant is unset, so the deployment's
+      own group/topic/admin values would decide whether a destination exists.
+      These two reads are the only database access in the backup path.
+    """
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setattr(database, "get_main_group_id", lambda: 0)
+    monkeypatch.setattr(database, "get_setting", lambda key, default=None, **kwargs: 0)
+
+
 def prepare_backup(tmp_path, monkeypatch, upload_result):
+    isolate_backup_environment(monkeypatch)
     production_dir = tmp_path / "production"
     production_dir.mkdir()
     db_path = production_dir / "source.sqlite3"
@@ -262,6 +282,7 @@ def test_restore_failure_preserves_caller_owned_empty_destination(tmp_path, monk
 
 
 def test_restore_preserves_hstagentbot_database_schema_and_settings(tmp_path, monkeypatch):
+    isolate_backup_environment(monkeypatch)
     production_dir = tmp_path / "production"
     production_dir.mkdir()
     db_path = production_dir / "agent_bot.db"

@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 
 import access_service
 import account_link_service
+import service_errors_fa
 from ui_v52 import button, render_error, render_page
 
 
@@ -80,7 +81,7 @@ def show_grants(
     try:
         exact_id = _positive(account_id, "account_id")
     except ValueError as exc:
-        return render_error(str(exc), persona=persona, parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=persona, parent_callback=parent_callback)
     if not _authorized(ctx, exact_id):
         return render_error("فقط مالک حساب یا فروشندهٔ مجاز می‌تواند دسترسی‌ها را مدیریت کند.",
                             persona=_persona(ctx, persona), parent_callback=parent_callback)
@@ -115,7 +116,7 @@ def show_grants(
                            persona=_persona(ctx, persona), page_kind="access",
                            parent_callback=parent_callback, rows=rows)
     except (ValueError, TypeError) as exc:
-        return render_error(str(exc), persona=_persona(ctx, persona),
+        return render_error(service_errors_fa.translate(exc), persona=_persona(ctx, persona),
                             parent_callback=parent_callback)
 
 
@@ -156,7 +157,7 @@ def begin_grant(
         return preview_grant(ctx, exact_id, selected_grantee, selected_level,
                              persona=persona, parent_callback=parent_callback)
     except (ValueError, TypeError, PermissionError) as exc:
-        return render_error(str(exc), persona=_persona(ctx, persona),
+        return render_error(service_errors_fa.translate(exc), persona=_persona(ctx, persona),
                             parent_callback=parent_callback)
 
 
@@ -189,7 +190,7 @@ def preview_grant(
             rows=[[button("بازگشت به دسترسی‌ها", f"v52:grants:{aid}")]],
         )
     except (ValueError, TypeError, PermissionError) as exc:
-        return render_error(str(exc), persona=_persona(ctx, persona),
+        return render_error(service_errors_fa.translate(exc), persona=_persona(ctx, persona),
                             parent_callback=parent_callback)
 
 
@@ -235,7 +236,7 @@ def preview_revoke(
             rows=[[button("تأیید لغو", f"v52:grevoke:{aid}:{grantee}")]],
         )
     except (ValueError, TypeError, PermissionError) as exc:
-        return render_error(str(exc), persona=_persona(ctx, persona),
+        return render_error(service_errors_fa.translate(exc), persona=_persona(ctx, persona),
                             parent_callback=parent_callback)
 
 
@@ -263,7 +264,7 @@ def show_link_candidates(
                            persona=persona, page_kind="selection",
                            parent_callback=parent_callback, rows=rows)
     except (ValueError, TypeError) as exc:
-        return render_error(str(exc), persona=persona, parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=persona, parent_callback=parent_callback)
 
 
 __all__ = ["show_grants", "begin_grant", "preview_grant", "preview_revoke",

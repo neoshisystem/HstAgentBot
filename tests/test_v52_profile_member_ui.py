@@ -44,7 +44,9 @@ def _prepared(tmp_path, monkeypatch):
             )
             conn.execute(
                 "INSERT INTO system_settings(key,value,label,description) "
-                "VALUES('sub_profile_limit','2','synthetic quota','W17.7')"
+                "VALUES('sub_profile_limit','2','synthetic quota','W17.7') "
+                "ON CONFLICT(key) DO UPDATE SET value='2', label='synthetic quota', "
+                "description='W17.7'"
             )
         helpers.seed_actor(database, actor_tg_id=101, rep_id=202, rep_tg_id=303)
         helpers.seed_account(database, account_id=303, rep_id=202, owner_tg_id=101)

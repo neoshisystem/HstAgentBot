@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import config
+import service_errors_fa
 from ui_v52 import button, render_error, render_page
 
 
@@ -79,7 +80,7 @@ def tickets_page(
         return render_page("تیکت‌های پشتیبانی", body, persona=_persona(ctx), rows=rows,
                            parent_callback=parent_callback)
     except (TypeError, ValueError, PermissionError, KeyError) as exc:
-        return render_error(str(exc), persona=_persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=_persona(ctx), parent_callback=parent_callback)
 
 
 def begin_ticket(
@@ -130,7 +131,7 @@ def begin_ticket(
             rows=[[button("مشاهده تیکت", f"v52:ticket:{result['ticket_id']}")]],
         )
     except (TypeError, ValueError, PermissionError, KeyError) as exc:
-        return render_error(str(exc), persona=_persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=_persona(ctx), parent_callback=parent_callback)
 
 
 def begin_abuse(
@@ -172,7 +173,7 @@ def begin_abuse(
             persona=_persona(ctx), page_kind="result", parent_callback=parent_callback,
         )
     except (TypeError, ValueError, PermissionError, KeyError) as exc:
-        return render_error(str(exc), persona=_persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=_persona(ctx), parent_callback=parent_callback)
 
 
 def ticket_status_header(status: Any, ticket_id: Any = None) -> str:
@@ -337,7 +338,7 @@ def reply_or_escalate(
             persona=_persona(ctx), page_kind="result", parent_callback=parent_callback,
         )
     except (TypeError, ValueError, PermissionError, KeyError) as exc:
-        return render_error(str(exc), persona=_persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=_persona(ctx), parent_callback=parent_callback)
 
 
 __all__ = ["begin_ticket", "begin_abuse", "reply_or_escalate", "ticket_page_rows",

@@ -40,7 +40,8 @@ def test_non_destructive_seed(tmp_path, monkeypatch):
                 "VALUES('rep','vip','Custom VIP',1,375,125,4,7654321,990000)"
             )
             conn.execute(
-                "INSERT INTO system_settings(key,value) VALUES('sub_profile_limit','9')"
+                "INSERT INTO system_settings(key,value) VALUES('sub_profile_limit','9') "
+                "ON CONFLICT(key) DO UPDATE SET value='9'"
             )
             conn.execute("INSERT INTO feature_flags(name,enabled) VALUES('custom_gate',1)")
 

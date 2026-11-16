@@ -13,6 +13,7 @@ from telegram.ext import ContextTypes
 import database
 import message_edit
 import nlp_matcher
+import service_errors_fa
 
 from server_integrations import load_integration
 xui_manager = load_integration("xui_manager")
@@ -31,8 +32,9 @@ SETTINGS_CATEGORIES = (
      ("main_group_id", "operational_logs_topic_id", "pending_receipts_topic_id",
       "backups_topic_id", "rep_logs_topic_id", "support_tickets_topic_id", "admin_dm_topic_id")),
     ("registration", "🔐 سیاست‌های ثبت‌نام، عضویت و کد معرف",
-     ("registration_mode", "referral_requires_approval", "referral_reward_toman",
-      "referral_reward_percent", "sub_profile_limit")),
+     ("registration_mode", "referral_requires_approval", "referral_signup_bonus",
+      "referral_first_purchase_bonus", "referral_purchase_reward_percent",
+      "sub_profile_limit")),
     ("finance", "💰 آستانه‌های مالی، رزرو و قوانین تمدید (Rollover)",
      ("rollover_max_gb", "rollover_max_days", "reserve_trigger_gb", "renewal_lock_ttl_sec")),
     ("monitoring", "🔍 تنظیمات مانیتورینگ، دیده‌بان (Watchdog) و استخر آزاد",
@@ -43,6 +45,65 @@ SETTINGS_CATEGORIES = (
 SETTINGS_CATEGORY_TITLES = {key: title for key, title, _keys in SETTINGS_CATEGORIES}
 SETTINGS_CATEGORY_OF = {k: key for key, _title, keys in SETTINGS_CATEGORIES for k in keys}
 SETTINGS_OTHER_TITLE = "🧩 سایر پارامترها"
+
+# Internal counters and bookkeeping rows are not operator settings. They must not
+# appear in the settings centre at all — not in a category, not in the catch-all —
+# because there is nothing an operator could usefully change about them.
+HIDDEN_SETTINGS = frozenset({"ticket_code_seq"})
+
+# Settings whose value is a switch rather than a number or an identifier. Only
+# these render as فعال/غیرفعال: a topic id of 0 is a real identifier, not "off".
+BOOLEAN_SETTINGS = frozenset({
+    "v52_ui_enabled", "v52_persona_switcher_enabled", "referral_requires_approval",
+})
+BOOLEAN_ON, BOOLEAN_OFF = "🟢 فعال (1)", "🔴 غیرفعال (0)"
+
+# Readable Persian for a setting whose value is a fixed keyword.
+SETTING_VALUE_LABELS = {
+    "registration_mode": {
+        "open": "باز — همه کاربران می‌توانند ثبت‌نام کنند",
+        "approval_required": "نیازمند تایید مدیریت",
+        "referral_only": "فقط با کد معرف معتبر",
+    },
+}
+
+# A raw English key must never reach the screen, so every fallback below is Persian.
+SETTING_LABEL_FALLBACK = "پارامتر سیستمی"
+SETTING_DESCRIPTION_FALLBACK = (
+    "برای این پارامتر توضیح فارسی ثبت نشده است؛ پیش از تغییر مقدار، اثر آن را بررسی کنید."
+)
+
+
+def _has_persian(text) -> bool:
+    """True when the text carries at least one Persian letter."""
+    return service_errors_fa.is_persian(text)
+
+
+def setting_label(setting) -> str:
+    """Persian title for a settings row; the raw key is never a fallback."""
+    label = str(setting.get("label") or "").strip()
+    if label and _has_persian(label):
+        return label
+    return SETTING_LABEL_FALLBACK
+
+
+def setting_description(setting) -> str:
+    """Practical Persian explanation for a settings row, never empty."""
+    description = str(setting.get("description") or "").strip()
+    if description and _has_persian(description):
+        return description
+    return SETTING_DESCRIPTION_FALLBACK
+
+
+def setting_value_display(key: str, value) -> str:
+    """Readable current value: a switch reads as فعال/غیرفعال, a keyword in Persian."""
+    text = str(value if value is not None else "").strip()
+    keywords = SETTING_VALUE_LABELS.get(str(key))
+    if keywords and text in keywords:
+        return keywords[text]
+    if str(key) in BOOLEAN_SETTINGS and text in {"0", "1"}:
+        return BOOLEAN_ON if text == "1" else BOOLEAN_OFF
+    return f"`{text}`" if text else "—"
 
 
 def settings_category_of(key: str) -> str:
@@ -58,7 +119,8 @@ def settings_category_title(cat_key: str) -> str:
 
 def _settings_category_members(cat_key: str):
     """Live settings rows for one category, in the category's declared order."""
-    settings_list = database.get_all_settings()
+    settings_list = [s for s in database.get_all_settings()
+                     if s["key"] not in HIDDEN_SETTINGS]
     if cat_key == "other":
         return [s for s in settings_list if s["key"] not in SETTINGS_CATEGORY_OF]
     order = {k: i for i, k in enumerate(
@@ -68,7 +130,12 @@ def _settings_category_members(cat_key: str):
 
 
 def build_settings_category_page(cat_key: str):
-    """Readable Persian page for one settings category plus its button rows."""
+    """Readable Persian page for one settings category plus its button rows.
+
+    Only the Persian title, the readable current value and the practical
+    explanation reach the screen: the raw English key stays inside the callback
+    data, where the operator never reads it.
+    """
     title = settings_category_title(cat_key)
     members = _settings_category_members(cat_key)
     lines = [f"**{title}**\n"]
@@ -77,12 +144,12 @@ def build_settings_category_page(cat_key: str):
         lines.append("• پارامتری در این دسته‌بندی ثبت نشده است.")
     for setting in members:
         key = setting["key"]
-        label = setting["label"] or key
-        value = setting["value"]
-        description = setting.get("description") or ""
-        lines.append(f"• **{label}**\n   مقدار فعلی: `{value}`\n   {description}")
+        label = setting_label(setting)
+        value = setting_value_display(key, setting["value"])
+        description = setting_description(setting)
+        lines.append(f"• **{label}**\n   مقدار فعلی: {value}\n   {description}")
         rows.append([InlineKeyboardButton(
-            f"⚙️ {label}: {value}",
+            f"⚙️ {label}",
             callback_data=f"admin:prompt_setting:{key}:{cat_key}",
         )])
     if cat_key == "group":
@@ -417,7 +484,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
              InlineKeyboardButton("🤖 مدیریت بات‌ها", callback_data="v52:bots")],
             [InlineKeyboardButton("🌐 مدیریت دامنه‌ها", callback_data="v52:domains"),
              InlineKeyboardButton("💳 کارت‌های پرداخت", callback_data="v52:cards")],
-            [InlineKeyboardButton("🏷 تعرفه‌ها", callback_data="v52:plans"),
+            [InlineKeyboardButton("🏷 ماتریس تعرفه و پنل‌ها", callback_data="v52:plans"),
              InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
             [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets"),
              InlineKeyboardButton("⚙️ تنظیمات تیکت و وضعیت‌ها", callback_data="v52:ticketsettings")],
@@ -429,7 +496,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
              InlineKeyboardButton("👤 مدیریت کاربران", callback_data="admin:users")],
             [InlineKeyboardButton("📦 تخصیص و اسکوپ", callback_data="admin:scope"),
              InlineKeyboardButton("💰 امور مالی و تسویه‌ها", callback_data="admin:finance")],
-            [InlineKeyboardButton("⚙️ تعرفه‌ها و پلن‌ها", callback_data="admin:plans"),
+            [InlineKeyboardButton("⚙️ مدیریت بسته‌ها و قیمت پایه", callback_data="admin:plans"),
              InlineKeyboardButton("🔄 همگام‌سازی و آمار", callback_data="admin:sync")],
             [InlineKeyboardButton("⚠️ مانیتورینگ اکانت‌های بحرانی", callback_data="admin:audit"),
              InlineKeyboardButton("🏊 استخر آزاد", callback_data="admin:pool")],
@@ -438,7 +505,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("⏳ تراکنش‌های معلق و قفل‌شده", callback_data="admin:pending_tx")],
             [InlineKeyboardButton("💾 پشتیبان‌گیری سریع دیتابیس", callback_data="admin:backup")],
             # --- Persona Switcher ---
-            [InlineKeyboardButton("🧑‍💼 میزکار نماینده (root_admin_rep)", callback_data="v52:persona:rep")],
+            [InlineKeyboardButton("🧑‍💼 ورود به میزکار نمایندگی", callback_data="v52:persona:rep")],
             [InlineKeyboardButton("👤 پورتال کاربری", callback_data="v52:persona:user")],
         ])
     rows = [
@@ -446,7 +513,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("👤 مدیریت کاربران", callback_data="admin:users")],
         [InlineKeyboardButton("📦 تخصیص و اسکوپ", callback_data="admin:scope"),
          InlineKeyboardButton("💰 امور مالی و تسویه‌ها", callback_data="admin:finance")],
-        [InlineKeyboardButton("⚙️ تعرفه‌ها و پلن‌ها", callback_data="admin:plans"),
+        [InlineKeyboardButton("⚙️ مدیریت بسته‌ها و قیمت پایه", callback_data="admin:plans"),
          InlineKeyboardButton("🔄 همگام‌سازی و آمار", callback_data="admin:sync")],
         [InlineKeyboardButton("⚠️ مانیتورینگ اکانت‌های بحرانی", callback_data="admin:audit"),
          InlineKeyboardButton("🏊 استخر آزاد", callback_data="admin:pool")],
@@ -456,7 +523,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
     ]
     # The persona switcher is a navigation guarantee, not a v5.2-only feature: the
     # super-admin must always be able to reach the lower workspaces.
-    rows.append([InlineKeyboardButton("🧑‍💼 میزکار نماینده (root_admin_rep)",
+    rows.append([InlineKeyboardButton("🧑‍💼 ورود به میزکار نمایندگی",
                                       callback_data="v52:persona:rep")])
     rows.append([InlineKeyboardButton("👤 پورتال کاربری", callback_data="v52:persona:user")])
     return InlineKeyboardMarkup(rows)
@@ -1923,16 +1990,15 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
                 await query.answer("❌ تنظیم مورد نظر یافت نشد.", show_alert=True)
                 return
             context.user_data["admin_state"] = {
-                "action": "edit_setting", "key": setting_key, "label": target_s["label"],
-                "category": cat_key, "ts": now_ts,
+                "action": "edit_setting", "key": setting_key,
+                "label": setting_label(target_s), "category": cat_key, "ts": now_ts,
             }
             prompt_parent_cb = f"admin:settings_cat:{cat_key}"
             msg = (
                 f"🛠 **ویرایش تنظیمات سامانه:**\n\n"
-                f"• عنوان: **{escape_markdown(target_s.get('label') or '')}**\n"
-                f"• کلید سیستمی: `{escape_markdown_code(setting_key)}`\n"
-                f"• توضیح: {escape_markdown(target_s.get('description') or '')}\n"
-                f"• مقدار فعلی: `{escape_markdown_code(target_s.get('value') or '')}`\n\n"
+                f"• عنوان: **{escape_markdown(setting_label(target_s))}**\n"
+                f"• توضیح: {escape_markdown(setting_description(target_s))}\n"
+                f"• مقدار فعلی: {setting_value_display(setting_key, target_s.get('value'))}\n\n"
                 f"لطفاً مقدار جدید را ارسال کنید:\n\n"
                 f"⏱ مهلت ارسال: ۶۰ ثانیه (یا بنویسید `cancel`)"
             )

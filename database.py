@@ -58,6 +58,16 @@ DEFAULT_SETTINGS = [
     ("referral_signup_bonus", "0", "هدیه ثبت‌نام معرف (تومان)", "مبلغ ثابت واریز به کیف پول معرف پس از تایید عضویت زیرمجموعه"),
     ("referral_first_purchase_bonus", "0", "هدیه اولین خرید معرف (تومان)", "مبلغ ثابت واریز به کیف پول معرف پس از اولین خرید موفق زیرمجموعه"),
     ("referral_purchase_reward_percent", "0", "درصد پاداش خرید معرف", "درصدی از مبلغ اولین خرید زیرمجموعه که به کیف پول معرف واریز می‌شود"),
+    # The v5.2 feature flags and the profile cap are written by the bootstrap and
+    # the policy registry with a value only, so they used to reach the settings
+    # centre with no Persian title and no explanation. Listing them here gives the
+    # operator a readable name, a practical description and a readable value.
+    ("v52_ui_enabled", "1", "رابط کاربری نسخهٔ ۵.۲",
+     "با فعال بودن (۱) منوها و صفحات نسخهٔ ۵.۲ — پروفایل ۳۶۰ درجه، فروشگاه دیجیتال، سطوح قیمت‌گذاری و وضعیت‌های پویا — نمایش داده می‌شود؛ با غیرفعال کردن (۰) رابط قدیمی برمی‌گردد"),
+    ("v52_persona_switcher_enabled", "1", "جابه‌جایی بین میزکار مدیر کل، نمایندگی و کاربر",
+     "با فعال بودن (۱) مدیر کل می‌تواند از منوی اصلی بین سه میزکار جابه‌جا شود؛ با غیرفعال کردن (۰) این دکمه‌ها پنهان می‌شوند"),
+    ("sub_profile_limit", "5", "سقف پروفایل جانبی هر اکانت",
+     "حداکثر تعداد پروفایل (کاربر) قابل ایجاد روی هر اکانت سرویس؛ مقدار ۰ یعنی بدون محدودیت"),
     ("pending_receipts_topic_id", "0", "تاپیک فیش‌ها و امور مالی", "شناسه تاپیک تایید فیش‌ها و عملیات مالی"),
     ("support_tickets_topic_id", "0", "تاپیک تیکت‌ها و گزارش تخلف", "شناسه تاپیک تیکت‌ها و گزارش تخلف"),
     ("admin_telegram_id", str(ADMIN_TELEGRAM_ID), "شناسه تلگرام ادمین کل", "شناسه عددی ادمین اصلی سیستم")

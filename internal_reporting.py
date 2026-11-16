@@ -22,9 +22,19 @@ def _redact(value: Any) -> str:
 
 def _queue(logical_key: str, *, purpose: str, resource_type: str,
            resource_id: str, rep_id: int | None = None,
-           actor_tg_id: int | None = None) -> dict[str, Any]:
+           actor_tg_id: int | None = None,
+           chat_id: int | None = None,
+           thread_id: int | None = None) -> dict[str, Any]:
+    """Enqueue one delivery, either to a routed destination or an explicit one.
+
+    ``chat_id`` names a destination that the caller already resolved from trusted
+    settings — the backups topic or the super-admin direct message. It is never a
+    caller-supplied identifier from user input, so the router's privacy property
+    holds: the bot still comes from the registry and the destination from
+    settings. Without it, the logical key is routed as before.
+    """
     import database
-    from report_router import route_event
+    from report_router import primary_bot_id, route_event
     from outbox_service import enqueue_delivery
 
     event: dict[str, Any] = {"logical_key": logical_key}
@@ -39,16 +49,25 @@ def _queue(logical_key: str, *, purpose: str, resource_type: str,
             actor = int(row["telegram_id"]) if row and row["telegram_id"] is not None else 0
         event.update({"rep_id": int(rep_id), "actor_tg_id": int(actor)})
     with database.get_db() as conn:
-        route = route_event(event, conn=conn)
+        if chat_id is None:
+            route = route_event(event, conn=conn)
+            bot_id = int(route["bot_id"])
+            destination_chat = int(route["chat_id"])
+            destination_thread = route["thread_id"]
+        else:
+            bot_id = primary_bot_id(conn)
+            destination_chat = int(chat_id)
+            # A direct message has no thread; the topic case carries one.
+            destination_thread = int(thread_id) if thread_id else None
         event_hash = hashlib.sha256(
-            (logical_key + "\0" + str(route["chat_id"]) + "\0" + resource_id).encode("utf-8")
+            (logical_key + "\0" + str(destination_chat) + "\0" + resource_id).encode("utf-8")
         ).hexdigest()
         queued = enqueue_delivery(
             conn,
             event_key=f"w19:{logical_key}:{event_hash}:{uuid.uuid4().hex[:12]}",
-            bot_id=int(route["bot_id"]),
-            chat_id=int(route["chat_id"]),
-            thread_id=route["thread_id"],
+            bot_id=bot_id,
+            chat_id=destination_chat,
+            thread_id=destination_thread,
             purpose=purpose,
             resource_type=resource_type,
             resource_id=resource_id,
@@ -120,8 +139,18 @@ def send_telegram_message(target_topic, text=None, parse_mode=None, *,
 
 
 def send_telegram_document(target_topic, document_path=None, caption=None, parse_mode=None, *,
-                           logical_key: str = "backupfile", **_ignored):
-    """Queue only an encrypted archive whose ciphertext and authenticated payload verify."""
+                           logical_key: str = "backupfile",
+                           chat_id: int | None = None, thread_id: int | None = None,
+                           **_ignored):
+    """Queue only an encrypted archive whose ciphertext and authenticated payload verify.
+
+    ``target_topic`` is the historical positional destination and stays ignored:
+    the router derives the destination from trusted registries. ``chat_id`` and
+    ``thread_id`` are the explicit alternative, used by the backup job because it
+    resolves its destination (the backups topic, else the super-admin DM) from
+    ``system_settings`` — a topic delivery carries both, a direct message only the
+    chat. Both are settings-derived, never user input.
+    """
     path = document_path if document_path is not None else target_topic
     if not isinstance(path, (str, os.PathLike)):
         return {"ok": False, "queued": False, "state": "definite_failure",
@@ -150,6 +179,8 @@ def send_telegram_document(target_topic, document_path=None, caption=None, parse
             purpose="backup_document",
             resource_type="encrypted_backup",
             resource_id=resource,
+            chat_id=chat_id,
+            thread_id=thread_id,
         )
     except Exception as exc:
         return {

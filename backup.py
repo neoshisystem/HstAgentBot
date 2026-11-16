@@ -158,7 +158,10 @@ def resolve_backup_destination() -> dict:
     if group_id and topic_id:
         return {"configured": True, "target": "group_topic",
                 "chat_id": int(group_id), "topic_id": int(topic_id)}
-    if group_id and admin_id:
+    if admin_id:
+        # The direct-message fallback must not require a group: a deployment whose
+        # main group is not configured yet still has a super-admin to deliver to,
+        # and a backup must never be dropped for want of a group id.
         return {"configured": True, "target": "admin_dm",
                 "chat_id": int(admin_id), "topic_id": None}
     return {"configured": False,
@@ -503,8 +506,14 @@ def run_backup():
         destination = resolve_backup_destination()
         if destination["configured"]:
             try:
+                # Pass the resolved destination explicitly. Only the topic id used
+                # to be forwarded, which the reporting facade ignores — so the
+                # group case silently depended on topic registration and the
+                # direct-message fallback could never work at all, because it
+                # resolved to no thread and no chat.
                 upload_res = backup_and_report.send_telegram_document(
-                    destination["topic_id"], archive_path, caption, parse_mode="HTML"
+                    destination["topic_id"], archive_path, caption, parse_mode="HTML",
+                    chat_id=destination["chat_id"], thread_id=destination["topic_id"],
                 )
                 if isinstance(upload_res, dict) and upload_res.get("ok"):
                     upload_status = "sent"

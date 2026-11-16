@@ -59,7 +59,9 @@ def test_default_unique_quota_and_atomic_create(tmp_path, monkeypatch):
         with database.get_db() as conn:
             conn.execute(
                 "INSERT INTO system_settings(key,value,label,description) "
-                "VALUES('sub_profile_limit','2','synthetic quota','W11')"
+                "VALUES('sub_profile_limit','2','synthetic quota','W11') "
+                "ON CONFLICT(key) DO UPDATE SET value='2', label='synthetic quota', "
+                "description='W11'"
             )
             first = service.ensure_default_profile(conn, 101, now=1794400001)
             second = service.ensure_default_profile(conn, 101, now=1794400002)

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
-import secrets
 import time
 from typing import Any
 
@@ -70,7 +69,6 @@ def create_abuse_report(
     actor_id = _actor_id(ctx)
     source_bot = support._bot_id(ctx, bot_id)
     timestamp = _timestamp(now)
-    ticket_id = secrets.token_urlsafe(18)
     selected_attachment_bot = (
         support._positive(attachment_bot_id, "attachment_bot_id")
         if attachment_bot_id is not None else source_bot
@@ -78,6 +76,14 @@ def create_abuse_report(
 
     with database.get_db() as conn, support._atomic(conn):
         support._validate_bot(conn, source_bot)
+        # The abuse report draws its reference from the same sequence as support
+        # tickets, so an operator reads a short five-digit code instead of a
+        # 24-character random token. Generated inside the transaction: a rollback
+        # must never burn a code, and the sequence also consults the highest
+        # numeric id already stored, so a restored backup cannot hand out a
+        # duplicate. Legacy random ids stay valid — every lookup is by exact
+        # string and support_service.migrate_legacy_ticket_codes rewrites them.
+        ticket_id = support.next_ticket_code(conn)
         conn.execute(
             "INSERT INTO support_tickets(ticket_id,sender_tg_id,bot_id,account_id,rep_id,"
             "ticket_type,assigned_key,status,snapshot_cipher,created_at,updated_at) "

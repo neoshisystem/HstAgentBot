@@ -287,12 +287,14 @@ def _assignment(conn: sqlite3.Connection, account, *, sender_is_rep: bool = Fals
 TICKET_CODE_FLOOR = 10001
 
 # The three standard lifecycle states the operator sees. ``unseen`` and
-# ``escalated`` are both "open"; ``answered`` is "in progress".
+# ``escalated`` are both "open"; ``answered`` is "in progress". These are the
+# fallback labels for a database that predates the editable catalog, so they carry
+# no raw English: the operator-facing wording must be Persian on every path.
 TICKET_STATUS_LABELS: dict[str, str] = {
-    "unseen": "🟢 باز (Open)",
-    "escalated": "🟢 باز (Open)",
+    "unseen": "🟢 باز",
+    "escalated": "🟠 باز (ارجاع‌شده)",
     "answered": "🟡 در حال بررسی / پاسخ‌داده‌شده",
-    "closed": "🔴 بسته شده (Closed)",
+    "closed": "🔴 بسته شده",
 }
 TICKET_OPEN_STATUSES = ("unseen", "escalated")
 
@@ -350,6 +352,12 @@ def _next_ticket_code(conn: sqlite3.Connection) -> str:
         "VALUES('ticket_code_seq',?,'','') "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(nxt),))
     return str(nxt)
+
+
+# Public name for the shared sequence. The abuse-report flow issues its code from
+# the same counter so every operator-facing reference in the system — ticket or
+# abuse report — is a short, quotable number instead of a random token.
+next_ticket_code = _next_ticket_code
 
 
 def migrate_legacy_ticket_codes(conn: sqlite3.Connection) -> int:
