@@ -63,6 +63,10 @@ def tickets_page(
                         "v52:ticket:" + str(item["ticket_id"]))]
                 for item in tickets[:12]]
         rows.append([button("➕ ارسال تیکت جدید", "v52:newticket")])
+        if _root(ctx):
+            # The status catalog is the operator's own surface; it is offered from
+            # the ticket section itself so it is reachable where the need arises.
+            rows.append([button("⚙️ تنظیمات تیکت و وضعیت‌ها", "v52:ticketsettings")])
         marks = [(("• " if key == selected else "") + label, f"v52:tickets:{key}")
                  for key, label in _TICKET_GROUPS]
         rows.append([button(label, callback) for label, callback in marks[:2]])
@@ -203,6 +207,30 @@ def ticket_lifecycle_rows(
     return rows
 
 
+def ticket_page_rows(
+    ticket_id: str, status: Any, *, is_operator: bool = True, is_author: bool = False,
+) -> list:
+    """The full control set for one ticket: the one-tap status picker, then actions.
+
+    The picker is built from the operator's own status catalog, so a status the
+    root added or renamed appears here immediately. It is rendered **above** the
+    lifecycle rows because changing the state is the common operation, and it is
+    only offered to an operator — a customer must never be able to move their own
+    ticket between queues.
+    """
+    rows = ticket_lifecycle_rows(
+        ticket_id, status, is_operator=is_operator, is_author=is_author)
+    if not is_operator:
+        return rows
+    try:
+        import ticket_status_ui
+        picker = ticket_status_ui.status_picker_rows(
+            str(ticket_id), current=str(status or ""))
+    except Exception:  # noqa: BLE001 - a picker must never break the ticket page
+        return rows
+    return list(picker) + rows
+
+
 def reply_or_escalate(
     ctx: Any,
     ticket_id: str | None = None,
@@ -303,4 +331,5 @@ def reply_or_escalate(
         return render_error(str(exc), persona=_persona(ctx), parent_callback=parent_callback)
 
 
-__all__ = ["begin_ticket", "begin_abuse", "reply_or_escalate", "tickets_page"]
+__all__ = ["begin_ticket", "begin_abuse", "reply_or_escalate", "ticket_page_rows",
+           "ticket_lifecycle_rows", "ticket_status_header", "tickets_page"]

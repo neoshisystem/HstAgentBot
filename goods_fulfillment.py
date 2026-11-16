@@ -148,6 +148,37 @@ def _prepare_inventory(order_id: str, now: int):
         return payload, "ready", False
 
 
+def delivery_text_for(order_id: str, item: str, *, conn=None) -> str:
+    """Compose the buyer-facing delivery message for one order and item.
+
+    The stored payload stays the raw secret — it is the authenticated artifact and
+    the replay key — while this function builds what the buyer actually reads:
+    the product's fixed usage guide plus the item in a copyable block.
+    """
+    from goods_service import compose_delivery_text, get_product_usage_guide
+
+    order_id = str(order_id).strip()
+    if not order_id:
+        raise GoodsValidationError("order_id is required")
+    with _database_connection(conn) as db:
+        row = db.execute(
+            """
+            SELECT p.id,p.title
+            FROM payment_orders o
+            JOIN quotes q ON q.quote_id=o.quote_id
+            JOIN digital_products p ON p.id=q.product_id
+            WHERE o.order_id=?
+            """,
+            (order_id,),
+        ).fetchone()
+    if row is None:
+        raise FulfillmentError("digital-goods order or product does not exist")
+    guide = get_product_usage_guide(int(row[0]), conn=conn)
+    return compose_delivery_text(
+        str(row[1]), item, usage_guide=guide, order_id=order_id
+    )
+
+
 def fulfill_inventory(order_id: str, *, sender=None, now: int | None = None) -> dict:
     """Expose one reserved code exactly once; timeout leaves it sold and replayable."""
     order_id = str(order_id).strip()
@@ -160,10 +191,12 @@ def fulfill_inventory(order_id: str, *, sender=None, now: int | None = None) -> 
             "order_id": order_id,
             "state": state,
             "payload": payload,
+            "delivery_text": delivery_text_for(order_id, payload),
             "replayed": replayed,
         }
     result = _dispatch(order_id, payload, sender, state)
     result["replayed"] = replayed
+    result["delivery_text"] = delivery_text_for(order_id, payload)
     return result
 
 

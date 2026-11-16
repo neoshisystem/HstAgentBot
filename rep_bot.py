@@ -1925,6 +1925,45 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                     "نمایش داده می‌شود؛ هیچ نسخه‌ای به صندوق نماینده نمی‌رود.",
                     persona="admin", rows=rows, parent_callback="v52:home:admin",
                 )
+            elif name == "ticket_status_settings":
+                import ticket_status_ui
+                page = ticket_status_ui.ticket_status_settings(ctx, parent_callback="v52:tickets")
+            elif name == "begin_ticket_status_new":
+                import ticket_status_ui
+                page = ticket_status_ui.begin_ticket_status_new(
+                    ctx, parent_callback="v52:ticketsettings")
+            elif name == "begin_ticket_status_edit":
+                import ticket_status_ui
+                page = ticket_status_ui.begin_ticket_status_edit(
+                    ctx, str(params["code"]), parent_callback="v52:ticketsettings")
+            elif name == "toggle_ticket_status":
+                import ticket_status_ui
+                page = ticket_status_ui.toggle_ticket_status(
+                    ctx, str(params["code"]), parent_callback="v52:ticketsettings")
+            elif name == "delete_ticket_status":
+                import ticket_status_ui
+                page = ticket_status_ui.delete_ticket_status(
+                    ctx, str(params["code"]), parent_callback="v52:ticketsettings")
+            elif name == "set_ticket_status":
+                import ticket_status_ui
+                selected_ticket = str(params["ticket_id"])
+                page = ticket_status_ui.set_ticket_status(
+                    ctx, selected_ticket, str(params["code"]),
+                    parent_callback=f"v52:ticket:{selected_ticket}")
+            elif name == "list_tiers":
+                import tier_admin_ui
+                page = tier_admin_ui.list_tiers(ctx)
+            elif name == "begin_tier_new":
+                import tier_admin_ui
+                page = tier_admin_ui.begin_tier_new(ctx)
+            elif name == "begin_tier_edit":
+                import tier_admin_ui
+                page = tier_admin_ui.begin_tier_edit(
+                    ctx, str(params["actor_type"]), str(params["code"]))
+            elif name == "delete_tier":
+                import tier_admin_ui
+                page = tier_admin_ui.delete_tier(
+                    ctx, str(params["actor_type"]), str(params["code"]))
             elif name == "close_ticket":
                 import support_ui
                 page = support_ui.reply_or_escalate(
@@ -1986,7 +2025,7 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         + "\n\n" + summary
                         + "\n\nپاسخ خود را در پیام بعدی ارسال کنید.",
                         persona=persona, page_kind="form",
-                        rows=support_ui.ticket_lifecycle_rows(
+                        rows=support_ui.ticket_page_rows(
                             ticket_id, ticket.get("status"),
                             is_operator=(persona in ("admin", "rep")), is_author=is_author),
                     )
@@ -2214,6 +2253,16 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 from ui_v52 import render_page
                 text, rows = goods_ui.begin_product_price(ctx, int(params["product_id"]))
                 page = render_page("💵 تغییر قیمت", text, persona="admin", rows=rows)
+            elif name == "begin_product_guide":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.begin_product_guide(ctx, int(params["product_id"]))
+                page = render_page("📘 راهنمای استفاده محصول", text, persona="admin", rows=rows)
+            elif name == "clear_product_guide":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.clear_product_guide(ctx, int(params["product_id"]))
+                page = render_page("📘 راهنمای استفاده محصول", text, persona="admin", rows=rows)
             elif name == "preview_product_delete":
                 import goods_ui
                 from ui_v52 import render_page
@@ -2310,6 +2359,22 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 page = _v52_begin_manual_import(ctx, int(params["panel_id"]))
             elif name == "begin_digital_import":
                 page = _v52_begin_digital_import(ctx, int(params["product_id"]))
+            elif name == "confirm_digital_import":
+                import inventory_admin_ui
+                page = inventory_admin_ui.confirm_digital_import(
+                    ctx, str(params["token"]), parent_callback="v52:shop")
+            elif name == "cancel_digital_import":
+                import inventory_admin_ui
+                page = inventory_admin_ui.cancel_digital_import(
+                    ctx, str(params["token"]), parent_callback="v52:shop")
+            elif name == "confirm_manual_import":
+                import inventory_admin_ui
+                page = inventory_admin_ui.confirm_manual_import(
+                    ctx, str(params["token"]), parent_callback="v52:panels")
+            elif name == "cancel_manual_import":
+                import inventory_admin_ui
+                page = inventory_admin_ui.cancel_manual_import(
+                    ctx, str(params["token"]), parent_callback="v52:panels")
             elif name == "resolve_quote_preview":
                 page = _v52_confirmation_page(ctx, persona, str(params["nonce"]))
             elif name == "consume_and_dispatch":
@@ -2586,11 +2651,11 @@ async def _route_v52_fsm_text(update, context):
             return True
         if route.name == "inventory_digital_batch":
             import inventory_admin_ui
-            items = [line.strip() for line in text_value.splitlines() if line.strip()]
-            if not items:
-                raise ValueError("هیچ قلمی ارسال نشد.")
+            # The raw text goes to the parser rather than a pre-split list, so the
+            # --- / ### separators can group multi-line items into one record.
             page = inventory_admin_ui.begin_digital_import(
-                ctx, int(payload.get("product_id", 0)), items, parent_callback="v52:shop")
+                ctx, int(payload.get("product_id", 0)), text_value,
+                parent_callback="v52:shop")
             await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
             return True
         if route.name == "goods_product_draft":
@@ -2609,6 +2674,43 @@ async def _route_v52_fsm_text(update, context):
                 ctx, payload, text_value,
                 parent_callback=str(route.params.get("parent_callback") or "v52:shop"))
             page = render_page("💵 تغییر قیمت", text, persona="admin", rows=rows)
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "goods_product_guide":
+            import goods_ui
+            from ui_v52 import render_page
+            text, rows = goods_ui.apply_product_guide(
+                ctx, payload, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:shop"))
+            page = render_page("📘 راهنمای استفاده محصول", text, persona="admin", rows=rows)
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "ticket_status_new":
+            import ticket_status_ui
+            page = ticket_status_ui.apply_ticket_status_new(
+                ctx, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:ticketsettings"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "ticket_status_edit":
+            import ticket_status_ui
+            page = ticket_status_ui.apply_ticket_status_edit(
+                ctx, payload, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:ticketsettings"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "tier_new":
+            import tier_admin_ui
+            page = tier_admin_ui.apply_tier_new(
+                ctx, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:tiers"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "tier_edit":
+            import tier_admin_ui
+            page = tier_admin_ui.apply_tier_edit(
+                ctx, payload, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:tiers"))
             await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
             return True
         await message.reply_text(

@@ -777,11 +777,15 @@ async def _apply_tier(update, context, user_id: int, tier_code: str, origin: str
 
 async def _apply_promotion(update, context, user_id: int, kind: str,
                            parent_rep_id: int | None, origin: str, ref: str) -> bool:
-    """Create the representative record and link it into the hierarchy.
+    """Create the representative record, its financial edge and the base role.
 
-    The row is created through the existing ``add_or_update_rep`` writer, then
-    ``parent_rep_id`` and the base role are set. A promotion is idempotent: a
-    person who is already a representative is refused rather than duplicated.
+    All three writes go through :func:`rep_tree_service.promote_actor` in ONE
+    transaction. The previous implementation wrote ``representatives.parent_rep_id``
+    and never created the matching ``rep_edges`` row, so a freshly promoted
+    representative had no resolvable price chain and every later purchase, renewal
+    and quote failed with «representative must have exactly one active parent edge»
+    — that is ``BUG-TIER-001``. A promotion stays idempotent: a person who is
+    already a representative is refused rather than duplicated.
     """
     query = update.callback_query
     if _rep_row_for(user_id):
@@ -790,24 +794,15 @@ async def _apply_promotion(update, context, user_id: int, kind: str,
     u_info = database.get_bot_user_by_tg_id(user_id) or {}
     name = str(u_info.get("full_name") or u_info.get("username") or f"rep-{user_id}")
     try:
-        database.add_or_update_rep(
+        import rep_tree_service
+        rep_tree_service.promote_actor(
+            {"actor_tg_id": int(getattr(update.effective_user, "id", 0) or 0), "rep_id": None},
+            int(user_id),
             rep_code=f"rep-{int(user_id)}",
             name=name,
-            telegram_id=int(user_id),
-            group_id=None,
-            topic_id=None,
+            parent_rep_id=parent_rep_id,
             scope_filter=str(u_info.get("username") or ""),
         )
-        with database.get_db() as conn:
-            conn.execute(
-                "UPDATE representatives SET parent_rep_id=?, tier='normal' WHERE telegram_id=?",
-                (int(parent_rep_id) if parent_rep_id else None, int(user_id)),
-            )
-            conn.execute(
-                "UPDATE bot_users SET role='rep', registration_status='approved' "
-                "WHERE telegram_id=?", (int(user_id),),
-            )
-            conn.commit()
     except Exception:
         logger.exception("Promotion failed for %s", user_id)
         await query.answer("❌ ارتقاء ناموفق بود؛ لاگ سرور را بررسی کنید.", show_alert=True)

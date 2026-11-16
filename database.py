@@ -2062,6 +2062,94 @@ def ensure_profile_notes_table(conn) -> None:
     )
 
 
+_TICKET_STATUSES_DDL = """
+CREATE TABLE IF NOT EXISTS ticket_statuses (
+    code TEXT PRIMARY KEY,
+    title_fa TEXT NOT NULL,
+    emoji TEXT NOT NULL DEFAULT '',
+    group_key TEXT NOT NULL DEFAULT 'open',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    is_system INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+# The four lifecycle states the operator has always seen. They are seeded as
+# system rows so an existing deployment keeps behaving identically, and the root
+# can add, rename, recolour, reorder or disable any of them afterwards.
+#
+# The wording is part of a frozen contract, not free copy: every "open" state
+# must read as «باز» and the answered state must mention «پاسخ», because
+# ``tests/test_v52_bugfix_s52.py`` asserts exactly that against
+# ``support_service.ticket_status_label``. Seeding a different wording silently
+# broke that contract, so the labels below are the ones the contract pins.
+_TICKET_STATUS_SEED = (
+    ("unseen", "باز", "🟢", "open", 10),
+    ("escalated", "باز (ارجاع‌شده)", "🟠", "open", 20),
+    ("answered", "در حال بررسی / پاسخ‌داده‌شده", "🟡", "answered", 30),
+    ("closed", "بسته شده", "🔴", "closed", 40),
+)
+
+# Titles an earlier build of this catalog seeded for the two rows whose wording
+# violated the contract above. A system row still carrying one of these was never
+# renamed by the operator, so reconciling it is safe; a row the root did rename is
+# left exactly as the operator left it.
+_SUPERSEDED_STATUS_TITLES: dict[str, tuple[str, ...]] = {
+    "escalated": ("ارجاع‌شده",),
+    "answered": ("در حال بررسی",),
+}
+
+
+def ensure_ticket_statuses_table(conn) -> None:
+    """Create and seed the dynamic ticket-status catalog on first use.
+
+    Lazy and idempotent for the same reason as the notes table: a restored
+    backup or an audit clone predates ``init_db``. Seeding uses
+    ``INSERT OR IGNORE`` so an operator's own edits are never overwritten, and a
+    system row that still carries a superseded wording is reconciled to the
+    contract wording once — an operator rename is never touched.
+    """
+    conn.execute(_TICKET_STATUSES_DDL)
+    conn.executemany(
+        "INSERT OR IGNORE INTO ticket_statuses("
+        "code,title_fa,emoji,group_key,sort_order,is_active,is_system,"
+        "created_at,updated_at) VALUES(?,?,?,?,?,1,1,0,0)",
+        [(code, title, emoji, group, order) for code, title, emoji, group, order
+         in _TICKET_STATUS_SEED],
+    )
+    for code, title, emoji, group, order in _TICKET_STATUS_SEED:
+        superseded = _SUPERSEDED_STATUS_TITLES.get(code)
+        if not superseded:
+            continue
+        conn.execute(
+            "UPDATE ticket_statuses SET title_fa=?,emoji=?,group_key=?,sort_order=? "
+            "WHERE code=? AND is_system=1 AND title_fa IN ("
+            + ",".join("?" for _ in superseded) + ")",
+            (title, emoji, group, order, code, *superseded),
+        )
+
+
+_DIGITAL_PRODUCT_GUIDE_DDL = (
+    "ALTER TABLE digital_products ADD COLUMN usage_guide TEXT NOT NULL DEFAULT ''"
+)
+
+
+def ensure_product_usage_guide_column(conn) -> None:
+    """Add ``digital_products.usage_guide`` on first use.
+
+    A nineteenth migration file is not allowed (the schema_migrations count is
+    frozen at 18), so the column is added lazily and idempotently. A restored
+    backup or an audit clone predates ``init_db`` and needs the same guarantee.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(digital_products)")}
+    if not columns:
+        return
+    if "usage_guide" not in columns:
+        conn.execute(_DIGITAL_PRODUCT_GUIDE_DDL)
+
+
 def get_profile_lifetime_totals(tg_id: int, rep_id: int | None = None) -> dict:
     """Lifetime deposits and purchases for one person, from the append-only ledger.
 

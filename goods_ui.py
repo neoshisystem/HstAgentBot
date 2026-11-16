@@ -692,12 +692,97 @@ def begin_product_edit(ctx: Any, product_id: int, *, parent_callback: str | None
             f"قیمت کاربر: {int(row['user_price']):,} تومان",
             f"وضعیت: {'فعال' if row['is_active'] else 'غیرفعال'}",
         ]
+        guide = ""
+        try:
+            import goods_service
+            guide = goods_service.get_product_usage_guide(pid)
+        except (TypeError, ValueError):
+            guide = ""
+        lines.append(
+            "📘 راهنمای استفاده: " + (f"{len(guide)} کاراکتر ثبت شده" if guide else "ثبت نشده")
+        )
         rows = [
             [button("💵 تغییر قیمت پایه", f"v52:shop:price:{pid}")],
+            [button("📘 راهنمای استفاده / توضیحات محصول", f"v52:shop:guide:{pid}")],
             [button("🔁 فعال/غیرفعال کردن", f"v52:shop:toggle:{pid}")],
             [button("بازگشت به محصول", f"v52:shop:product:{pid}")],
         ]
         return "\n".join(lines), rows
+    except (TypeError, ValueError, PermissionError) as exc:
+        return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
+
+
+def begin_product_guide(ctx: Any, product_id: int, *, parent_callback: str | None = "v52:shop"):
+    """Arm the usage-guide editor and show the current text. Returns (text, rows)."""
+    try:
+        _require_root(ctx)
+        pid = _positive(product_id, "product_id")
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT id,title FROM digital_products WHERE id=?", (pid,)
+            ).fetchone()
+        if row is None:
+            raise ValueError("محصول موردنظر یافت نشد.")
+        if str(_value(ctx, "chat_type", "private")).lower() != "private":
+            raise PermissionError("ویرایش راهنمای محصول فقط در پیوی مدیریت انجام می‌شود.")
+        import goods_service
+        guide = goods_service.get_product_usage_guide(pid)
+        import v52_router
+        v52_router.DEFAULT_FSM.set(
+            ctx, "goods_product_guide", payload={"product_id": pid},
+            parent_callback=parent_callback, now=_now())
+        text = (
+            f"📘 راهنمای استفاده محصول #{pid} · {row['title']}\n\n"
+            + (f"متن فعلی ({len(guide)} کاراکتر):\n{guide}\n\n" if guide else "هنوز راهنمایی ثبت نشده است.\n\n")
+            + "این متن هنگام خرید همراه با محتوای تحویل برای خریدار ارسال می‌شود. "
+            "برای ثبت متن جدید، آن را در پیام بعدی ارسال کنید. "
+            "برای پاک کردن راهنما، عبارت «حذف» را بفرستید."
+        )
+        rows = [
+            [button("🗑 پاک کردن راهنما", f"v52:shop:guideclear:{pid}")],
+            [button("بازگشت به ویرایش محصول", f"v52:shop:edit:{pid}")],
+        ]
+        return text, rows
+    except (TypeError, ValueError, PermissionError) as exc:
+        return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
+
+
+def apply_product_guide(ctx: Any, payload: Mapping[str, Any], value: Any, *,
+                        parent_callback: str | None = "v52:shop"):
+    """Persist the pasted guide text. Returns (text, rows)."""
+    try:
+        _require_root(ctx)
+        pid = _positive(payload.get("product_id"), "product_id")
+        text = str(value or "").strip()
+        import goods_service
+        if text in {"حذف", "پاک", "clear", "-"}:
+            goods_service.set_product_usage_guide(pid, "")
+            body = "راهنمای استفاده پاک شد."
+        else:
+            result = goods_service.set_product_usage_guide(pid, text)
+            body = (
+                "راهنمای استفاده ثبت شد.\n"
+                f"طول متن: {result['length']} کاراکتر\n"
+                "این متن از این پس همراه هر تحویل این محصول برای خریدار ارسال می‌شود."
+            )
+        return body, [
+            [button("📘 مشاهده/ویرایش راهنما", f"v52:shop:guide:{pid}")],
+            [button("بازگشت به ویرایش محصول", f"v52:shop:edit:{pid}")],
+        ]
+    except (TypeError, ValueError, PermissionError) as exc:
+        return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
+
+
+def clear_product_guide(ctx: Any, product_id: int, *, parent_callback: str | None = "v52:shop"):
+    """Drop a product's usage guide. Returns (text, rows)."""
+    try:
+        _require_root(ctx)
+        pid = _positive(product_id, "product_id")
+        import goods_service
+        goods_service.set_product_usage_guide(pid, "")
+        return ("راهنمای استفاده پاک شد.", [
+            [button("بازگشت به ویرایش محصول", f"v52:shop:edit:{pid}")],
+        ])
     except (TypeError, ValueError, PermissionError) as exc:
         return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
 

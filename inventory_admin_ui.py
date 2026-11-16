@@ -1,4 +1,12 @@
-"""Root-only private import wizards for manual panel pools and digital inventory."""
+"""Root-only private import wizards for manual panel pools and digital inventory.
+
+Both wizards are two-step: a preview that validates and masks the batch, then a
+confirmation that performs the insert. The parsed batch is handed between the two
+steps through :mod:`inventory_import_service`, because the preview's local
+variables do not survive the round trip through Telegram — the FSM entry that
+carried the operator's text is consumed before the preview is even rendered, so a
+confirmation callback wired back to the entry handler silently dropped the batch.
+"""
 from __future__ import annotations
 
 import json
@@ -6,10 +14,23 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Callable
 
 import config
+import inventory_import_service
+from inventory_parser import (
+    InventoryParseError,
+    describe_batch,
+    parse_batch,
+    resolve_mode,
+)
 from ui_v52 import button, render_error, render_page
 
 MAX_BATCH_ITEMS = 100
 MAX_ITEM_BYTES = 8192
+
+_MODE_FA = {
+    "auto": "خودکار (بر اساس جداکننده)",
+    "line": "هر خط یک قلم",
+    "block": "هر بلوک بین --- یا ### یک قلم چندخطی",
+}
 
 
 def _value(obj: Any, key: str, default=None):
@@ -41,6 +62,41 @@ def _private(ctx: Any) -> bool:
     return str(_value(ctx, "chat_type", "private")).lower() == "private"
 
 
+def _actor(ctx: Any) -> int:
+    return _positive(_value(ctx, "actor_tg_id", _value(ctx, "telegram_id")), "actor_tg_id")
+
+
+def _bot(ctx: Any) -> int:
+    return _positive(_value(ctx, "bot_id"), "bot_id")
+
+
+def _db():
+    import database
+    return database.get_db()
+
+
+def _default_stager(ctx: Any, *, kind: str, target_id: int, items: list[str],
+                    meta: dict[str, Any], now: int | None) -> dict[str, Any]:
+    """Persist a previewed batch in the real staging table.
+
+    Injected as a callable so the UI layer stays unit-testable without a database,
+    exactly like the existing ``repository=`` and ``import_fn=`` seams.
+    """
+    with _db() as conn:
+        staged = inventory_import_service.stage(
+            conn,
+            actor_tg_id=_actor(ctx),
+            bot_id=_bot(ctx),
+            kind=kind,
+            target_id=target_id,
+            items=items,
+            meta=meta,
+            now=now,
+        )
+        conn.commit()
+        return staged
+
+
 def _batch(values: Any, label: str) -> list[str]:
     if isinstance(values, str):
         items = [line.strip() for line in values.splitlines() if line.strip()]
@@ -60,6 +116,25 @@ def _batch(values: Any, label: str) -> list[str]:
     return out
 
 
+def _staged_target(conn, token: str) -> int:
+    """Read a staged row's own target so the compare-and-swap can match it exactly.
+
+    The token is unguessable and already bound to actor, bot and kind, so reading
+    its own target cannot widen anyone's access. It exists because the product or
+    panel id does not fit in Telegram's 64-byte callback data alongside the token.
+    """
+    inventory_import_service.ensure_staging_table(conn)
+    row = conn.execute(
+        "SELECT target_id FROM inventory_import_staging WHERE token=?", (token,)
+    ).fetchone()
+    if row is None:
+        raise ValueError("پیش‌نمایش ورود موجودی یافت نشد یا منقضی شده است.")
+    return int(row[0])
+
+
+# --------------------------------------------------------------------------- #
+# Manual panel pool
+# --------------------------------------------------------------------------- #
 def begin_manual_import(
     ctx: Any,
     panel_id: int,
@@ -74,6 +149,7 @@ def begin_manual_import(
     confirm: bool = False,
     repository=None,
     encryptor: Callable[[str, str], str] | None = None,
+    stager: Callable[..., dict[str, Any]] | None = None,
     now: int | None = None,
     parent_callback: str | None = None,
 ):
@@ -108,13 +184,30 @@ def begin_manual_import(
             raise ValueError("expires_at must be empty unless time_mode=dated")
         masked_schemes = sorted({item.split(":", 1)[0].lower() for item in validated})
         if not confirm:
+            staged = (stager or _default_stager)(
+                ctx,
+                kind="manual_pool",
+                target_id=pid,
+                items=list(validated),
+                meta={
+                    "external_identifier": identifier,
+                    "quota_mode": quota_mode,
+                    "quota_bytes": quota_bytes,
+                    "used_bytes": used_bytes,
+                    "time_mode": time_mode,
+                    "expires_at": expires_at,
+                },
+                now=now,
+            )
             return render_page(
                 "پیش‌نمایش ورود Pool دستی",
                 f"پنل: {pid}\nشناسه خارجی: {identifier}\nتعداد URI معتبر: {len(validated)}\n"
-                f"پروتکل‌ها: {', '.join(masked_schemes)}\n"
-                "مقدار URI، credential یا متن کانفیگ نمایش داده نمی‌شود. هنوز هیچ رکوردی درج نشده است.",
+                f"پروتکل‌ها: {', '.join(masked_schemes)}\n\n"
+                "مقدار URI، credential یا متن کانفیگ نمایش داده نمی‌شود. "
+                "هنوز هیچ رکوردی درج نشده است.",
                 persona="admin", page_kind="preview", parent_callback=parent_callback,
-                rows=[[button("تأیید ورود batch", f"v52:poolimport:{pid}")]],
+                rows=[[button("✅ تأیید ورود batch", staged["callback_confirm"]),
+                       button("✖️ لغو", staged["callback_cancel"])]],
             )
         if repository is None:
             raise ValueError("ManualPoolRepository injection is required for confirmed import")
@@ -134,38 +227,127 @@ def begin_manual_import(
             "مقادیر حساس ذخیره رمزنگاری شده‌اند و در این صفحه نشان داده نمی‌شوند.",
             persona="admin", page_kind="result", parent_callback=parent_callback,
         )
+    except (TypeError, ValueError, PermissionError, InventoryParseError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+
+
+def confirm_manual_import(
+    ctx: Any,
+    token: str,
+    *,
+    repository=None,
+    encryptor: Callable[[str, str], str] | None = None,
+    now: int | None = None,
+    parent_callback: str | None = None,
+):
+    """Consume a staged manual-pool batch and perform the real insert."""
+    try:
+        if not _root(ctx):
+            raise PermissionError("manual pool import is root-only")
+        if not _private(ctx):
+            raise PermissionError("manual pool import is private-DM only")
+        with _db() as conn:
+            staged = inventory_import_service.consume(
+                conn, token=token, actor_tg_id=_actor(ctx), bot_id=_bot(ctx),
+                kind="manual_pool", target_id=_staged_target(conn, token), now=now,
+            )
+            conn.commit()
+        meta = staged["meta"]
+        return begin_manual_import(
+            ctx,
+            int(staged["target_id"]),
+            str(meta.get("external_identifier") or ""),
+            staged["items"],
+            quota_mode=str(meta.get("quota_mode") or "unknown"),
+            quota_bytes=meta.get("quota_bytes"),
+            used_bytes=meta.get("used_bytes"),
+            time_mode=str(meta.get("time_mode") or "unknown"),
+            expires_at=meta.get("expires_at"),
+            confirm=True,
+            repository=repository,
+            encryptor=encryptor,
+            now=now,
+            parent_callback=parent_callback,
+        )
+    except (TypeError, ValueError, PermissionError, InventoryParseError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+
+
+def cancel_manual_import(ctx: Any, token: str, *, now: int | None = None,
+                         parent_callback: str | None = None):
+    """Drop a staged manual-pool batch without inserting anything."""
+    try:
+        if not _root(ctx):
+            raise PermissionError("manual pool import is root-only")
+        with _db() as conn:
+            inventory_import_service.cancel(
+                conn, token=token, actor_tg_id=_actor(ctx), bot_id=_bot(ctx), now=now)
+            conn.commit()
+        return render_page(
+            "ورود Pool لغو شد",
+            "هیچ رکوردی درج نشد و پیش‌نمایش ذخیره‌شده پاک شد.",
+            persona="admin", page_kind="result",
+            parent_callback=parent_callback or "v52:panels",
+        )
     except (TypeError, ValueError, PermissionError) as exc:
         return render_error(str(exc), persona="admin", parent_callback=parent_callback)
 
 
+# --------------------------------------------------------------------------- #
+# Digital inventory
+# --------------------------------------------------------------------------- #
 def begin_digital_import(
     ctx: Any,
     product_id: int,
     items: Sequence[str] | str,
     *,
     notes: str = "",
+    mode: str = "auto",
     confirm: bool = False,
     import_fn: Callable[..., Any] | None = None,
+    stager: Callable[..., dict[str, Any]] | None = None,
     now: int | None = None,
     parent_callback: str | None = None,
 ):
-    """Preview a bounded digital-inventory batch; confirmed inserts go through goods_service."""
+    """Preview a bounded digital-inventory batch; confirmed inserts go through goods_service.
+
+    ``mode`` selects how the pasted text is split: ``auto`` uses the ``---`` /
+    ``###`` block separators when they are present and otherwise one item per
+    line, ``line`` forces one item per line, and ``block`` forces every block
+    between separators to be a single multi-line item.
+    """
     try:
         if not _root(ctx):
             raise PermissionError("digital inventory import is root-only")
         if not _private(ctx):
             raise PermissionError("digital inventory secrets must be entered in private DM")
         pid = _positive(product_id, "product_id")
-        values = _batch(items, "items")
+        if isinstance(items, str):
+            effective_mode = resolve_mode(items, mode)
+            values = parse_batch(items, mode=mode)
+        else:
+            effective_mode = "line"
+            values = _batch(items, "items")
         if len(str(notes).encode("utf-8")) > 1000:
             raise ValueError("notes exceeds the size limit")
         if not confirm:
+            staged = (stager or _default_stager)(
+                ctx,
+                kind="digital_inventory",
+                target_id=pid,
+                items=values,
+                meta={"notes": str(notes or ""), "mode": effective_mode},
+                now=now,
+            )
             return render_page(
                 "پیش‌نمایش ورود موجودی دیجیتال",
-                f"محصول: {pid}\nتعداد اقلام: {len(values)}\n"
-                "هیچ insert انجام نشده است. مقادیر محرمانه در این پیش‌نمایش و لاگ‌ها نشان داده نمی‌شوند.",
+                f"محصول: {pid}\n{describe_batch(values)}\n"
+                f"حالت تقسیم‌بندی: {_MODE_FA.get(effective_mode, effective_mode)}\n\n"
+                "هیچ insert انجام نشده است. مقادیر محرمانه در این پیش‌نمایش و لاگ‌ها "
+                "نشان داده نمی‌شوند.",
                 persona="admin", page_kind="preview", parent_callback=parent_callback,
-                rows=[[button("تأیید ورود موجودی", f"v52:inventory:{pid}")]],
+                rows=[[button("✅ تأیید ورود موجودی", staged["callback_confirm"]),
+                       button("✖️ لغو", staged["callback_cancel"])]],
             )
         if import_fn is None:
             from goods_service import import_inventory as import_fn
@@ -178,8 +360,76 @@ def begin_digital_import(
             "فروش فقط پس از commit سرویس inventory امکان‌پذیر است.",
             persona="admin", page_kind="result", parent_callback=parent_callback,
         )
+    except (TypeError, ValueError, PermissionError, InventoryParseError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+
+
+def confirm_digital_import(
+    ctx: Any,
+    token: str,
+    *,
+    import_fn: Callable[..., Any] | None = None,
+    now: int | None = None,
+    parent_callback: str | None = None,
+):
+    """Consume a staged digital batch and insert it for real.
+
+    This is the step that was missing: the confirmation callback used to be wired
+    to the *entry* handler, so the parsed batch was dropped and nothing was ever
+    inserted.
+    """
+    try:
+        if not _root(ctx):
+            raise PermissionError("digital inventory import is root-only")
+        if not _private(ctx):
+            raise PermissionError("digital inventory secrets must be entered in private DM")
+        with _db() as conn:
+            staged = inventory_import_service.consume(
+                conn, token=token, actor_tg_id=_actor(ctx), bot_id=_bot(ctx),
+                kind="digital_inventory", target_id=_staged_target(conn, token), now=now,
+            )
+            conn.commit()
+        meta = staged["meta"]
+        return begin_digital_import(
+            ctx,
+            int(staged["target_id"]),
+            staged["items"],
+            notes=str(meta.get("notes") or ""),
+            mode=str(meta.get("mode") or "line"),
+            confirm=True,
+            import_fn=import_fn,
+            now=now,
+            parent_callback=parent_callback,
+        )
+    except (TypeError, ValueError, PermissionError, InventoryParseError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+
+
+def cancel_digital_import(ctx: Any, token: str, *, now: int | None = None,
+                          parent_callback: str | None = None):
+    """Drop a staged digital batch without inserting anything."""
+    try:
+        if not _root(ctx):
+            raise PermissionError("digital inventory import is root-only")
+        with _db() as conn:
+            inventory_import_service.cancel(
+                conn, token=token, actor_tg_id=_actor(ctx), bot_id=_bot(ctx), now=now)
+            conn.commit()
+        return render_page(
+            "ورود موجودی لغو شد",
+            "هیچ رکوردی درج نشد و پیش‌نمایش ذخیره‌شده پاک شد.",
+            persona="admin", page_kind="result",
+            parent_callback=parent_callback or "v52:shop",
+        )
     except (TypeError, ValueError, PermissionError) as exc:
         return render_error(str(exc), persona="admin", parent_callback=parent_callback)
 
 
-__all__ = ["begin_manual_import", "begin_digital_import"]
+__all__ = [
+    "begin_digital_import",
+    "begin_manual_import",
+    "cancel_digital_import",
+    "cancel_manual_import",
+    "confirm_digital_import",
+    "confirm_manual_import",
+]

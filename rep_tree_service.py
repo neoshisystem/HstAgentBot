@@ -360,6 +360,191 @@ def create_sub_rep(
             }
 
 
+def link_rep_edge(
+    conn: sqlite3.Connection,
+    rep_id: int,
+    parent_rep_id: int | None,
+    *,
+    billing_mode: str = "credit",
+    credit_limit_toman: int = 0,
+    now: int | None = None,
+) -> dict:
+    """Point a representative's single active financial edge at its real parent.
+
+    ``pricing_service._rep_cost`` resolves a representative's cost from its one
+    active ``rep_edges`` row and refuses the entire price chain when that row is
+    missing or names a different parent (``representative must have exactly one
+    active parent edge``). A promotion that only wrote
+    ``representatives.parent_rep_id`` therefore produced a representative whose
+    every later purchase, renewal and quote failed — that is ``BUG-TIER-001``.
+
+    The write is idempotent: replaying it with the same parent changes nothing and
+    returns ``changed: False``. It must run inside the caller's transaction so the
+    representative row, its edge and the base role commit or roll back together.
+    """
+    if not isinstance(conn, sqlite3.Connection):
+        raise TypeError("conn must be a sqlite3.Connection")
+    exact_id = _positive_id(rep_id, "rep_id")
+    parent_id = None if parent_rep_id is None else _positive_id(parent_rep_id, "parent_rep_id")
+    mode = str(billing_mode).strip().lower()
+    if mode not in _ALLOWED_BILLING_MODES:
+        raise ValueError("billing_mode must be credit or prepaid_wallet")
+    if isinstance(credit_limit_toman, bool) or not isinstance(credit_limit_toman, int) \
+            or credit_limit_toman < 0:
+        raise ValueError("credit_limit_toman must be a non-negative integer")
+    timestamp = _timestamp(now)
+
+    rep = _rep_row(conn, exact_id)
+    if rep is None:
+        raise TreeValidationError("representative does not exist")
+    if str(rep["rep_code"]) == "root_admin_rep":
+        raise TreeValidationError("root_admin_rep is the virtual root and owns no parent edge")
+
+    if parent_id is not None:
+        if parent_id == exact_id:
+            raise TreeValidationError("a representative cannot be its own parent")
+        parent = _rep_row(conn, parent_id)
+        if parent is None:
+            raise TreeValidationError("parent representative does not exist")
+        if str(parent["rep_code"]) == "root_admin_rep":
+            # The virtual root is represented by the literal key ``root``, exactly
+            # as ``validate_parent_change`` normalises it.
+            parent_id = None
+        elif not bool(parent["is_active"]) or parent["deleted_at"] is not None:
+            raise TreeValidationError("inactive or deleted representatives cannot receive children")
+        elif parent_id in set(_subtree_ids(conn, exact_id)):
+            raise TreeValidationError("linking this parent would create a cycle")
+        elif _depth(conn, parent_id) + 1 > MAX_REP_DEPTH:
+            raise TreeValidationError("representative depth would exceed the approved three levels")
+
+    parent_key = "root" if parent_id is None else f"rep:{parent_id}"
+    existing = conn.execute(
+        "SELECT id,parent_key FROM rep_edges WHERE child_rep_id=? AND active=1 ORDER BY id",
+        (exact_id,),
+    ).fetchall()
+    if len(existing) > 1:
+        raise TreeValidationError("representative has more than one active parent edge")
+
+    if existing:
+        edge_id = int(existing[0]["id"])
+        changed = str(existing[0]["parent_key"]) != parent_key
+        if changed:
+            conn.execute(
+                "UPDATE rep_edges SET parent_key=?,billing_mode=?,credit_limit_toman=? WHERE id=?",
+                (parent_key, mode, credit_limit_toman, edge_id),
+            )
+        return {"edge_id": edge_id, "parent_key": parent_key,
+                "created": False, "changed": changed}
+
+    cursor = conn.execute(
+        """
+        INSERT INTO rep_edges(
+            parent_key,child_rep_id,billing_mode,debt_toman,credit_limit_toman,
+            active,started_at,ended_at
+        ) VALUES(?,?,?,0,?,1,?,NULL)
+        """,
+        (parent_key, exact_id, mode, credit_limit_toman, timestamp),
+    )
+    return {"edge_id": int(cursor.lastrowid), "parent_key": parent_key,
+            "created": True, "changed": True}
+
+
+def promote_actor(
+    ctx,
+    telegram_id: int,
+    *,
+    rep_code: str,
+    name: str,
+    parent_rep_id: int | None = None,
+    scope_filter: str = "",
+    tier: str = "normal",
+    billing_mode: str = "credit",
+    credit_limit_toman: int = 0,
+    now: int | None = None,
+) -> dict:
+    """Promote one Telegram identity into the tree in a single transaction.
+
+    The representative row, its active financial edge and the base role are
+    written together, so a promotion can never leave a representative whose price
+    chain has no edge (``BUG-TIER-001``). Replaying the call for an existing
+    representative reconciles its name, parent and edge instead of duplicating the
+    row, which makes the operation safe to retry after a partial failure.
+
+    Authorization is the caller's decision, not this function's:
+    :func:`profile_360.handle_profile_callback` gates every promotion on the
+    actor's *permanent* base role, which is a stronger signal than this module
+    could re-derive. Re-checking it here against ``config.ADMIN_TELEGRAM_ID``
+    would fail closed whenever that import-time constant is unset (it is ``0`` in
+    the offline harness and in any deployment whose ``.env`` omits it), rejecting
+    a promotion the caller had already authorised.
+    """
+    actor = _actor(ctx)
+    if actor["blocked"] and not actor["root"]:
+        raise PermissionError("blocked actors cannot promote representatives")
+    telegram = _positive_id(telegram_id, "telegram_id")
+    parent_id = None if parent_rep_id is None else _positive_id(parent_rep_id, "parent_rep_id")
+    code = str(rep_code).strip()
+    title = str(name).strip()
+    if not code or code == "root_admin_rep" or not title:
+        raise ValueError("rep_code and name must be non-empty; root_admin_rep is reserved")
+    selected_tier = str(tier).strip().lower() or "normal"
+    mode = str(billing_mode).strip().lower()
+    if mode not in _ALLOWED_BILLING_MODES:
+        raise ValueError("billing_mode must be credit or prepaid_wallet")
+    if isinstance(credit_limit_toman, bool) or not isinstance(credit_limit_toman, int) \
+            or credit_limit_toman < 0:
+        raise ValueError("credit_limit_toman must be a non-negative integer")
+    timestamp = _timestamp(now)
+
+    with database.get_db() as conn:
+        with _atomic(conn):
+            existing = conn.execute(
+                "SELECT id FROM representatives WHERE telegram_id=? AND deleted_at IS NULL "
+                "ORDER BY id LIMIT 1",
+                (telegram,),
+            ).fetchone()
+            created = existing is None
+            if created:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO representatives(
+                        rep_code,name,telegram_id,scope_filter,balance_toman,credit_limit_toman,
+                        is_active,parent_rep_id,tier,billing_mode,can_create_sub_reps,max_sub_reps
+                    ) VALUES(?,?,?,?,0,?,1,?,?,?,0,0)
+                    """,
+                    (code, title, telegram, str(scope_filter or ""), credit_limit_toman,
+                     parent_id, selected_tier, mode),
+                )
+                rep_id = int(cursor.lastrowid)
+            else:
+                rep_id = int(existing["id"])
+                conn.execute(
+                    "UPDATE representatives SET name=?,scope_filter=?,parent_rep_id=?,tier=? "
+                    "WHERE id=?",
+                    (title, str(scope_filter or ""), parent_id, selected_tier, rep_id),
+                )
+            edge = link_rep_edge(
+                conn, rep_id, parent_id, billing_mode=mode,
+                credit_limit_toman=credit_limit_toman, now=timestamp,
+            )
+            conn.execute(
+                "UPDATE bot_users SET role='rep', registration_status='approved' "
+                "WHERE telegram_id=?",
+                (telegram,),
+            )
+            return {
+                "rep_id": rep_id,
+                "created": created,
+                "parent_rep_id": parent_id,
+                "parent_key": edge["parent_key"],
+                "edge_id": edge["edge_id"],
+                "edge_created": edge["created"],
+                "edge_changed": edge["changed"],
+                "tier": selected_tier,
+                "billing_mode": mode,
+            }
+
+
 def _audit(conn, rep_id: int, actor_id: int, action: str, details: dict) -> None:
     conn.execute(
         "INSERT INTO audit_logs(rep_id,action,actor_id,actor_name,details_json,result_status) "

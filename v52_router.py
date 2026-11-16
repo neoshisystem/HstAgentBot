@@ -132,9 +132,21 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:shop:edit:([1-9][0-9]{0,17})$"), "begin_product_edit", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:toggle:([1-9][0-9]{0,17})$"), "toggle_product", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:price:([1-9][0-9]{0,17})$"), "begin_product_price", "root", lambda m: {"product_id": int(m[1])}),
+    (re.compile(r"^v52:shop:guide:([1-9][0-9]{0,17})$"), "begin_product_guide", "root DM", lambda m: {"product_id": int(m[1])}),
+    (re.compile(r"^v52:shop:guideclear:([1-9][0-9]{0,17})$"), "clear_product_guide", "root DM", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:delete:([1-9][0-9]{0,17}):confirm$"), "confirm_product_delete", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:delete:([1-9][0-9]{0,17})$"), "preview_product_delete", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:tickets$"), "list_tickets", "actor", lambda m: {}),
+    (re.compile(r"^v52:ticketsettings$"), "ticket_status_settings", "root", lambda m: {}),
+    (re.compile(r"^v52:ticketstatus:new$"), "begin_ticket_status_new", "root DM", lambda m: {}),
+    (re.compile(r"^v52:ticketstatus:edit:([a-z][a-z0-9_]{1,29})$"), "begin_ticket_status_edit", "root DM", lambda m: {"code": m[1]}),
+    (re.compile(r"^v52:ticketstatus:toggle:([a-z][a-z0-9_]{1,29})$"), "toggle_ticket_status", "root", lambda m: {"code": m[1]}),
+    (re.compile(r"^v52:ticketstatus:del:([a-z][a-z0-9_]{1,29})$"), "delete_ticket_status", "root", lambda m: {"code": m[1]}),
+    (re.compile(r"^v52:ticketstatus:set:([1-9][0-9]{0,17}):([a-z][a-z0-9_]{1,29})$"), "set_ticket_status", "operator", lambda m: {"ticket_id": m[1], "code": m[2]}),
+    (re.compile(r"^v52:tiers$"), "list_tiers", "root", lambda m: {}),
+    (re.compile(r"^v52:tier:new$"), "begin_tier_new", "root DM", lambda m: {}),
+    (re.compile(r"^v52:tier:edit:(rep|end_user):([a-z][a-z0-9_]{1,29})$"), "begin_tier_edit", "root DM", lambda m: {"actor_type": m[1], "code": m[2]}),
+    (re.compile(r"^v52:tier:del:(rep|end_user):([a-z][a-z0-9_]{1,29})$"), "delete_tier", "root", lambda m: {"actor_type": m[1], "code": m[2]}),
     (re.compile(r"^v52:tickets:(open|answered|closed|all)$"), "list_tickets", "actor", lambda m: {"group": m[1]}),
     (re.compile(r"^v52:newticket$"), "begin_new_ticket", "actor", lambda m: {}),
     (re.compile(r"^v52:support:([0-9]{1,18})$"), "begin_ticket", "view authorized", lambda m: {"account_id": int(m[1])}),
@@ -151,6 +163,14 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:forums:([A-Za-z0-9._:-]{1,36})$"), "sync_topics", "root", lambda m: {"owner_key": m[1]}),
     (re.compile(r"^v52:poolimport:([1-9][0-9]{0,17})$"), "begin_manual_import", "root DM", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:inventory:([1-9][0-9]{0,17})$"), "begin_digital_import", "root DM", lambda m: {"product_id": int(m[1])}),
+    # Two-step import confirmations. The staged batch is bound to actor+bot+kind
+    # and single-use, so the token alone is enough to authorise the insert; the
+    # target id is read back from the staged row because it does not fit inside
+    # Telegram's 64-byte callback data alongside the token.
+    (re.compile(r"^v52:invok:([A-Za-z0-9_-]{24})$"), "confirm_digital_import", "root DM", lambda m: {"token": m[1]}),
+    (re.compile(r"^v52:invno:([A-Za-z0-9_-]{24})$"), "cancel_digital_import", "root DM", lambda m: {"token": m[1]}),
+    (re.compile(r"^v52:poolok:([A-Za-z0-9_-]{24})$"), "confirm_manual_import", "root DM", lambda m: {"token": m[1]}),
+    (re.compile(r"^v52:poolno:([A-Za-z0-9_-]{24})$"), "cancel_manual_import", "root DM", lambda m: {"token": m[1]}),
     (re.compile(r"^v52:q:([A-Za-z0-9_-]{16,40})$"), "resolve_quote_preview", "actor+seller", lambda m: {"nonce": m[1]}),
     (re.compile(r"^v52:ok:([A-Za-z0-9_-]{16,40})$"), "consume_and_dispatch", "same actor/bot/action/revision", lambda m: {"nonce": m[1]}),
     (re.compile(r"^v52:no:([A-Za-z0-9_-]{16,40})$"), "cancel_confirmation", "same actor/bot", lambda m: {"nonce": m[1]}),
@@ -206,7 +226,10 @@ class DraftFSM:
                             "panel_connection_url", "panel_connection_token",
                             "inventory_manual_batch", "inventory_digital_batch",
                             "ownership_transfer", "goods_product_draft",
-                            "goods_product_price", "panel_connection_name",
+                            "goods_product_price", "goods_product_guide",
+                            "panel_connection_name",
+                            "ticket_status_new", "ticket_status_edit",
+                            "tier_new", "tier_edit",
                             "domain_hostname"}:
             raise ValueError("unknown v5.2 FSM state")
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:
@@ -234,7 +257,10 @@ class DraftFSM:
                              "panel_connection_url", "panel_connection_token",
                              "inventory_manual_batch", "inventory_digital_batch",
                              "ownership_transfer", "goods_product_draft",
-                             "goods_product_price", "panel_connection_name",
+                             "goods_product_price", "goods_product_guide",
+                             "panel_connection_name",
+                             "ticket_status_new", "ticket_status_edit",
+                             "tier_new", "tier_edit",
                              "domain_hostname"},
                     "photo": {"support_ticket_body", "support_reply"}}
         if event not in accepted or entry.state not in accepted[event]:

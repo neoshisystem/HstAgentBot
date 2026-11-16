@@ -521,7 +521,9 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🏷 تعرفه‌ها", callback_data="v52:plans"),
              InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
             [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets"),
-             InlineKeyboardButton("🚨 گزارش‌های تخلف", callback_data="v52:abuse:list")],
+             InlineKeyboardButton("⚙️ تنظیمات تیکت و وضعیت‌ها", callback_data="v52:ticketsettings")],
+            [InlineKeyboardButton("🚨 گزارش‌های تخلف", callback_data="v52:abuse:list"),
+             InlineKeyboardButton("🎖 سطوح کاربری و قیمت‌گذاری", callback_data="v52:tiers")],
             [InlineKeyboardButton("🧩 همگام‌سازی فروم", callback_data="v52:forums:root")],
             # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
             [InlineKeyboardButton("👥 مدیریت نماینده‌ها", callback_data="admin:reps"),

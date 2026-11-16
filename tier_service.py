@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -300,3 +301,280 @@ def is_first_purchase(conn: sqlite3.Connection, actor_tg_id: int) -> bool:
         return True
     except sqlite3.Error:
         return False
+
+
+# --------------------------------------------------------------------------- #
+# Tier catalog administration
+#
+# ``tier_policies`` was read-only from the product: ``pricing_service`` consumed
+# ``discount_bps``, ``tier_service`` consumed ``daily_test_quota`` and
+# ``rep_tree_service`` validated that a tier code existed, but nothing could
+# create, edit or retire a row. These writers are the missing half, and because
+# every reader resolves the policy at call time, an edit here takes effect on the
+# very next price calculation.
+# --------------------------------------------------------------------------- #
+
+TIER_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,29}$")
+ACTOR_TYPES = ("rep", "end_user")
+ACTOR_TYPE_FA = {"rep": "نمایندگی", "end_user": "کاربری"}
+MAX_TIER_TITLE = 40
+MAX_BPS = 10000
+#: The ladder is exact in basis points, but an operator thinks in percent
+#: (``2.5`` means 2.5%). The conversion lives here so both the UI and any future
+#: caller agree on the rounding.
+BPS_PER_PERCENT = 100
+
+#: Every column an operator may set, with its validator. ``rank`` orders the
+#: ladder, the two ``*_bps`` fields are basis points (100 bps = 1%), and the
+#: remaining three are the quota / credit / sales-floor constraints.
+_TIER_FIELDS: dict[str, str] = {
+    "title_fa": "عنوان فارسی",
+    "rank": "رتبه",
+    "discount_bps": "درصد تخفیف",
+    "cashback_bps": "درصد کش‌بک",
+    "daily_test_quota": "سهمیه تست روزانه",
+    "default_credit_limit": "سقف اعتبار پیش‌فرض",
+    "min_monthly_sales_toman": "حداقل فروش ماهانه",
+}
+
+
+class TierPolicyConflict(TierServiceError):
+    """The tier code is already taken, or the row is still in use."""
+
+
+def _clean_actor_type(value: Any) -> str:
+    actor = str(value or "").strip().lower()
+    if actor not in ACTOR_TYPES:
+        raise TierServiceError(
+            "نقش هدف باید «rep» (نمایندگی) یا «end_user» (کاربری) باشد."
+        )
+    return actor
+
+
+def _clean_tier_code(value: Any) -> str:
+    code = str(value or "").strip().lower()
+    if not TIER_CODE_RE.fullmatch(code):
+        raise TierServiceError(
+            "کد سطح باید با حرف کوچک لاتین شروع شود و فقط شامل حروف کوچک، "
+            "رقم و زیرخط باشد (۲ تا ۳۰ کاراکتر)."
+        )
+    return code
+
+
+def _clean_title(value: Any) -> str:
+    title = str(value or "").strip()
+    if not title:
+        raise TierServiceError("عنوان فارسی سطح نمی‌تواند خالی باشد.")
+    if len(title) > MAX_TIER_TITLE:
+        raise TierServiceError(f"عنوان سطح حداکثر {MAX_TIER_TITLE} کاراکتر است.")
+    return title
+
+
+def _clean_int(value: Any, label: str, *, minimum: int = 0, maximum: int | None = None) -> int:
+    if isinstance(value, bool):
+        raise TierServiceError(f"{label} باید یک عدد صحیح باشد.")
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise TierServiceError(f"{label} باید یک عدد صحیح باشد.") from exc
+    if number < minimum or (maximum is not None and number > maximum):
+        bound = f"بین {minimum} و {maximum}" if maximum is not None else f"حداقل {minimum}"
+        raise TierServiceError(f"{label} باید {bound} باشد.")
+    return number
+
+
+def parse_int(value: Any, label: str, *, minimum: int = 0, maximum: int | None = None) -> int:
+    """Validate one operator-supplied integer field, with a Persian message."""
+    return _clean_int(value, label, minimum=minimum, maximum=maximum)
+
+
+def parse_percent_bps(value: Any, label: str) -> int:
+    """Convert an operator-typed percentage (``2.5``) into basis points (``250``)."""
+    text = str(value if value is not None else "").strip()
+    if not text:
+        raise TierServiceError(f"{label} نمی‌تواند خالی باشد.")
+    try:
+        number = float(text)
+    except (TypeError, ValueError) as exc:
+        raise TierServiceError(f"{label} باید یک عدد باشد.") from exc
+    if number != number or number in (float("inf"), float("-inf")):
+        raise TierServiceError(f"{label} باید یک عدد متناهی باشد.")
+    if number < 0 or number * BPS_PER_PERCENT > MAX_BPS:
+        raise TierServiceError(f"{label} باید بین ۰ و ۱۰۰ درصد باشد.")
+    return int(round(number * BPS_PER_PERCENT))
+
+
+def _tier_row_to_dict(row) -> dict[str, Any]:
+    return {
+        "actor_type": str(row[0]),
+        "tier_code": str(row[1]),
+        "title_fa": str(row[2]),
+        "rank": int(row[3]),
+        "discount_bps": int(row[4]),
+        "cashback_bps": int(row[5]),
+        "daily_test_quota": int(row[6]),
+        "default_credit_limit": int(row[7]),
+        "min_monthly_sales_toman": int(row[8]),
+    }
+
+
+_TIER_COLUMNS = (
+    "actor_type,tier_code,title_fa,rank,discount_bps,cashback_bps,"
+    "daily_test_quota,default_credit_limit,min_monthly_sales_toman"
+)
+
+
+def list_tiers(conn, *, actor_type: Any = None) -> list[dict[str, Any]]:
+    """Every tier policy, ordered by target role then ladder rank."""
+    if actor_type is None:
+        rows = conn.execute(
+            "SELECT " + _TIER_COLUMNS + " FROM tier_policies "
+            "ORDER BY CASE actor_type WHEN 'rep' THEN 0 ELSE 1 END, rank, tier_code"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT " + _TIER_COLUMNS + " FROM tier_policies "
+            "WHERE actor_type=? ORDER BY rank, tier_code",
+            (_clean_actor_type(actor_type),),
+        ).fetchall()
+    return [_tier_row_to_dict(row) for row in rows]
+
+
+def get_tier(conn, actor_type: Any, tier_code: Any) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT " + _TIER_COLUMNS + " FROM tier_policies WHERE actor_type=? AND tier_code=?",
+        (_clean_actor_type(actor_type), _clean_tier_code(tier_code)),
+    ).fetchone()
+    return None if row is None else _tier_row_to_dict(row)
+
+
+def tier_usage(conn, actor_type: Any, tier_code: Any) -> dict[str, int]:
+    """How many actors currently sit on this tier, per side of the catalog."""
+    actor = _clean_actor_type(actor_type)
+    code = _clean_tier_code(tier_code)
+    representatives = 0
+    users = 0
+    if actor == "rep":
+        representatives = int(conn.execute(
+            "SELECT COUNT(*) FROM representatives WHERE tier=?", (code,)).fetchone()[0])
+    else:
+        users = int(conn.execute(
+            "SELECT COUNT(*) FROM bot_users WHERE tier=?", (code,)).fetchone()[0])
+    return {"representatives": representatives, "users": users,
+            "total": representatives + users}
+
+
+def create_tier(
+    conn,
+    *,
+    actor_type: Any,
+    tier_code: Any,
+    title_fa: Any,
+    rank: Any = 0,
+    discount_bps: Any = 0,
+    cashback_bps: Any = 0,
+    daily_test_quota: Any = 1,
+    default_credit_limit: Any = 0,
+    min_monthly_sales_toman: Any = 0,
+) -> dict[str, Any]:
+    """Add one tier policy; the code is unique per target role."""
+    actor = _clean_actor_type(actor_type)
+    code = _clean_tier_code(tier_code)
+    if get_tier(conn, actor, code) is not None:
+        raise TierPolicyConflict(f"سطح «{code}» برای این نقش از قبل وجود دارد.")
+    conn.execute(
+        "INSERT INTO tier_policies(" + _TIER_COLUMNS + ") VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            actor, code, _clean_title(title_fa),
+            _clean_int(rank, "رتبه"),
+            _clean_int(discount_bps, "درصد تخفیف", maximum=MAX_BPS),
+            _clean_int(cashback_bps, "درصد کش‌بک", maximum=MAX_BPS),
+            _clean_int(daily_test_quota, "سهمیه تست روزانه"),
+            _clean_int(default_credit_limit, "سقف اعتبار پیش‌فرض"),
+            _clean_int(min_monthly_sales_toman, "حداقل فروش ماهانه"),
+        ),
+    )
+    return get_tier(conn, actor, code)
+
+
+def update_tier(conn, actor_type: Any, tier_code: Any, **fields) -> dict[str, Any]:
+    """Edit one tier policy in place; only the supplied fields change."""
+    actor = _clean_actor_type(actor_type)
+    code = _clean_tier_code(tier_code)
+    current = get_tier(conn, actor, code)
+    if current is None:
+        raise TierServiceError(f"سطح «{code}» برای این نقش یافت نشد.")
+    supplied = {key: value for key, value in fields.items() if value is not None}
+    unknown = sorted(set(supplied) - set(_TIER_FIELDS))
+    if unknown:
+        raise TierServiceError("فیلد ناشناخته: " + ", ".join(unknown))
+    if not supplied:
+        return current
+    assignments: list[str] = []
+    params: list[Any] = []
+    for key, value in supplied.items():
+        if key == "title_fa":
+            assignments.append("title_fa=?")
+            params.append(_clean_title(value))
+        elif key in {"discount_bps", "cashback_bps"}:
+            assignments.append(f"{key}=?")
+            params.append(_clean_int(value, _TIER_FIELDS[key], maximum=MAX_BPS))
+        else:
+            assignments.append(f"{key}=?")
+            params.append(_clean_int(value, _TIER_FIELDS[key]))
+    params.extend([actor, code])
+    conn.execute(
+        "UPDATE tier_policies SET " + ",".join(assignments)
+        + " WHERE actor_type=? AND tier_code=?",
+        params,
+    )
+    return get_tier(conn, actor, code)
+
+
+def delete_tier(conn, actor_type: Any, tier_code: Any) -> dict[str, Any]:
+    """Retire a tier policy, but never while an actor still sits on it.
+
+    Deleting a tier in use would leave ``representatives.tier`` pointing at a code
+    that no longer exists, and the next price calculation would silently fall back
+    to a 0% discount while ``reserve_test_quota`` refused the actor outright. The
+    guard turns that into an explicit, actionable refusal.
+    """
+    actor = _clean_actor_type(actor_type)
+    code = _clean_tier_code(tier_code)
+    if get_tier(conn, actor, code) is None:
+        raise TierServiceError(f"سطح «{code}» برای این نقش یافت نشد.")
+    usage = tier_usage(conn, actor, code)
+    if usage["total"] > 0:
+        raise TierPolicyConflict(
+            f"این سطح در حال استفاده است ({usage['total']} مورد)؛ ابتدا "
+            "کاربران/نمایندگان آن را به سطح دیگری منتقل کنید."
+        )
+    conn.execute(
+        "DELETE FROM tier_policies WHERE actor_type=? AND tier_code=?", (actor, code))
+    return {"actor_type": actor, "tier_code": code, "deleted": True}
+
+
+__all__ = [
+    "ACTOR_TYPES",
+    "ACTOR_TYPE_FA",
+    "BPS_PER_PERCENT",
+    "DailyTestQuotaExceeded",
+    "MAX_BPS",
+    "MAX_TIER_TITLE",
+    "TEHRAN",
+    "TIER_CODE_RE",
+    "TierPolicyConflict",
+    "TierPolicyUnavailable",
+    "TierServiceError",
+    "create_tier",
+    "delete_tier",
+    "finish_test_quota",
+    "get_tier",
+    "is_first_purchase",
+    "list_tiers",
+    "parse_int",
+    "parse_percent_bps",
+    "reserve_test_quota",
+    "tier_usage",
+    "update_tier",
+]

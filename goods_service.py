@@ -220,6 +220,101 @@ def import_inventory(
         return inserted
 
 
+MAX_USAGE_GUIDE_BYTES = 4000
+
+
+def set_product_usage_guide(
+    product_id: int,
+    usage_guide: str,
+    *,
+    conn=None,
+) -> dict[str, Any]:
+    """Store the fixed usage guide shown to the buyer alongside the item.
+
+    A digital product is rarely self-explanatory: an account needs "log in, change
+    the password, do not share", a config needs "import this URI into the client".
+    The guide is product-level, so it is written once and delivered with every
+    item of that product.
+    """
+    product_id = _integer(product_id, "product_id", minimum=1)
+    guide = str(usage_guide or "").strip()
+    if len(guide.encode("utf-8")) > MAX_USAGE_GUIDE_BYTES:
+        raise GoodsValidationError(
+            f"راهنمای استفاده از حد مجاز ({MAX_USAGE_GUIDE_BYTES} بایت) بزرگ‌تر است."
+        )
+    with _database_connection(conn) as db, _atomic(db):
+        _ensure_usage_guide_column(db)
+        product = db.execute(
+            "SELECT id FROM digital_products WHERE id=?", (product_id,)
+        ).fetchone()
+        if product is None:
+            raise GoodsValidationError("محصول موردنظر یافت نشد.")
+        db.execute(
+            "UPDATE digital_products SET usage_guide=? WHERE id=?", (guide, product_id)
+        )
+    return {"product_id": product_id, "usage_guide": guide, "length": len(guide)}
+
+
+def get_product_usage_guide(product_id: int, *, conn=None) -> str:
+    """Read one product's usage guide; an absent column or product reads as empty."""
+    product_id = _integer(product_id, "product_id", minimum=1)
+    with _database_connection(conn) as db:
+        _ensure_usage_guide_column(db)
+        row = db.execute(
+            "SELECT usage_guide FROM digital_products WHERE id=?", (product_id,)
+        ).fetchone()
+    if row is None:
+        return ""
+    return str(row[0] or "")
+
+
+def _ensure_usage_guide_column(db) -> None:
+    import database
+    database.ensure_product_usage_guide_column(db)
+
+
+def compose_delivery_text(
+    product_title: str,
+    item: str,
+    *,
+    usage_guide: str = "",
+    order_id: str | None = None,
+) -> str:
+    """Build the buyer-facing delivery message: guide first, then the item.
+
+    The item is kept verbatim inside a fenced block so a multi-line account or
+    config survives Telegram's HTML rendering and can be copied in one tap. The
+    guide is plain text and never contains the secret.
+    """
+    title = str(product_title or "").strip() or "محصول دیجیتال"
+    body = str(item or "").strip()
+    if not body:
+        raise GoodsValidationError("محتوای تحویل نمی‌تواند خالی باشد.")
+    lines = [f"🧾 <b>{_escape_html(title)}</b>"]
+    if order_id:
+        lines.append(f"شناسه سفارش: <code>{_escape_html(str(order_id))}</code>")
+    lines.append("")
+    lines.append("🔑 <b>محتوای تحویل</b>")
+    lines.append(f"<pre>{_escape_html(body)}</pre>")
+    guide = str(usage_guide or "").strip()
+    if guide:
+        lines.append("")
+        lines.append("📘 <b>راهنمای استفاده</b>")
+        lines.append(_escape_html(guide))
+    lines.append("")
+    lines.append("⚠️ این محتوا فقط یک‌بار برای شما ارسال شده است؛ آن را در جای امن نگه دارید.")
+    return "\n".join(lines)
+
+
+def _escape_html(value: str) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 def reserve_inventory(
     product_id: int,
     order_id: str,

@@ -304,8 +304,23 @@ def ticket_code_label(ticket_id: Any) -> str:
 
 
 def ticket_status_label(status: Any) -> str:
-    """Persian lifecycle label for a raw status value."""
-    return TICKET_STATUS_LABELS.get(str(status or "").strip().lower(), "نامشخص")
+    """Persian lifecycle label for a raw status value.
+
+    The label comes from the operator-editable catalog in
+    :mod:`ticket_status_service`, so a status the root renamed or recoloured is
+    reflected everywhere at once. A database that predates the catalog, or a code
+    that was retired after a ticket was written, falls back to the historic
+    static labels rather than rendering nothing.
+    """
+    text = str(status or "").strip().lower()
+    if not text:
+        return "نامشخص"
+    try:
+        import ticket_status_service
+        with database.get_db() as conn:
+            return ticket_status_service.label_for(conn, text)
+    except Exception:  # noqa: BLE001 - a label must never break a ticket page
+        return TICKET_STATUS_LABELS.get(text, "نامشخص")
 
 
 def _next_ticket_code(conn: sqlite3.Connection) -> str:
@@ -466,10 +481,26 @@ _TICKET_STATUS_GROUPS: dict[str, tuple[str, ...] | None] = {
 }
 
 
+def _catalog_group(group_key: str) -> tuple[str, ...]:
+    """Active catalog codes for a queue group, or () when the catalog is absent."""
+    try:
+        import ticket_status_service
+        with database.get_db() as conn:
+            return ticket_status_service.group_codes(conn, group_key)
+    except Exception:  # noqa: BLE001 - fall back to the historic group
+        return ()
+
+
 def _status_filter(status: str | None, statuses: tuple[str, ...] | None) -> tuple[str, list[Any]]:
-    """Build the status predicate; a named group expands, ``all`` matches everything."""
+    """Build the status predicate; a named group expands, ``all`` matches everything.
+
+    A named group is resolved from the operator catalog first, so a status the
+    root added to a group is picked up without a code change; the historic tuple
+    is the fallback when the catalog is unavailable.
+    """
     if statuses is None and isinstance(status, str) and status in _TICKET_STATUS_GROUPS:
-        statuses = _TICKET_STATUS_GROUPS[status]
+        dynamic = _catalog_group(status)
+        statuses = dynamic or _TICKET_STATUS_GROUPS[status]
         status = None
     if statuses:
         return "status IN (" + ",".join("?" for _ in statuses) + ")", list(statuses)

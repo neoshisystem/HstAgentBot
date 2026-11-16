@@ -20,12 +20,40 @@ def _guard_network(monkeypatch):
     return attempts
 
 
+class FakeStager:
+    """In-memory stand-in for the staging table used by the preview step.
+
+    The preview must persist the parsed batch somewhere, because the FSM entry
+    that carried the operator's text is consumed before the preview is rendered.
+    This seam keeps the UI test hermetic — no database, no network.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, ctx, *, kind, target_id, items, meta, now):
+        self.calls.append({"kind": kind, "target_id": target_id,
+                           "items": list(items), "meta": dict(meta), "now": now})
+        token = "T" * 24
+        prefix = {"digital_inventory": "inv", "manual_pool": "pool"}[kind]
+        return {
+            "token": token,
+            "callback_confirm": f"v52:{prefix}ok:{token}",
+            "callback_cancel": f"v52:{prefix}no:{token}",
+            "item_count": len(items),
+            "expires_at": 9999999999,
+            "kind": kind,
+            "target_id": target_id,
+        }
+
+
 def test_preview_before_import_and_scope(monkeypatch):
     attempts = _guard_network(monkeypatch)
     monkeypatch.setattr(config, "ADMIN_TELEGRAM_ID", 9901)
-    root = {"actor_tg_id": 9901, "chat_type": "private", "persona": "admin"}
+    root = {"actor_tg_id": 9901, "bot_id": 5, "chat_type": "private", "persona": "admin"}
     uris = ["vless://SYNTHETIC-CREDENTIAL-ONE@node.invalid:443", "vmess://SYNTHETIC-CREDENTIAL-TWO@node.invalid:443"]
     repo_calls, digital_calls = [], []
+    stager = FakeStager()
 
     class FakeRepository:
         def import_client(self, **kwargs):
@@ -33,12 +61,15 @@ def test_preview_before_import_and_scope(monkeypatch):
             return {"id": 41}
 
     preview_pool = inventory_admin_ui.begin_manual_import(
-        root, 7, "panel-7-batch", uris,
+        root, 7, "panel-7-batch", uris, stager=stager,
         encryptor=lambda text, label: "CIPHERTEXT:" + str(len(text)), repository=FakeRepository(),
     )
     assert preview_pool.kind == "preview" and "تعداد URI معتبر: 2" in preview_pool.text
     assert "SYNTHETIC-CREDENTIAL" not in preview_pool.text
     assert repo_calls == []
+    assert stager.calls[-1]["kind"] == "manual_pool"
+    assert stager.calls[-1]["items"] == uris
+    assert "v52:poolok:" in preview_pool.reply_markup.inline_keyboard[0][0].callback_data
 
     saved_pool = inventory_admin_ui.begin_manual_import(
         root, 7, "panel-7-batch", uris, confirm=True, repository=FakeRepository(),
@@ -56,12 +87,15 @@ def test_preview_before_import_and_scope(monkeypatch):
 
     digital_secrets = ["LICENSE-SECRET-A", "LICENSE-SECRET-B"]
     preview_digital = inventory_admin_ui.begin_digital_import(
-        root, 12, digital_secrets,
+        root, 12, digital_secrets, stager=stager,
         import_fn=lambda *a, **k: digital_calls.append((a, k)) or [1, 2],
     )
     assert preview_digital.kind == "preview" and "تعداد اقلام: 2" in preview_digital.text
     assert all(secret not in preview_digital.text for secret in digital_secrets)
     assert digital_calls == []
+    assert stager.calls[-1]["kind"] == "digital_inventory"
+    assert stager.calls[-1]["items"] == digital_secrets
+    assert "v52:invok:" in preview_digital.reply_markup.inline_keyboard[0][0].callback_data
 
     saved_digital = inventory_admin_ui.begin_digital_import(
         root, 12, digital_secrets, confirm=True,
