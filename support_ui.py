@@ -209,26 +209,35 @@ def ticket_lifecycle_rows(
 
 def ticket_page_rows(
     ticket_id: str, status: Any, *, is_operator: bool = True, is_author: bool = False,
+    sender_tg_id: int | None = None,
 ) -> list:
-    """The full control set for one ticket: the one-tap status picker, then actions.
+    """The full control set for one ticket: profile, status picker, then actions.
 
     The picker is built from the operator's own status catalog, so a status the
     root added or renamed appears here immediately. It is rendered **above** the
     lifecycle rows because changing the state is the common operation, and it is
     only offered to an operator — a customer must never be able to move their own
-    ticket between queues.
+    ticket between queues, nor open anyone's profile.
     """
     rows = ticket_lifecycle_rows(
         ticket_id, status, is_operator=is_operator, is_author=is_author)
     if not is_operator:
         return rows
+    head = []
+    if sender_tg_id:
+        # The ticket is the most common place an operator asks «who is this?», so
+        # the 360-degree card is one tap away and remembers the ticket it came from.
+        import profile_360
+        head = [[button("👤 مشاهده پروفایل ۳۶۰ درجه",
+                        profile_360.profile_callback(
+                            "view", int(sender_tg_id), "ticket", str(ticket_id)))]]
     try:
         import ticket_status_ui
         picker = ticket_status_ui.status_picker_rows(
             str(ticket_id), current=str(status or ""))
     except Exception:  # noqa: BLE001 - a picker must never break the ticket page
-        return rows
-    return list(picker) + rows
+        picker = []
+    return head + list(picker) + rows
 
 
 def reply_or_escalate(

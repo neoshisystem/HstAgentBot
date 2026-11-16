@@ -202,6 +202,22 @@ def _collect_counts(user_id: int, rep_row: Mapping[str, Any] | None) -> dict:
 # The page
 # --------------------------------------------------------------------------
 
+def _origin_suffix(origin: str, ref: str) -> str:
+    """``:origin:ref`` when the profile knows where it was opened from, else ``""``.
+
+    Every management control on the card lives in the ``admin:`` namespace — those
+    are the admin panel's writers — but each one is *started from* a 360-degree
+    card. Carrying the originating surface inside the callback, instead of stashing
+    it in ``context.user_data``, means the return destination survives a lost form
+    state and is visible in the audit trail.
+    """
+    surface = str(origin or "").strip()
+    reference = str(ref or "").strip()
+    if surface in PROFILE_ORIGINS and reference:
+        return f":{surface}:{reference}"
+    return ""
+
+
 def build_profile_page(
     user_id: int,
     *,
@@ -260,7 +276,11 @@ def build_profile_page(
     lines.append("")
     lines.append("💰 **کیف پول:**")
     lines.append(f"   • موجودی قابل برداشت: **{wallet:,} تومان**")
-    lines.append(f"   • محفوظ در تراکنش معلق: **{locked:,} تومان**")
+    # The wording is pinned by the S52 contract test, which asserts both
+    # «موجودی قابل برداشت» and «مبلغ محفوظ» on this card. It is the surviving card
+    # now that the admin panel's duplicate renderer is gone, so it carries the
+    # contract wording rather than its own paraphrase.
+    lines.append(f"   • مبلغ محفوظ در تراکنش معلق: **{locked:,} تومان**")
     lines.append("")
     lines.append("📈 **آمار تجمیعی کل دوره (Lifetime):**")
     lines.append(f"   • مجموع کل واریزی‌ها: **{lifetime['deposits_toman']:,} تومان**")
@@ -298,18 +318,31 @@ def build_profile_page(
         callback_data=profile_callback("notes", user_id, origin, ref))])
 
     if allow_management:
+        suffix = _origin_suffix(origin, ref)
         rows.append([
             InlineKeyboardButton("💰 افزایش / کسر موجودی",
-                                 callback_data=f"admin:prompt_charge_user:{user_id}"),
+                                 callback_data=f"admin:prompt_charge_user:{user_id}{suffix}"),
             InlineKeyboardButton("🎖 تغییر سطح / تعرفه",
                                  callback_data=profile_callback("tier", user_id, origin, ref)),
         ])
         toggle = "🟢 رفع مسدودی" if is_blocked else "🔒 مسدودسازی حساب"
         rows.append([
             InlineKeyboardButton(toggle,
-                                 callback_data=f"admin:set_block_user:{user_id}:{0 if is_blocked else 1}"),
+                                 callback_data=f"admin:set_block_user:{user_id}:{0 if is_blocked else 1}{suffix}"),
             InlineKeyboardButton("🧑‍💼 ارتقاء به نماینده",
                                  callback_data=profile_callback("promote", user_id, origin, ref)),
+        ])
+        rows.append([
+            InlineKeyboardButton("➕ اتصال اکانت",
+                                 callback_data=f"admin:prompt_link_user_id:{user_id}{suffix}"),
+            InlineKeyboardButton("❌ قطع اتصال اکانت",
+                                 callback_data=f"admin:prompt_unlink_user_acc:{user_id}{suffix}"),
+        ])
+        rows.append([
+            InlineKeyboardButton("✏️ تغییر Telegram ID",
+                                 callback_data=f"admin:prompt_edit_user_id:{user_id}{suffix}"),
+            InlineKeyboardButton("🗑 حذف کاربر",
+                                 callback_data=f"admin:confirm_del_user:{user_id}{suffix}"),
         ])
         if rep_row:
             rows.append([InlineKeyboardButton(
@@ -337,7 +370,18 @@ def _services_page(user_id: int, origin: str, ref: str):
         state = "🟢 فعال" if account.get("enable") else "🔴 غیرفعال"
         code = str(account.get("account_code") or "—")
         lines.append(f"   • `{escape_markdown_code(code)}` | {state}")
-        rows.append([InlineKeyboardButton(f"📦 {code[:28]}", callback_data=f"user:view_acc:{code}")])
+        # Open the canonical v5.2 service card by account id. The legacy
+        # ``user:view_acc:<code>`` callback renders the *customer's own* portal
+        # view and issues a live panel query with ``scope="all"``, so an operator
+        # opening it from someone else's profile saw the wrong surface and paid a
+        # panel round trip for it.
+        account_id = account.get("id")
+        if account_id:
+            rows.append([InlineKeyboardButton(
+                f"📦 {code[:28]}", callback_data=f"v52:sub:{int(account_id)}")])
+        else:
+            rows.append([InlineKeyboardButton(
+                f"📦 {code[:28]}", callback_data=f"user:view_acc:{code}")])
     rows.append([InlineKeyboardButton("🔙 بازگشت به پروفایل ۳۶۰ درجه",
                                       callback_data=profile_callback("view", user_id, origin, ref))])
     return "\n".join(lines), rows
@@ -420,7 +464,8 @@ def _transactions_page(user_id: int, origin: str, ref: str, rep_row=None):
     return "\n".join(lines), rows
 
 
-def _subs_page(user_id: int, origin: str, ref: str, rep_row=None):
+def _subs_page(user_id: int, origin: str, ref: str, rep_row=None, *,
+               allow_management: bool = True):
     invited = []
     try:
         with database.get_db() as conn:
@@ -435,7 +480,7 @@ def _subs_page(user_id: int, origin: str, ref: str, rep_row=None):
         try:
             with database.get_db() as conn:
                 children = conn.execute(
-                    "SELECT id, name, rep_code, tier FROM representatives "
+                    "SELECT id, name, rep_code, tier, telegram_id FROM representatives "
                     "WHERE parent_rep_id=? AND deleted_at IS NULL ORDER BY id LIMIT 20",
                     (int(rep_row["id"]),),
                 ).fetchall()
@@ -457,13 +502,24 @@ def _subs_page(user_id: int, origin: str, ref: str, rep_row=None):
     if rep_row:
         lines.append("")
         lines.append(f"🧑‍💼 **زیرنماینده‌های مستقیم ({len(children)}):**")
+        # A sub-representative is opened through their own 360-degree profile, which
+        # applies the same bottom-up rule as any other person. The previous
+        # ``admin:rep_detail:`` button was root-only, so a representative looking at
+        # their own downstream tree got a button that only ever answered «دسترسی
+        # مجاز نیست» — a dead end on their own data.
+        sub_origin = "reps" if allow_management else "repnet"
         if children:
             for row in children:
                 lines.append(f"   • {escape_markdown(row['name'] or '—')} "
                              f"(`{escape_markdown_code(row['rep_code'] or '')}`) | {escape_markdown(row['tier'] or '')}")
-                rows.append([InlineKeyboardButton(
-                    f"🧑‍💼 {str(row['name'] or row['id'])[:24]}",
-                    callback_data=f"admin:rep_detail:{int(row['id'])}")])
+                label = f"🧑‍💼 {str(row['name'] or row['id'])[:24]}"
+                if row["telegram_id"]:
+                    rows.append([InlineKeyboardButton(
+                        label, callback_data=profile_callback(
+                            "view", int(row["telegram_id"]), sub_origin, str(int(row["id"]))))])
+                elif allow_management:
+                    rows.append([InlineKeyboardButton(
+                        label, callback_data=f"admin:rep_detail:{int(row['id'])}")])
         else:
             lines.append("   • زیرنماینده‌ای ثبت نشده است.")
     rows.append([InlineKeyboardButton("🔙 بازگشت به پروفایل ۳۶۰ درجه",
@@ -633,7 +689,8 @@ async def handle_profile_callback(update, context, *, role: str, rep) -> bool:
     elif section == "tx":
         text, rows = _transactions_page(user_id, origin, ref, _rep_row_for(user_id))
     elif section == "subs":
-        text, rows = _subs_page(user_id, origin, ref, _rep_row_for(user_id))
+        text, rows = _subs_page(user_id, origin, ref, _rep_row_for(user_id),
+                                allow_management=allow_management)
     elif section == "notes":
         text, rows = _notes_page(user_id, origin, ref)
     elif section == "notenew":

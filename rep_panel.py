@@ -186,7 +186,7 @@ async def _show_rep_network(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     "WHERE assigned_rep_id=? ORDER BY id DESC LIMIT 25", (rep_id,),
                 ).fetchall()
                 children = conn.execute(
-                    "SELECT id, name, rep_code, tier FROM representatives "
+                    "SELECT id, name, rep_code, tier, telegram_id FROM representatives "
                     "WHERE parent_rep_id=? AND deleted_at IS NULL ORDER BY id LIMIT 25",
                     (rep_id,),
                 ).fetchall()
@@ -199,9 +199,17 @@ async def _show_rep_network(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if children:
         for child in children:
             lines.append(f"   • {child['name']} (`{child['rep_code']}`) | {child['tier']}")
-            rows.append([InlineKeyboardButton(
-                f"🧑‍💼 {str(child['name'] or child['id'])[:26]}",
-                callback_data=f"admin:rep_detail:{int(child['id'])}")])
+            # A sub-representative opens through their own 360-degree profile, which
+            # enforces the same bottom-up rule as any other person. The root-only
+            # ``admin:rep_detail:`` button answered «دسترسی مجاز نیست» to the very
+            # representative whose own tree it was listing.
+            label = f"🧑‍💼 {str(child['name'] or child['id'])[:26]}"
+            if child["telegram_id"]:
+                rows.append([InlineKeyboardButton(
+                    label, callback_data=profile_360.profile_callback(
+                        "view", int(child["telegram_id"]), "repnet", str(rep_id)))])
+            else:
+                lines.append("     (بدون شناسه تلگرام ثبت‌شده؛ پروفایل قابل باز شدن نیست)")
     else:
         lines.append("   • زیرنماینده‌ای ثبت نشده است.")
     lines.append("")

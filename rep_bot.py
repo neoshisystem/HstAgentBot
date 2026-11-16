@@ -1916,8 +1916,20 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 import abuse_service
                 from ui_v52 import render_page, button
                 reports = abuse_service.list_abuse_reports(ctx)
-                rows = [[button(f"{str(item['ticket_id'])[:8]} · {item['status']}",
-                                "v52:ticket:" + str(item["ticket_id"]))] for item in reports[:12]]
+                import profile_360
+                rows = []
+                for item in reports[:12]:
+                    abuse_ticket = str(item["ticket_id"])
+                    row = [button(f"🎫 {abuse_ticket[:8]} · {item['status']}",
+                                  "v52:ticket:" + abuse_ticket)]
+                    # The reporter's 360-degree card, remembering the report it was
+                    # opened from. This surface is root-only, so the button can never
+                    # be shown to a lower level.
+                    sender = int(item.get("sender_tg_id") or 0)
+                    if sender:
+                        row.append(button("👤 پروفایل", profile_360.profile_callback(
+                            "view", sender, "abuse", abuse_ticket)))
+                    rows.append(row)
                 page = render_page(
                     "🚨 گزارش‌های تخلف",
                     f"تعداد گزارش‌های ثبت‌شده: {len(reports)}\n"
@@ -2027,7 +2039,8 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         persona=persona, page_kind="form",
                         rows=support_ui.ticket_page_rows(
                             ticket_id, ticket.get("status"),
-                            is_operator=(persona in ("admin", "rep")), is_author=is_author),
+                            is_operator=(persona in ("admin", "rep")), is_author=is_author,
+                            sender_tg_id=int(ticket.get("sender_tg_id") or 0) or None),
                     )
             elif name == "sync_topics":
                 if persona != "admin" or not ctx.get("is_root"):

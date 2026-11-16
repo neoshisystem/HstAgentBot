@@ -101,12 +101,14 @@ def build_settings_category_page(cat_key: str):
 def profile_origin_callback(origin: str = "", ref: str = "") -> str:
     """Encode where a profile page was opened from so its back button returns there.
 
-    ``origin`` names the surface (``tx``, ``rcp``, ``ticket``) and ``ref`` its id.
-    An unknown or empty origin falls back to the user list, so the button is never
-    a dead end.
+    ``origin`` names the surface (``tx``, ``rcp``, ``ticket``, ``reg``, ``users``,
+    ``reps``, ``abuse``, ``repnet``) and ``ref`` its id. The valid set lives in
+    :mod:`profile_360` — the single owner of the 360-degree card — so this module
+    cannot drift into accepting an origin the card would then silently drop.
     """
+    import profile_360
     surface = str(origin or "").strip()
-    if surface not in PROFILE_ORIGINS:
+    if surface not in profile_360.PROFILE_ORIGINS:
         return ""
     reference = str(ref or "").strip()
     if not reference:
@@ -115,28 +117,63 @@ def profile_origin_callback(origin: str = "", ref: str = "") -> str:
 
 
 def build_profile_callback(user_id: int, origin: str = "", ref: str = "") -> str:
-    """Callback that opens a user profile and remembers the page it came from."""
+    """Callback that opens a user profile and remembers the page it came from.
+
+    The ``admin:user_detail:`` form stays the emitted callback: it is already
+    inside messages delivered to operators and is pinned by tests. What changed is
+    the destination — the handler now renders the one canonical card from
+    :mod:`profile_360` instead of this module's own, poorer copy.
+    """
     base = f"admin:user_detail:{int(user_id)}"
     encoded = profile_origin_callback(origin, ref)
     return f"{base}:{encoded}" if encoded else base
 
 
-def _profile_back_row(origin: str, ref: str) -> list:
-    """The single back button a profile page shows for its originating surface."""
-    if origin == "tx" and ref:
-        return [InlineKeyboardButton("🔙 بازگشت به تراکنش معلق",
-                                     callback_data=f"admin:pending_tx:{ref}")]
-    if origin == "rcp" and ref:
-        return [InlineKeyboardButton("🔙 بازگشت به فیش واریزی",
-                                     callback_data=f"admin_detail_rcp_{ref}")]
-    if origin == "ticket" and ref:
-        return [InlineKeyboardButton("🔙 بازگشت به تیکت",
-                                     callback_data=f"v52:ticket:{ref}")]
-    if origin == "reg" and ref:
-        return [InlineKeyboardButton("🔙 بازگشت به صف تایید عضویت",
-                                     callback_data="admin:pending_reg")]
-    return [InlineKeyboardButton("🔙 بازگشت به فهرست کاربران",
-                                 callback_data="admin:users:1")]
+def build_user_profile_page(
+    user_id: int, *, origin: str = "", ref: str = "",
+    allow_management: bool = True,
+):
+    """Thin delegate to the single 360-degree card in :mod:`profile_360`.
+
+    This module used to carry a second, incomplete profile renderer: no lifetime
+    totals, no drill-downs, no internal notes, no tier or promotion controls, and
+    a back-button set that only knew four origins. An operator who reached a
+    profile from the user list, a receipt, a locked transaction or the
+    registration queue therefore saw a *different and poorer* page than one
+    reached from the ticket surface — the same person, two cards. The renderer now
+    exists only in :mod:`profile_360`; this wrapper keeps the ``admin:`` call sites
+    and the existing tests working unchanged.
+    """
+    import profile_360
+    return profile_360.build_profile_page(
+        int(user_id), origin=origin, ref=ref, allow_management=allow_management)
+
+
+def _profile_return(user_id: int, origin: str, ref: str, *, notice: str = ""):
+    """Re-render the single 360-degree card after a management action.
+
+    Every management action started from a profile must land the operator back on
+    that same card with its originating surface preserved. The wallet, block,
+    identity and account handlers used to reply with a hand-rolled summary — or
+    with the main menu — which silently dropped the profile's own buttons, so the
+    operator had to walk back through the user list to continue.
+
+    Returns ``(text, keyboard)``, or ``None`` when the card cannot be rendered —
+    the person no longer exists, or the database is unreachable. A management
+    action must never fail *because* the follow-up page could not be built, so the
+    caller falls back to the plain notice instead of losing the saved result.
+    """
+    import profile_360
+    try:
+        text, rows = profile_360.build_profile_page(
+            int(user_id), origin=origin, ref=ref, allow_management=True)
+    except Exception:
+        logger.debug("Profile re-render failed for %s", user_id, exc_info=True)
+        return None
+    if not text:
+        return None
+    body = "\n\n".join(part for part in (str(notice or "").strip(), text) if part)
+    return body, InlineKeyboardMarkup(rows)
 
 
 def _base_role_of(user, chat, thread_id=None) -> tuple[str, dict | None]:
@@ -152,144 +189,6 @@ def _base_role_of(user, chat, thread_id=None) -> tuple[str, dict | None]:
     except Exception:
         logger.debug("Base-role resolution failed", exc_info=True)
         return "end_user", None
-
-
-def _profile_identity_lines(u_info: dict) -> list[str]:
-    """Identity block shared by every profile surface."""
-    lines = [
-        f"• **نام:** {escape_markdown(u_info.get('full_name') or 'ثبت نشده')}",
-    ]
-    if u_info.get("username"):
-        lines.append(f"• **یوزرنیم:** @{escape_markdown(u_info.get('username'))}")
-    else:
-        lines.append("• **یوزرنیم:** ندارد")
-    lines.append(f"• **شناسه تلگرام:** `{int(u_info.get('telegram_id') or 0)}`")
-    lines.append(f"• **نقش پایه:** {escape_markdown(u_info.get('role') or 'end_user')}")
-    referrer = u_info.get("referred_by_user_id")
-    if referrer:
-        lines.append(
-            f"• **معرف:** `{int(referrer)}` (کد `{escape_markdown(u_info.get('referred_by_code') or '—')}`)")
-    else:
-        lines.append("• **معرف:** ندارد")
-    if u_info.get("assigned_rep_id"):
-        lines.append(f"• **نماینده بالاسری:** `{int(u_info['assigned_rep_id'])}`")
-    status_map = {
-        "approved": "✅ تاییدشده", "pending_approval": "⏳ در انتظار تایید",
-        "awaiting_referral": "🎁 در انتظار کد معرف", "rejected": "❌ ردشده",
-    }
-    lines.append(
-        "• **وضعیت عضویت:** "
-        + status_map.get(str(u_info.get("registration_status") or "approved"), "نامشخص"))
-    return lines
-
-
-def build_user_profile_page(
-    user_id: int, *, origin: str = "", ref: str = "",
-    allow_management: bool = True,
-):
-    """360° profile card: identity, money, services, tickets and the way back.
-
-    ``origin``/``ref`` remember the surface the profile was opened from so the
-    back button returns to that exact transaction, receipt or ticket instead of
-    dumping the operator in the user list. ``allow_management`` is False for a
-    representative viewing a downstream user: read-only, no wallet or block
-    controls, and never a link to a higher authority's profile.
-    """
-    user_id = int(user_id)
-    u_info = database.get_bot_user_by_tg_id(user_id) or {}
-    if not u_info:
-        return "", []
-    wallet = int(u_info.get("wallet_balance") or 0)
-    try:
-        locked = int(database.get_user_locked_amount(user_id) or 0)
-    except Exception:
-        locked = 0
-    is_blocked = int(u_info.get("is_blocked") or 0) == 1
-    lines = ["👤 **پروفایل ۳۶۰ درجه کاربر:**\n"]
-    lines.extend(_profile_identity_lines(u_info))
-    lines.append(f"• **وضعیت دسترسی:** {'🔴 مسدود' if is_blocked else '🟢 فعال'}")
-    lines.append("")
-    lines.append(f"💰 **کیف پول:**")
-    lines.append(f"   • موجودی قابل برداشت: **{wallet:,} تومان**")
-    lines.append(f"   • مبلغ محفوظ در تراکنش معلق: **{locked:,} تومان**")
-    lines.append(f"   • تعداد اکانت‌های متصل: **{int(u_info.get('linked_accounts_count') or 0)}**")
-
-    try:
-        accounts = database.get_user_accounts(user_id) or []
-    except Exception:
-        accounts = []
-    if accounts:
-        lines.append("")
-        lines.append("📡 **سرویس‌ها:**")
-        for account in accounts[:5]:
-            state = "🟢 فعال" if account.get("enable") else "🔴 غیرفعال"
-            lines.append(
-                f"   • `{escape_markdown_code(account.get('account_code') or '—')}` | "
-                f"{escape_markdown(account.get('email') or '—')} | {state}")
-    else:
-        lines.append("")
-        lines.append("📡 **سرویس‌ها:** هیچ سرویسی ثبت نشده است.")
-
-    try:
-        ledger = database.get_recent_ledger_entries(limit=5) or []
-    except Exception:
-        ledger = []
-    mine = [row for row in ledger if int(row.get("user_id") or 0) == user_id][:5]
-    lines.append("")
-    lines.append("🧾 **۵ تراکنش آخر:**")
-    if mine:
-        for row in mine:
-            lines.append(
-                f"   • {escape_markdown(str(row.get('transaction_type') or '—'))} | "
-                f"**{int(row.get('amount') or 0):,} ت** | "
-                f"`{escape_markdown_code(str(row.get('created_at') or '')[:19])}`")
-    else:
-        lines.append("   • تراکنشی ثبت نشده است.")
-
-    try:
-        with database.get_db() as conn:
-            ticket_rows = conn.execute(
-                "SELECT ticket_id, status FROM support_tickets WHERE sender_tg_id=? "
-                "AND ticket_type<>'abuse_report' ORDER BY created_at DESC LIMIT 5",
-                (user_id,),
-            ).fetchall()
-    except Exception:
-        ticket_rows = []
-    lines.append("")
-    lines.append(f"🎫 **تیکت‌ها ({len(ticket_rows)} مورد آخر):**")
-    if ticket_rows:
-        for row in ticket_rows:
-            lines.append(
-                f"   • `{escape_markdown_code(str(row['ticket_id']))}` | "
-                f"{escape_markdown(str(row['status']))}")
-    else:
-        lines.append("   • تیکتی ثبت نشده است.")
-
-    rows = []
-    if allow_management:
-        toggle = "🟢 رفع مسدودی" if is_blocked else "🚫 مسدود کردن"
-        rows.append([
-            InlineKeyboardButton("💰 شارژ / کسر کیف پول",
-                                 callback_data=f"admin:prompt_charge_user:{user_id}"),
-        ])
-        rows.append([
-            InlineKeyboardButton(toggle,
-                                 callback_data=f"admin:set_block_user:{user_id}:{0 if is_blocked else 1}"),
-            InlineKeyboardButton("✏️ تغییر Telegram ID",
-                                 callback_data=f"admin:prompt_edit_user_id:{user_id}"),
-        ])
-        rows.append([
-            InlineKeyboardButton("➕ اتصال اکانت",
-                                 callback_data=f"admin:prompt_link_user_id:{user_id}"),
-            InlineKeyboardButton("❌ قطع اتصال اکانت",
-                                 callback_data=f"admin:prompt_unlink_user_acc:{user_id}"),
-        ])
-        rows.append([
-            InlineKeyboardButton("🗑 حذف کاربر",
-                                 callback_data=f"admin:confirm_del_user:{user_id}"),
-        ])
-    rows.append(_profile_back_row(origin, ref))
-    return "\n".join(lines), rows
 
 
 def _pending_intent_card(intent: dict):
@@ -575,9 +474,6 @@ def build_back_to_admin_keyboard(
         InlineKeyboardButton("↩️ بازگشت به پنل مدیریت ادمین", callback_data="admin:main")
     ])
     return InlineKeyboardMarkup(keyboard)
-
-
-PROFILE_ORIGINS = ("tx", "rcp", "ticket", "reg")
 
 
 def escape_markdown(value) -> str:
@@ -1101,6 +997,11 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
     elif action == "set_block_user":
         user_id = int(sub_action)
         desired_blocked = parts[3] if len(parts) > 3 else ""
+        # The profile carries the surface it was opened from, so the card can be
+        # re-rendered in place after the toggle instead of replacing it with a
+        # hand-rolled summary that lost every other control.
+        origin = parts[4] if len(parts) > 4 else ""
+        origin_ref = parts[5] if len(parts) > 5 else ""
         if desired_blocked not in ("0", "1"):
             await query.answer("⛔️ وضعیت درخواستی معتبر نیست؛ کارت کاربر را تازه کنید.", show_alert=True)
             return
@@ -1112,30 +1013,17 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             f"✅ وضعیت کاربر به {'مسدود' if new_val else 'فعال'} تنظیم شد.",
             show_alert=True
         )
-        u_info = database.get_bot_user_by_tg_id(user_id)
-        if not u_info:
-            await query.edit_message_text("❌ کاربر یافت نشد.", reply_markup=build_back_to_admin_keyboard())
+        rendered = _profile_return(
+            user_id, origin, origin_ref,
+            notice=f"✅ وضعیت دسترسی کاربر به **{'مسدود' if new_val else 'فعال'}** تغییر یافت.")
+        if rendered is None:
+            await query.answer("❌ کاربر یافت نشد.", show_alert=True)
             return
-        is_blocked = bool(u_info.get("is_blocked", 0))
-        toggle_text = "🟢 رفع مسدودی" if is_blocked else "🚫 مسدود کردن"
-        lines = [
-            "👤 **شناسنامه کاربر نهایی:**\n",
-            f"• **نام:** {escape_markdown(u_info.get('full_name') or 'ثبت نشده')}",
-            f"• **یوزرنیم:** @{escape_markdown(u_info.get('username'))}" if u_info.get("username") else "• **یوزرنیم:** ندارد",
-            f"• **شناسه تلگرام:** `{u_info['telegram_id']}`",
-            f"• **وضعیت دسترسی:** **{'🔴 مسدود' if is_blocked else '🟢 فعال'}**",
-            f"• **موجودی کیف پول:** **{u_info['wallet_balance']:,} تومان**",
-            f"• **تعداد اکانت‌های متصل:** **{u_info['linked_accounts_count']}**"
-        ]
-        keyboard = build_back_to_admin_keyboard([
-            [InlineKeyboardButton("💰 شارژ / کسر کیف پول", callback_data=f"admin:prompt_charge_user:{user_id}")],
-            [InlineKeyboardButton(
-                toggle_text,
-                callback_data=f"admin:set_block_user:{user_id}:{0 if is_blocked else 1}"
-            )],
-            [InlineKeyboardButton("🏠 بازگشت به کاربران", callback_data="admin:users:1")]
-        ], parent_cb="admin:users:1")
-        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        body, keyboard = rendered
+        # message_edit, not edit_message_text: the profile is routinely opened from
+        # a receipt, which is a PHOTO message whose body is a caption.
+        await message_edit.render_page(
+            query, text=body, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         return
 
     # 5. Financial Management Center
@@ -1960,6 +1848,19 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             "prompt_edit_rep": "admin:reps",
             "prompt_edit_plan_specs": "admin:plans",
         }[action]
+        # The four user-management prompts are started from a 360-degree card and
+        # must return there. The card carries its originating surface inside the
+        # callback, so both the prompt's own back button and the page rendered after
+        # a successful save land on the profile instead of the user list.
+        profile_prompt = action in {
+            "prompt_charge_user", "prompt_edit_user_id",
+            "prompt_link_user_id", "prompt_unlink_user_acc",
+        }
+        prompt_origin = parts[3] if profile_prompt and len(parts) > 3 else ""
+        prompt_ref = parts[4] if profile_prompt and len(parts) > 4 else ""
+        if profile_prompt and prompt_origin and prompt_ref:
+            prompt_parent_cb = build_profile_callback(
+                int(sub_action), prompt_origin, prompt_ref)
         if action == "prompt_card_settings":
             context.user_data["admin_state"] = {"action": "edit_card_settings", "ts": now_ts}
             card_info = database.get_card_info()
@@ -1984,7 +1885,10 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
 
         elif action == "prompt_charge_user":
             user_id = sub_action
-            context.user_data["admin_state"] = {"action": "charge_user", "target_user_id": int(user_id), "ts": now_ts}
+            context.user_data["admin_state"] = {
+                "action": "charge_user", "target_user_id": int(user_id),
+                "origin": prompt_origin, "ref": prompt_ref, "ts": now_ts,
+            }
             msg = (
                 f"💰 **شارژ / کسر دستی کیف پول کاربر (`{user_id}`):**\n\n"
                 "مبلغ را به تومان وارد کنید (عدد مثبت برای شارژ، عدد منفی برای کسر):\n"
@@ -2145,7 +2049,8 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         elif action == "prompt_edit_user_id":
             target_user_id = int(sub_action)
             context.user_data["admin_state"] = {
-                "action": "edit_user_id", "target_user_id": target_user_id, "ts": now_ts
+                "action": "edit_user_id", "target_user_id": target_user_id,
+                "origin": prompt_origin, "ref": prompt_ref, "ts": now_ts
             }
             await query.edit_message_text(
                 f"✏️ **تغییر شناسه تلگرام کاربر `{target_user_id}`:**\nشناسه عددی جدید را ارسال کنید.",
@@ -2156,7 +2061,8 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         elif action == "prompt_link_user_id":
             target_user_id = int(sub_action)
             context.user_data["admin_state"] = {
-                "action": "link_user_account", "target_user_id": target_user_id, "ts": now_ts
+                "action": "link_user_account", "target_user_id": target_user_id,
+                "origin": prompt_origin, "ref": prompt_ref, "ts": now_ts
             }
             await query.edit_message_text(
                 f"🔗 **اتصال اکانت به کاربر `{target_user_id}`:**\nکد دقیق اکانت را ارسال کنید.",
@@ -2167,7 +2073,8 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         elif action == "prompt_unlink_user_acc":
             target_user_id = int(sub_action)
             context.user_data["admin_state"] = {
-                "action": "unlink_user_account", "target_user_id": target_user_id, "ts": now_ts
+                "action": "unlink_user_account", "target_user_id": target_user_id,
+                "origin": prompt_origin, "ref": prompt_ref, "ts": now_ts
             }
             await query.edit_message_text(
                 f"🔌 **قطع اتصال اکانت از کاربر `{target_user_id}`:**\nکد دقیق اکانت را ارسال کنید.",
@@ -2222,13 +2129,17 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
 
     elif action == "confirm_del_user":
         target_user_id = int(sub_action)
+        # Cancelling must return to the card the delete was started from.
+        del_origin = parts[3] if len(parts) > 3 else ""
+        del_ref = parts[4] if len(parts) > 4 else ""
         u_info = database.get_bot_user_by_tg_id(target_user_id)
         if not u_info:
             await query.answer("کاربر یافت نشد.", show_alert=True)
             return
         keyboard = build_back_to_admin_keyboard([
             [InlineKeyboardButton("🗑 بله، حذف دسترسی کاربر", callback_data=f"admin:do_del_user:{target_user_id}")],
-            [InlineKeyboardButton("❌ انصراف", callback_data=f"admin:user_detail:{target_user_id}")]
+            [InlineKeyboardButton("❌ انصراف",
+                                  callback_data=build_profile_callback(target_user_id, del_origin, del_ref))]
         ], parent_cb="admin:users:1")
         await query.edit_message_text(
             f"⚠️ **حذف پروفایل کاربر `{target_user_id}`؟**\n"
@@ -2494,16 +2405,15 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
                 actor_id=update.effective_user.id, actor_name=update.effective_user.full_name or "Admin"
             )
             sign_str = "افزایش" if amount >= 0 else "کاهش"
-            await update.message.reply_text(
-                f"✅ **کیف پول کاربر `{target_uid}` با موفقیت بروزرسانی شد.**\n\n"
+            notice = (
+                f"✅ **کیف پول کاربر `{target_uid}` بروزرسانی شد.**\n"
                 f"• میزان {sign_str}: **{abs(amount):,} تومان**\n"
-                f"• مانده جدید کیف پول: **{new_bal:,} تومان**",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=build_admin_main_keyboard()
+                f"• مانده جدید: **{new_bal:,} تومان**"
             )
         except ValueError as exc:
             return await _reply_fsm_validation_error(update,context,admin_state,f"مقدار باید عددی و معتبر باشد: {exc}")
         context.user_data.pop("admin_state",None)
+        await _reply_profile_after_action(update, admin_state, target_uid, notice)
         return True
 
     elif action == "edit_credit_limit":
@@ -2780,13 +2690,16 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
             if new_id <= 0:
                 raise ValueError("Telegram ID must be positive")
             database.change_user_tg_id(old_id, new_id)
-            await update.message.reply_text(
-                f"✅ شناسه کاربر از `{old_id}` به `{new_id}` تغییر کرد؛ سوابق و مالکیت‌های مرتبط منتقل شدند.",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard()
+            notice = (
+                f"✅ شناسه کاربر از `{old_id}` به `{new_id}` تغییر کرد؛ "
+                "سوابق و مالکیت‌های مرتبط منتقل شدند."
             )
         except ValueError as exc:
             return await _reply_fsm_validation_error(update,context,admin_state,f"تغییر شناسه انجام نشد: {exc}")
         context.user_data.pop("admin_state",None)
+        # The identity changed, so the card is re-rendered for the NEW id: the old
+        # one no longer resolves and would render an empty page.
+        await _reply_profile_after_action(update, admin_state, new_id, notice)
         return True
 
     elif action == "link_user_account":
@@ -2803,8 +2716,8 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
             response = f"✅ اکانت `{text}` به کاربر `{target_user_id}` متصل شد."
         else:
             return await _reply_fsm_validation_error(update,context,admin_state,f"اتصال انجام نشد: {linked.get('message') or 'کد اکانت معتبر نیست.'}")
-        await update.message.reply_text(response,parse_mode=ParseMode.MARKDOWN,reply_markup=build_admin_main_keyboard())
         context.user_data.pop("admin_state",None)
+        await _reply_profile_after_action(update, admin_state, target_user_id, response)
         return True
 
     elif action == "unlink_user_account":
@@ -2813,7 +2726,9 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
         if not unlinked:
             return await _reply_fsm_validation_error(update,context,admin_state,"اکانت متعلق به این کاربر نیست یا یافت نشد.")
         context.user_data.pop("admin_state",None)
-        await update.message.reply_text("✅ اتصال اکانت قطع شد.",reply_markup=build_admin_main_keyboard())
+        await _reply_profile_after_action(
+            update, admin_state, target_user_id,
+            f"✅ اتصال اکانت `{text}` از کاربر `{target_user_id}` قطع شد.")
         return True
 
     elif action == "edit_rep":
@@ -2848,6 +2763,26 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
 
     return False
 
+
+
+async def _reply_profile_after_action(update, admin_state, user_id, notice: str) -> bool:
+    """Return the operator to the profile card after a saved management action.
+
+    A management action started from a 360-degree card must end on that card. The
+    handlers used to answer with the main menu, so the operator lost the profile's
+    own buttons — including the drill-downs they were working through.
+    """
+    rendered = _profile_return(
+        int(user_id), admin_state.get("origin") or "", admin_state.get("ref") or "",
+        notice=notice)
+    if rendered is None:
+        await update.message.reply_text(
+            notice + "\n\n⚠️ پروفایل این کاربر دیگر در دسترس نیست.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard())
+        return True
+    body, keyboard = rendered
+    await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    return True
 
 
 async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:

@@ -777,6 +777,19 @@ def init_db():
             )
             apply_migrations(conn, migration_dir, now=int(time.time()))
 
+        # Objects added after the migration count was frozen at 18. They are still
+        # created lazily by the code that reads them (a restored backup or an audit
+        # clone never runs ``init_db``), but creating them here too means a plain
+        # service restart leaves the live database fully provisioned instead of
+        # waiting for the first ticket page, product edit or import preview to do it.
+        # No nineteenth migration file exists, so the frozen count is untouched.
+        ensure_ticket_statuses_table(conn)
+        import inventory_import_service
+        inventory_import_service.ensure_staging_table(conn)
+        ensure_product_usage_guide_column(conn)
+        conn.commit()
+
+
 def bootstrap_v52_installation(*, bot_id: int, username: str, token: str) -> dict:
     """Idempotently seed v5.2 policies, the primary bot, root identity and default panel."""
     if isinstance(bot_id, bool) or not isinstance(bot_id, int) or bot_id <= 0:
