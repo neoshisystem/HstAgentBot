@@ -27,6 +27,127 @@ from typing import Any
 from ui_v52 import button, render_error, render_page
 
 
+def _tier_wizard_register():
+    import ui_v52
+
+    def pct(raw):
+        try:
+            value = float(str(raw).strip().replace(",", "."))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("درصد تخفیف باید عددی بین صفر تا صد باشد.") from exc
+        if not 0 <= value <= 100:
+            raise ValueError("درصد تخفیف باید بین صفر تا صد باشد.")
+        return round(value * 100)
+
+    def code(raw):
+        value = str(raw or "").strip().lower()
+        if not value:
+            raise ValueError("کد سطح را وارد کنید.")
+        return _service()._clean_tier_code(value)
+
+    def generated(values):
+        title = str(values.get("title_fa") or "").strip()
+        if not title:
+            raise ValueError("ابتدا عنوان فارسی را وارد کنید.")
+        translit = str.maketrans("اآبتثجحخدذرزسشصضطظعغفقکگلمنوهی", "aabthjkhddrzsshstzghfkgklmnwhy")
+        slug = title.translate(translit).lower()
+        slug = __import__("re").sub(r"[^a-z0-9]+", "_", slug).strip("_")
+        return slug or "tier_" + __import__("hashlib").sha1(title.encode()).hexdigest()[:8]
+
+    def legacy(raw):
+        parts = [part.strip() for part in str(raw).split("|")]
+        if len(parts) < 3:
+            return None
+        role, key, title = parts[:3]
+        role = {"user": "end_user", "end_user": "end_user", "rep": "rep"}.get(role)
+        if not role:
+            return None
+        discount = pct(parts[4] or "0") if len(parts) > 4 and parts[4] else 0
+        return {"actor_type": role, "tier_code": code(key), "title_fa": title,
+                "discount_bps": discount, "rank": int(parts[3] or 0) if len(parts) > 3 else 0,
+                "cashback_bps": pct(parts[5] or "0") if len(parts) > 5 and parts[5] else 0,
+                "daily_test_quota": int(parts[6] or 1) if len(parts) > 6 else 1,
+                "default_credit_limit": int(parts[7] or 0) if len(parts) > 7 else 0,
+                "min_monthly_sales_toman": int(parts[8] or 0) if len(parts) > 8 else 0}
+
+    def title_and_key(raw):
+        """One answer collects the title and the key derived from it.
+
+        ``عنوان`` alone derives the key; ``عنوان | کد دلخواه`` lets the operator
+        pin an explicit key. Asking for the key as its own step made the flow four
+        questions long for a value the operator usually does not care about.
+        """
+        parts = [chunk.strip() for chunk in str(raw).split("|")]
+        title = parts[0]
+        if not title:
+            raise ValueError("عنوان فارسی سطح را وارد کنید.")
+        if len(parts) > 1 and parts[1]:
+            return {"title_fa": title, "tier_code": code(parts[1])}
+        return {"title_fa": title, "tier_code": code(generated({"title_fa": title}))}
+
+    steps = (
+        ui_v52.WizardStep("actor_type", "نقش هدف", choices=(("سطح کاربری", "end_user"), ("سطح نمایندگی", "rep"))),
+        ui_v52.WizardStep(
+            "title_fa", "عنوان فارسی و کد سطح",
+            hint="عنوان را به فارسی وارد کنید. برای تعیین کد دلخواه، آن را بعد از علامت | بنویسید؛ "
+                 "در غیر این صورت کد خودکار ساخته می‌شود.",
+            parse=title_and_key),
+        ui_v52.WizardStep("discount_bps", "درصد تخفیف پیش‌فرض", choices=tuple((f"{n}%", str(n)) for n in (0, 5, 10, 15, 20, 25)), parse=pct, display=lambda n: f"{n / 100:g}%"),
+    )
+    def preview(v):
+        return (f"نقش: {({'end_user': 'سطح کاربری', 'rep': 'سطح نمایندگی'}).get(v.get('actor_type'), v.get('actor_type'))}"
+                f"\nعنوان: {v.get('title_fa', '')}\nکد: <code>{v.get('tier_code', '')}</code>"
+                f"\nتخفیف پیش‌فرض: {int(v.get('discount_bps', 0)) / 100:g}%")
+    def commit_new(v, actor):
+        with _db() as conn:
+            row = _service().create_tier(conn, actor_type=v['actor_type'], tier_code=v['tier_code'],
+                title_fa=v['title_fa'], discount_bps=v['discount_bps'], rank=v.get('rank', 0),
+                cashback_bps=v.get('cashback_bps', 0), daily_test_quota=v.get('daily_test_quota', 1),
+                default_credit_limit=v.get('default_credit_limit', 0), min_monthly_sales_toman=v.get('min_monthly_sales_toman', 0))
+            conn.commit()
+        return f"سطح {row['title_fa']} با کد {row['tier_code']} ثبت شد."
+    # The operator must be told what each field does *before* answering, exactly as
+    # the pre-wizard page did: the effect explanation is the flow's intro, so it
+    # rides on the first step instead of a separate page that no longer exists.
+    _tier_effect_intro = (
+        "هر سطری که اینجا تعریف می‌کنید بی‌درنگ روی محاسبهٔ قیمت خرید و تمدید همان "
+        "سطح اثر می‌گذارد:\n"
+        "• درصد تخفیف — سهم تخفیفی که از قیمت پایهٔ تعرفه کم می‌شود.\n"
+        "• درصد کش‌بک — سهمی که از هر خرید به کیف پول همان سطح بازمی‌گردد.\n"
+        "• سهمیه تست روزانه — تعداد سرویس آزمایشی مجاز در هر روز.\n"
+        "• سقف اعتبار — حداکثر بدهی مجاز برای سطح نمایندگی.\n"
+        "• حداقل فروش ماهانه — کف فروشی که برای ماندن در این سطح لازم است."
+    )
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "tier_admin_new", "افزودن سطح", steps, preview, commit_new,
+        legacy=legacy, intro=_tier_effect_intro))
+    def commit_edit(v, actor):
+        anchor = v.get("_original") or v
+        with _db() as conn:
+            row = _service().update_tier(conn, anchor['actor_type'], anchor['tier_code'],
+                title_fa=v['title_fa'], discount_bps=v['discount_bps'])
+            conn.commit()
+        return f"سطح {row['title_fa']} به‌روز شد."
+    ui_v52.register_flow(ui_v52.WizardFlow("tier_admin_edit", "ویرایش سطح", steps, preview, commit_edit,
+        legacy=lambda raw: None))
+
+
+_tier_wizard_register()
+
+
+def _start_tier_wizard(ctx: Any, flow_key: str, parent_callback: str, *, seed=None):
+    import ui_v52
+    user_data = _value(ctx, "user_data", None)
+    if not isinstance(user_data, dict):
+        user_data = {}
+        if isinstance(ctx, dict):
+            ctx["user_data"] = user_data
+    state = ui_v52.start_wizard(
+        user_data, flow_key, return_callback=parent_callback, seed=seed,
+        message_id=_value(ctx, "message_id"), chat_id=_value(ctx, "chat_id"))
+    return ui_v52.render_wizard_step(state)
+
+
 def _code(value: Any) -> str:
     """Render one identifier as an escaped code span."""
     return f"<code>{_html_escape(str(value), quote=True)}</code>"
@@ -180,17 +301,7 @@ def begin_tier_new(ctx: Any, *, parent_callback: str | None = "v52:tiers"):
         _require_root(ctx)
         if not _private(ctx):
             raise PermissionError("تعریف سطح جدید فقط در پیوی مدیریت انجام می‌شود.")
-        import time
-        import v52_router
-        v52_router.DEFAULT_FSM.set(
-            ctx, "tier_new", payload={}, parent_callback=parent_callback,
-            now=int(time.time()))
-        return render_page(
-            "➕ سطح جدید", body_html=_html_from_template(NEW_FORMAT),
-            persona="admin", page_kind="form",
-            rows=[[button("بازگشت به فهرست سطوح", parent_callback or "v52:tiers")]],
-            parent_callback=parent_callback,
-        )
+        return _start_tier_wizard(ctx, "tier_admin_new", parent_callback or "v52:tiers")
     except (TypeError, ValueError, PermissionError) as exc:
         return render_error(str(exc), persona="admin", parent_callback=parent_callback,
                             body_html=_html_from_template(exc))
@@ -256,33 +367,10 @@ def begin_tier_edit(ctx: Any, actor_type: str, code: str, *,
             usage = service.tier_usage(conn, actor_type, code) if current else None
         if current is None:
             raise ValueError("سطح موردنظر یافت نشد.")
-        import time
-        import v52_router
-        v52_router.DEFAULT_FSM.set(
-            ctx, "tier_edit",
-            payload={"actor_type": current["actor_type"], "tier_code": current["tier_code"]},
-            parent_callback=parent_callback, now=int(time.time()))
-        body = (
-            f"ویرایش سطح {current['title_fa']}\n"
-            f"کد: {_code(current['tier_code'])}\n"
-            f"نقش هدف: {service.ACTOR_TYPE_FA.get(current['actor_type'], current['actor_type'])}\n"
-            f"رتبه فعلی: {current['rank']}\n"
-            f"تخفیف فعلی: {_percent(current['discount_bps'])}\n"
-            f"کش‌بک فعلی: {_percent(current['cashback_bps'])}\n"
-            f"سهمیه تست روزانه: {current['daily_test_quota']}\n"
-            f"سقف اعتبار پیش‌فرض: {current['default_credit_limit']:,} تومان\n"
-            f"حداقل فروش ماهانه: {current['min_monthly_sales_toman']:,} تومان\n"
-            f"تعداد استفاده‌کنندهٔ فعلی: {usage['total']}\n\n"
-            + EDIT_FORMAT
-        )
-        return render_page(
-            "✏️ ویرایش سطح", body_html=_html_from_template(body),
-            persona="admin", page_kind="form",
-            rows=[[button("🏷 تعیین قیمت اختصاصی تعرفه‌ها برای این سطح",
-                          f"v52:tierprices:{current['actor_type']}:{current['tier_code']}")],
-                  [button("بازگشت به فهرست سطوح", parent_callback or "v52:tiers")]],
-            parent_callback=parent_callback,
-        )
+        seed = {"actor_type": current["actor_type"], "tier_code": current["tier_code"],
+                "title_fa": current["title_fa"], "discount_bps": current["discount_bps"],
+                "_original": {"actor_type": current["actor_type"], "tier_code": current["tier_code"]}}
+        return _start_tier_wizard(ctx, "tier_admin_edit", parent_callback or "v52:tiers", seed=seed)
     except (TypeError, ValueError, PermissionError) as exc:
         return render_error(str(exc), persona="admin", parent_callback=parent_callback,
                             body_html=_html_from_template(exc))

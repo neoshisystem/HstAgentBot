@@ -141,8 +141,8 @@ def begin_grant(
         if selected_grantee is None:
             rows = []
             if selected_level is None:
-                rows = [[button("viewer", f"v52:gset:{exact_id}:viewer"),
-                         button("manager", f"v52:gset:{exact_id}:manager")]]
+                rows = [[button("👁 مشاهده‌گر (Viewer)", f"v52:gset:{exact_id}:viewer"),
+                         button("⚙️ مدیر حساب (Manager)", f"v52:gset:{exact_id}:manager")]]
             text = (f"حساب {exact_id}\nشناسهٔ عددی و مثبت تلگرامِ دریافت‌کننده را ارسال کنید."
                     + (f" سطح انتخاب‌شده: {selected_level}." if selected_level else " ابتدا سطح viewer یا manager را انتخاب کنید."))
             return render_page("شروع اعطای دسترسی", text, persona=_persona(ctx, persona),
@@ -152,8 +152,8 @@ def begin_grant(
                                f"کاربر {selected_grantee} برای حساب {exact_id}. سطح viewer یا manager را انتخاب کنید.",
                                persona=_persona(ctx, persona), page_kind="form",
                                parent_callback=parent_callback,
-                               rows=[[button("viewer", f"v52:gset:{exact_id}:viewer"),
-                                      button("manager", f"v52:gset:{exact_id}:manager")]])
+                               rows=[[button("👁 مشاهده‌گر (Viewer)", f"v52:gset:{exact_id}:viewer"),
+                                      button("⚙️ مدیر حساب (Manager)", f"v52:gset:{exact_id}:manager")]])
         return preview_grant(ctx, exact_id, selected_grantee, selected_level,
                              persona=persona, parent_callback=parent_callback)
     except (ValueError, TypeError, PermissionError) as exc:

@@ -91,8 +91,17 @@ async def build_account_card(
     account_loader: Callable[[int], Mapping[str, Any] | None] | None = None,
     authorizer: Callable[[Any, int, str], bool] | None = None,
     now: int | None = None,
+    parent_callback: str | None = None,
 ) -> AccountCard:
-    """Read this account's own panel only; an unavailable read remains unknown."""
+    """Read this account's own panel only; an unavailable read remains unknown.
+
+    ``parent_callback`` is the surface the card was opened from. A drill-down from a
+    360-degree profile passes that profile, so Back returns to the person the
+    operator was working on. Without one the card offers the persona home: the
+    previous default was ``v52:accounts:<persona>``, which was never registered in
+    ``v52_router._CALLBACK_PATTERNS``, so every back press on this card resolved to
+    no Route and surfaced the registry error page instead of navigating.
+    """
     if isinstance(account_id, bool) or int(account_id) <= 0:
         raise ValueError("account_id must be positive")
     exact_id = int(account_id)
@@ -172,7 +181,8 @@ async def build_account_card(
         rows.append([button("ترافیک", f"v52:traffic:{exact_id}"),
                      button("زمان", f"v52:expiry:{exact_id}")])
     page = render_page(f"حساب {label}", body, persona=persona, root=False,
-                       parent_callback=f"v52:accounts:{persona}", rows=rows)
+                       parent_callback=parent_callback or f"v52:home:{persona}",
+                       rows=rows)
     return AccountCard(exact_id, page.text, page.reply_markup, snapshot, status, seen_at)
 
 
@@ -185,11 +195,12 @@ async def refresh_account_card(
     account_loader: Callable[[int], Mapping[str, Any] | None] | None = None,
     authorizer: Callable[[Any, int, str], bool] | None = None,
     now: int | None = None,
+    parent_callback: str | None = None,
 ) -> dict[str, Any]:
     """Edit the same Telegram message; edit errors never mutate business state."""
     card = await build_account_card(
         ctx, account_id, adapter_factory=adapter_factory, account_loader=account_loader,
-        authorizer=authorizer, now=now,
+        authorizer=authorizer, now=now, parent_callback=parent_callback,
     )
     try:
         await _await(message.edit_text(

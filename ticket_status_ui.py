@@ -44,6 +44,136 @@ def _value(obj: Any, key: str, default=None):
     return obj.get(key, default) if isinstance(obj, Mapping) else getattr(obj, key, default)
 
 
+# --------------------------------------------------------------------------- #
+# S58 — the step-by-step status wizard
+#
+# The status used to be one ``code | title | emoji | group`` line, so an operator
+# had to remember four positional fields and a keyword. The wizard asks for them
+# one at a time — group and emoji as buttons, the title as text — and shows a
+# preview card before anything is written.
+# --------------------------------------------------------------------------- #
+
+GROUP_CHOICES: tuple[tuple[str, str], ...] = (
+    ("🟢 گروه باز", "open"),
+    ("🟡 گروه در حال بررسی", "answered"),
+    ("🔴 گروه بسته‌شده", "closed"),
+)
+EMOJI_CHOICES: tuple[tuple[str, str], ...] = (
+    ("🟢", "🟢"), ("🟡", "🟡"), ("🟠", "🟠"), ("🔵", "🔵"), ("🟣", "🟣"),
+    ("🔴", "🔴"), ("⏳", "⏳"), ("✅", "✅"), ("📌", "📌"),
+)
+
+
+def _status_code_from_title(title: Any) -> str:
+    """Derive a valid status code from a Persian title.
+
+    A Persian title has no Latin letters to slug, so the fallback is a stable hash
+    of the title rather than an empty code — the code is an internal identifier the
+    operator never has to type.
+    """
+    import hashlib
+    import re
+    slug = re.sub(r"[^a-z0-9]+", "_", str(title or "").strip().lower()).strip("_")
+    if re.fullmatch(r"[a-z][a-z0-9_]{1,31}", slug or ""):
+        return slug
+    return "status_" + hashlib.sha1(str(title or "").encode("utf-8")).hexdigest()[:8]
+
+
+def _title_from_text(raw: Any) -> str:
+    title = str(raw or "").strip()
+    if not title:
+        raise ValueError("عنوان فارسی وضعیت را وارد کنید.")
+    if len(title) > 60:
+        raise ValueError("عنوان وضعیت نباید بیشتر از ۶۰ نویسه باشد.")
+    return title
+
+
+def _ticket_status_preview(values: Mapping[str, Any]) -> str:
+    return "\n".join([
+        f"• گروه: <b>{GROUP_FA.get(str(values.get('group_key')), '—')}</b>",
+        f"• نشان: <b>{values.get('emoji') or '—'}</b>",
+        f"• عنوان: <b>{values.get('title_fa') or '—'}</b>",
+        f"• کد داخلی: <code>{values.get('code') or _status_code_from_title(values.get('title_fa'))}</code>",
+    ])
+
+
+def _commit_ticket_status_new(values: Mapping[str, Any], actor: Mapping[str, Any]) -> str:
+    code = str(values.get("code") or "").strip() or _status_code_from_title(values.get("title_fa"))
+    with _db() as conn:
+        created = _service().create_status(
+            conn, code=code, title_fa=values.get("title_fa"),
+            emoji=values.get("emoji"), group_key=values.get("group_key"))
+        conn.commit()
+    return (f"وضعیت {created['emoji']} {created['title_fa']} ثبت شد.\n"
+            f"کد: {created['code']}\n"
+            f"گروه: {GROUP_FA.get(created['group_key'], created['group_key'])}\n\n"
+            "از این پس می‌توانید این وضعیت را روی هر تیکت انتخاب کنید.")
+
+
+def _commit_ticket_status_edit(values: Mapping[str, Any], actor: Mapping[str, Any]) -> str:
+    code = str(values.get("code") or "").strip()
+    if not code:
+        raise ValueError("کد وضعیت برای ویرایش مشخص نیست.")
+    with _db() as conn:
+        updated = _service().update_status(
+            conn, code, title_fa=values.get("title_fa"),
+            emoji=values.get("emoji"), group_key=values.get("group_key"))
+        conn.commit()
+    return (f"وضعیت {updated['emoji']} {updated['title_fa']} به‌روز شد.\n"
+            f"کد: {updated['code']}\n"
+            f"گروه: {GROUP_FA.get(updated['group_key'], updated['group_key'])}")
+
+
+def _legacy_ticket_status(raw: Any) -> dict | None:
+    """Accept the pre-wizard ``code | title | emoji | group`` line at step 1."""
+    parts = [chunk.strip() for chunk in str(raw or "").split("|")]
+    if len(parts) < 2:
+        return None
+    code, title = parts[0], parts[1]
+    emoji = parts[2] if len(parts) > 2 else "📌"
+    group = parts[3] if len(parts) > 3 else "open"
+    try:
+        return {"code": _service()._clean_code(code), "title_fa": _title_from_text(title),
+                "emoji": emoji, "group_key": group}
+    except (ValueError, TypeError):
+        return None
+
+
+def _register_ticket_status_wizards() -> None:
+    import ui_v52
+    steps = (
+        ui_v52.WizardStep("group_key", "گروه چرخهٔ عمر", hint=GROUP_HINT, choices=GROUP_CHOICES),
+        ui_v52.WizardStep("emoji", "نشان وضعیت", choices=EMOJI_CHOICES),
+        ui_v52.WizardStep("title_fa", "عنوان فارسی وضعیت", parse=_title_from_text),
+    )
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "ticket_status_new", "افزودن وضعیت تیکت", steps,
+        _ticket_status_preview, _commit_ticket_status_new,
+        legacy=_legacy_ticket_status))
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "ticket_status_edit", "ویرایش وضعیت تیکت", steps,
+        _ticket_status_preview, _commit_ticket_status_edit,
+        legacy=lambda raw: None))
+
+
+_register_ticket_status_wizards()
+
+
+def _start_ticket_status_wizard(ctx: Any, flow_key: str, parent_callback: str, *,
+                                seed: Mapping[str, Any] | None = None):
+    """Open one status wizard on the caller's own conversation store."""
+    import ui_v52
+    user_data = _value(ctx, "user_data", None)
+    if not isinstance(user_data, dict):
+        user_data = {}
+        if isinstance(ctx, dict):
+            ctx["user_data"] = user_data
+    state = ui_v52.start_wizard(
+        user_data, flow_key, return_callback=parent_callback, seed=dict(seed or {}),
+        message_id=_value(ctx, "message_id"), chat_id=_value(ctx, "chat_id"))
+    return ui_v52.render_wizard_step(state)
+
+
 def _db():
     import database
     return database.get_db()
@@ -97,31 +227,21 @@ def ticket_status_settings(ctx: Any, *, parent_callback: str | None = "v52:home:
 
 
 def begin_ticket_status_new(ctx: Any, *, parent_callback: str | None = "v52:ticketsettings"):
-    """Arm the text input for a brand-new status."""
+    """Open the step-by-step wizard for a brand-new status."""
     try:
         if not _value(ctx, "is_root", False):
             raise PermissionError("افزودن وضعیت تیکت فقط در اختیار مدیر کل است.")
         if str(_value(ctx, "chat_type", "private")).lower() != "private":
             raise PermissionError("افزودن وضعیت تیکت فقط در پیوی مدیریت انجام می‌شود.")
-        import v52_router
-        import time
-        v52_router.DEFAULT_FSM.set(
-            ctx, "ticket_status_new", payload={}, parent_callback=parent_callback,
-            now=int(time.time()))
-        return render_page(
-            "➕ وضعیت تیکت جدید",
-            NEW_FORMAT + "\n\n" + GROUP_HINT,
-            persona="admin", page_kind="form",
-            rows=[[button("بازگشت به تنظیمات", parent_callback or "v52:ticketsettings")]],
-            parent_callback=parent_callback,
-        )
+        return _start_ticket_status_wizard(
+            ctx, "ticket_status_new", parent_callback or "v52:ticketsettings")
     except (TypeError, ValueError, PermissionError) as exc:
         return render_error(str(exc), persona="admin", parent_callback=parent_callback)
 
 
 def begin_ticket_status_edit(ctx: Any, code: str, *,
                              parent_callback: str | None = "v52:ticketsettings"):
-    """Arm the text input for editing one status."""
+    """Open the step-by-step wizard for editing one existing status."""
     try:
         if not _value(ctx, "is_root", False):
             raise PermissionError("ویرایش وضعیت تیکت فقط در اختیار مدیر کل است.")
@@ -131,24 +251,10 @@ def begin_ticket_status_edit(ctx: Any, code: str, *,
             current = _service().get_status(conn, code)
         if current is None:
             raise ValueError("وضعیت موردنظر یافت نشد.")
-        import v52_router
-        import time
-        v52_router.DEFAULT_FSM.set(
-            ctx, "ticket_status_edit", payload={"code": current["code"]},
-            parent_callback=parent_callback, now=int(time.time()))
-        body = (
-            f"ویرایش وضعیت {current['emoji']} {current['title_fa']}\n"
-            f"کد: <code>{current['code']}</code>\n"
-            f"گروه فعلی: {GROUP_FA.get(current['group_key'], current['group_key'])}\n"
-            f"ترتیب فعلی: {current['sort_order']}\n"
-            f"وضعیت فعلی: {'روشن' if current['is_active'] else 'خاموش'}\n\n"
-            + EDIT_FORMAT + "\n\n" + GROUP_HINT
-        )
-        return render_page(
-            "✏️ ویرایش وضعیت تیکت", body, persona="admin", page_kind="form",
-            rows=[[button("بازگشت به تنظیمات", parent_callback or "v52:ticketsettings")]],
-            parent_callback=parent_callback,
-        )
+        return _start_ticket_status_wizard(
+            ctx, "ticket_status_edit", parent_callback or "v52:ticketsettings",
+            seed={"code": current["code"], "title_fa": current["title_fa"],
+                  "emoji": current["emoji"], "group_key": current["group_key"]})
     except (TypeError, ValueError, PermissionError) as exc:
         return render_error(str(exc), persona="admin", parent_callback=parent_callback)
 

@@ -263,6 +263,17 @@ def test_a_scoped_viewer_gets_no_management_control_at_all(monkeypatch):
     assert "rep:my_network" in callbacks
 
 
+def _is_bridged(handler: str) -> bool:
+    """Whether the v5.2 bridge implements a registry handler name.
+
+    A registry entry with no bridge renders the "not connected to the Bridge" error
+    page, so the registry and the bridge must agree for every callback the card
+    emits. ``rep_bot`` is imported lazily because it pulls in the whole bot.
+    """
+    import rep_bot
+    return f'"{handler}"' in Path(rep_bot.__file__).read_text(encoding="utf-8")
+
+
 def test_the_card_never_emits_a_callback_the_router_rejects(monkeypatch):
     _stub_profile_reads(monkeypatch)
     _text, rows = profile_360.build_profile_page(
@@ -270,8 +281,14 @@ def test_the_card_never_emits_a_callback_the_router_rejects(monkeypatch):
     for callback in _callbacks(rows):
         if callback.startswith("p360:"):
             assert profile_360.parse_profile_callback(callback) is not None, callback
-        else:
-            assert not callback.startswith("v52:"), f"unregistered v52 callback: {callback}"
+        elif callback.startswith("v52:"):
+            # The card's cross-persona management actions live in the v5.2
+            # namespace, so every one of them must resolve to a registered route
+            # *and* to a bridge handler — a registry entry with no bridge renders
+            # the "not connected to the Bridge" error page instead of a page.
+            route = v52_router.route_callback(callback)
+            assert isinstance(route, v52_router.Route), callback
+            assert _is_bridged(route.handler), callback
 
 
 # --------------------------------------------------------------------------
@@ -381,8 +398,12 @@ def test_the_management_prompt_back_button_returns_to_the_profile(monkeypatch, t
 
         callbacks = _callbacks(query.message.edits[-1][1]["reply_markup"].inline_keyboard)
         assert f"admin:user_detail:{CUSTOMER_TG_ID}:rcp:42" in callbacks
-        state = context.user_data["admin_state"]
+        # S58: the form is a wizard now, so the originating surface travels in the
+        # wizard's own state instead of ``admin_state``. The guarantee is the same —
+        # the post-save page returns to the card the form was opened from.
+        state = context.user_data["v52_wizard"]
         assert state["origin"] == "rcp" and state["ref"] == "42"
+        assert state["return_callback"] == f"admin:user_detail:{CUSTOMER_TG_ID}:rcp:42"
 
 
 # --------------------------------------------------------------------------

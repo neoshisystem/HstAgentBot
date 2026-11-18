@@ -6,13 +6,130 @@ quote/order/payment services remain the only sources of executable state.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
+import service_errors_fa
 from ui_v52 import button, render_error, render_page
+
+#: Every timestamp on a checkout page is shown in Tehran wall time; the epoch
+#: second is what the services store, never what the operator reads.
+_TEHRAN = ZoneInfo("Asia/Tehran")
+
+#: Internal state tokens -> the words the operator reads. A token that is not in
+#: the map is reported as «نامشخص» rather than echoed: ARCH-UX-002 forbids showing
+#: a raw English identifier, and an unknown token is exactly the case where the
+#: operator must fall back to the support route.
+_PAYMENT_STATES_FA = {
+    "awaiting_payment": "در انتظار پرداخت",
+    "pending": "در انتظار پرداخت",
+    "paid": "پرداخت‌شده",
+    "confirmed": "تأییدشده",
+    "rejected": "رد شده",
+    "late": "پرداخت با تأخیر",
+    "refunded": "بازگشت‌خورده",
+    "cancelled": "لغو شده",
+    "canceled": "لغو شده",
+    "failed": "ناموفق",
+    "unknown": "نامشخص",
+}
+_OPERATION_STATES_FA = {
+    "not_started": "شروع نشده",
+    "pending": "در انتظار",
+    "running": "در حال انجام",
+    "in_progress": "در حال انجام",
+    "succeeded": "موفق",
+    "success": "موفق",
+    "failed": "ناموفق",
+    "cancelled": "لغو شده",
+    "unknown": "نامشخص",
+}
+_DELIVERY_STATES_FA = {
+    "not_started": "شروع نشده",
+    "pending": "در انتظار",
+    "in_progress": "در حال انجام",
+    "delivered": "تحویل شده",
+    "failed": "ناموفق",
+    "cancelled": "لغو شده",
+    "unknown": "نامشخص",
+}
+_RAILS_FA = {"wallet": "کیف پول", "card": "کارت‌به‌کارت", "exempt": "معاف از پرداخت"}
+_ADDONS_FA = {"gib": "افزایش حجم (GiB)", "day": "افزایش زمان (روز)"}
+
+_UNKNOWN_FA = "نامشخص"
+_UNLIMITED_FA = "نامحدود"
 
 
 def _get(value: Any, key: str, default=None):
     return value.get(key, default) if isinstance(value, Mapping) else getattr(value, key, default)
+
+
+def _label_fa(value: Any, labels: Mapping[str, str]) -> str:
+    """The Persian label of an internal token; never the token itself."""
+    return labels.get(str(value or "").strip().lower(), _UNKNOWN_FA)
+
+
+def _digits(value: Any) -> str | None:
+    """The plain digits of a byte/second count, or ``None`` when it is not a number."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _gib_fa(quota_bytes: int) -> str:
+    """A byte count as a readable GiB amount, trimmed of trailing zeros."""
+    gib = f"{quota_bytes / (1024 ** 3):.2f}".rstrip("0").rstrip(".")
+    return f"{gib} گیگابایت"
+
+
+def _volume_fa(snapshot: Mapping[str, Any]) -> str:
+    """The Persian volume of one side of a renewal; never a mapping or a raw key."""
+    if str(snapshot.get("quota_mode") or "").strip().lower() == "unlimited":
+        return _UNLIMITED_FA
+    quota = _digits(snapshot.get("quota_bytes"))
+    if quota is None:
+        return _UNKNOWN_FA
+    return f"{quota} بایت ({_gib_fa(int(quota))})"
+
+
+def _expiry_fa(snapshot: Mapping[str, Any]) -> str:
+    """The Persian expiry of one side of a renewal, in Tehran wall time."""
+    mode = str(snapshot.get("time_mode") or "").strip().lower()
+    if mode == "unlimited":
+        return _UNLIMITED_FA
+    if mode == "on_hold":
+        return "حساب معلق است و زمان‌بندی فعال ندارد"
+    epoch = _digits(snapshot.get("expires_at"))
+    if epoch is None:
+        return _UNKNOWN_FA
+    local = datetime.fromtimestamp(int(epoch), tz=timezone.utc).astimezone(_TEHRAN)
+    return f"{local.strftime('%Y-%m-%d %H:%M')} به وقت تهران"
+
+
+def _renewal_side_fa(label: str, snapshot: Mapping[str, Any]) -> list[str]:
+    """The labelled volume/time block for one side of a frozen renewal snapshot.
+
+    ``services.renewal_calculator`` speaks in ``quota_mode``/``quota_bytes``/
+    ``used_bytes``/``time_mode``/``expires_at`` (and ``days`` on the target side).
+    Those keys are internal: the operator gets labelled Persian values, and every
+    value passes through a formatter, so no mapping can reach the page.
+    """
+    lines = [f"{label}:", f"• حجم: {_volume_fa(snapshot)}"]
+    used = _digits(snapshot.get("used_bytes"))
+    if used is not None:
+        lines.append(f"• مصرف‌شده: {used} بایت")
+    lines.append(f"• انقضا: {_expiry_fa(snapshot)}")
+    remaining = _digits(snapshot.get("remaining_days"))
+    if remaining is not None:
+        lines.append(f"• روزهای باقی‌مانده: {remaining} روز")
+    added = _digits(snapshot.get("days"))
+    if added is not None:
+        lines.append(f"• زمان افزوده‌شدهٔ این تمدید: {added} روز")
+    return lines
 
 
 def _positive(value: Any, label: str) -> int:
@@ -67,7 +184,7 @@ def _quote_values(quote: Mapping[str, Any]) -> tuple[int, str, list, Mapping]:
 
 def _quote_lines(amount: int, quote: Mapping[str, Any], edges: list) -> list[str]:
     lines = [f"مبلغ نهاییِ quote قفل‌شده: {amount:,} تومان"]
-    lines.append(f"Quote: {quote.get('quote_id') or 'شناسه در جریان checkout'}")
+    lines.append(f"شناسهٔ quote: {quote.get('quote_id') or 'شناسه در جریان تسویه'}")
     if edges:
         lines.append("زنجیرهٔ قیمت:")
         for edge in edges:
@@ -108,7 +225,7 @@ def preview_buy(
                            persona=persona or _persona(ctx), page_kind="preview",
                            parent_callback=parent_callback, rows=rows)
     except (TypeError, ValueError) as exc:
-        return render_error(str(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
 
 
 def preview_renew(
@@ -147,14 +264,15 @@ def preview_renew(
         if after is not None and frozen.get("after") is not None and dict(after) != dict(frozen["after"]):
             raise ValueError("after snapshot differs from the frozen quote")
         lines = [f"حساب: {aid}", f"پلن: {code}", *_quote_lines(amount, quote, edges),
-                 f"قبل: {dict(selected_before)}", f"بعد از تمدید: {dict(selected_after)}"]
+                 *_renewal_side_fa("وضعیت پیش از تمدید", selected_before),
+                 *_renewal_side_fa("وضعیت پس از تمدید", selected_after)]
         callback = redirect_callback or f"v52:renew:{aid}:{code}"
         return render_page("پیش‌نمایش تمدید", "\n".join(lines),
                            persona=persona or _persona(ctx), page_kind="preview",
                            parent_callback=parent_callback,
                            rows=[[button("ادامه", callback)]])
     except (TypeError, ValueError) as exc:
-        return render_error(str(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
 
 
 def begin_addon(
@@ -174,7 +292,7 @@ def begin_addon(
         if kind not in {"gib", "day"}:
             raise ValueError("addon_type must be gib or day")
         if on_hold and kind == "day":
-            raise ValueError("افزودن روز برای حساب on-hold مجاز نیست؛ فقط افزایش حجم امکان‌پذیر است.")
+            raise ValueError("افزودن روز برای حساب معلق مجاز نیست؛ فقط افزایش حجم امکان‌پذیر است.")
         if value is None:
             rows = [[button("افزایش حجم (GiB)", f"v52:addon:{aid}:gib")]]
             if not on_hold:
@@ -182,7 +300,7 @@ def begin_addon(
             return render_page(
                 "افزونهٔ حساب",
                 f"حساب: {aid}\nنوع افزونه را انتخاب کنید."
-                + ("\nحساب on-hold است؛ گزینهٔ زمان مسدود است." if on_hold else ""),
+                + ("\nاین حساب معلق است؛ گزینهٔ زمان مسدود است." if on_hold else ""),
                 persona=persona or _persona(ctx), page_kind="form",
                 parent_callback=parent_callback, rows=rows,
             )
@@ -198,13 +316,14 @@ def begin_addon(
             display = f"{int(value)} روز"
         return render_page(
             "پیش‌نمایش افزونه",
-            f"حساب: {aid}\nنوع: {kind}\nمقدار: {display}\nقیمت فقط از quote نهایی سرویس قیمت‌گذاری خوانده می‌شود.",
+            f"حساب: {aid}\nنوع: {_label_fa(kind, _ADDONS_FA)}\nمقدار: {display}\n"
+            "قیمت فقط از برآورد نهایی سرویس قیمت‌گذاری خوانده می‌شود.",
             persona=persona or _persona(ctx), page_kind="preview",
             parent_callback=parent_callback,
             rows=[[button("بازگشت به حساب", f"v52:account:{aid}")]],
         )
     except (TypeError, ValueError) as exc:
-        return render_error(str(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
 
 
 def choose_rail(
@@ -236,7 +355,7 @@ def choose_rail(
             if amount <= 0:
                 raise ValueError("پرداخت کیف‌پولی فقط برای سفارش مبلغ‌دار معتبر است")
             if wallet_balance is None:
-                raise ValueError("ماندهٔ قابل‌مصرف کیف‌پول باید از financial_service خوانده شود")
+                raise ValueError("ماندهٔ قابل‌مصرف کیف‌پول باید از سرویس مالی خوانده شود؛ این صفحه خودش موجودی نمی‌سازد.")
             balance = _money(wallet_balance, "wallet_balance")
             if balance < amount:
                 return render_page(
@@ -254,14 +373,14 @@ def choose_rail(
         normalized = "card" if selected == "card_to_card" else selected
         return render_page(
             "تأیید روش پرداخت",
-            f"سفارش: {order_id}\nروش: {normalized}\nمبلغ کامل: {amount:,} تومان\n"
+            f"سفارش: {order_id}\nروش: {_label_fa(normalized, _RAILS_FA)}\nمبلغ کامل: {amount:,} تومان\n"
             "انتخاب روش به‌تنهایی پرداخت یا تحویل را انجام نمی‌دهد.",
             persona=persona or _persona(ctx), page_kind="preview",
             parent_callback=parent_callback,
             rows=[[button("ادامه", f"v52:pay:{order_id}:{'card' if normalized == 'card' else normalized}")]],
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
 
 
 def preview_receipt(
@@ -309,7 +428,7 @@ def preview_receipt(
             rows=[[button("ارسال رسید", f"v52:receipt:{attempt.get('attempt_id', '')}")]],
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
 
 
 def show_order(
@@ -338,9 +457,9 @@ def show_order(
         lines = [
             f"سفارش: {order_id}",
             f"مبلغ: {_money(order.get('amount_toman')):,} تومان",
-            f"وضعیت پرداخت: {payment_state}",
-            f"وضعیت عملیات: {operation_state}",
-            f"وضعیت تحویل: {delivery_state}",
+            f"وضعیت پرداخت: {_label_fa(payment_state, _PAYMENT_STATES_FA)}",
+            f"وضعیت عملیات: {_label_fa(operation_state, _OPERATION_STATES_FA)}",
+            f"وضعیت تحویل: {_label_fa(delivery_state, _DELIVERY_STATES_FA)}",
         ]
         if payment_state in {"pending", "awaiting_payment", "unknown", "late", "rejected"}:
             lines.append("پرداخت هنوز نهایی نشده است؛ هیچ تحویلی از این صفحه نتیجه‌گیری نمی‌شود.")
@@ -355,7 +474,7 @@ def show_order(
             rows=[[button("بازگشت به سفارش‌ها", "v52:orders")]],
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
 
 
 __all__ = [

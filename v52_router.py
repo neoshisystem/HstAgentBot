@@ -155,6 +155,10 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:shop:catalog$"), "view_catalog", "actor", lambda m: {}),
     (re.compile(r"^v52:shop:new$"), "begin_product_wizard", "root", lambda m: {}),
     (re.compile(r"^v52:shop:wiz:(delivery|audience):([a-z_]+)$"), "product_wizard_choice", "root", lambda m: {"field": m[1], "value": m[2]}),
+    # The preview card's own controls and the skippable usage-guide step. They reuse
+    # the same bridge handler, which already understands confirm/edit/skip.
+    (re.compile(r"^v52:shop:wiz:(confirm|edit)$"), "product_wizard_choice", "root", lambda m: {"field": m[1], "value": ""}),
+    (re.compile(r"^v52:shop:wiz:skip:([a-z_]+)$"), "product_wizard_choice", "root", lambda m: {"field": "skip", "value": ""}),
     (re.compile(r"^v52:shop:product:([1-9][0-9]{0,17})$"), "admin_product_detail", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:stock:([1-9][0-9]{0,17})$"), "begin_product_stock", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:edit:([1-9][0-9]{0,17})$"), "begin_product_edit", "root", lambda m: {"product_id": int(m[1])}),
@@ -228,6 +232,31 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:q:([A-Za-z0-9_-]{16,40})$"), "resolve_quote_preview", "actor+seller", lambda m: {"nonce": m[1]}),
     (re.compile(r"^v52:ok:([A-Za-z0-9_-]{16,40})$"), "consume_and_dispatch", "same actor/bot/action/revision", lambda m: {"nonce": m[1]}),
     (re.compile(r"^v52:no:([A-Za-z0-9_-]{16,40})$"), "cancel_confirmation", "same actor/bot", lambda m: {"nonce": m[1]}),
+    # --- S58: the shared step-by-step wizard controls ------------------------ #
+    # One registered namespace for every wizard in the product. The step and choice
+    # are positional indexes rather than values, so a callback stays short, ASCII
+    # and free of the operator's own text.
+    (re.compile(r"^v52:wz:cancel$"), "wizard_cancel", "actor DM", lambda m: {}),
+    (re.compile(r"^v52:wz:prev$"), "wizard_prev", "actor DM", lambda m: {}),
+    (re.compile(r"^v52:wz:edit$"), "wizard_edit", "actor DM", lambda m: {}),
+    (re.compile(r"^v52:wz:confirm$"), "wizard_confirm", "actor DM", lambda m: {}),
+    (re.compile(r"^v52:wz:pick:([0-9]{1,2}):([0-9]{1,2})$"), "wizard_pick", "actor DM", lambda m: {"step": int(m[1]), "choice": int(m[2])}),
+    (re.compile(r"^v52:wz:done:([0-9]{1,2})$"), "wizard_done", "actor DM", lambda m: {"step": int(m[1])}),
+    (re.compile(r"^v52:wz:skip:([0-9]{1,2})$"), "wizard_skip", "actor DM", lambda m: {"step": int(m[1])}),
+    (re.compile(r"^v52:wz:gen:([0-9]{1,2})$"), "wizard_generate", "actor DM", lambda m: {"step": int(m[1])}),
+    # --- S58: the 360-degree profile hub ------------------------------------- #
+    # The profile card's two cross-persona management actions, plus the two
+    # contextual drill-downs that carry the card they were opened from. Every one
+    # of them is implemented in ``rep_bot._dispatch_v52_callback``: a registry
+    # entry without a bridge renders the "not connected to the Bridge" error page
+    # instead of the page the operator asked for. The originating surface is an
+    # optional group on the two management routes, because a reference long enough
+    # to overflow Telegram's 64-byte callback budget is dropped by the emitter
+    # rather than sent.
+    (re.compile(r"^v52:p360new:([1-9][0-9]{0,17})(?::(tx|rcp|ticket|reg|users|reps|abuse|repnet):([A-Za-z0-9_-]{1,40}))?$"), "p360_issue_service", "root/downstream rep", lambda m: {"user_id": int(m[1]), "origin": m[2] or "", "ref": m[3] or ""}),
+    (re.compile(r"^v52:p360own:([1-9][0-9]{0,17})(?::(tx|rcp|ticket|reg|users|reps|abuse|repnet):([A-Za-z0-9_-]{1,40}))?$"), "p360_transfer_ownership", "root/downstream rep", lambda m: {"user_id": int(m[1]), "origin": m[2] or "", "ref": m[3] or ""}),
+    (re.compile(r"^v52:p360acc:([1-9][0-9]{0,17}):([1-9][0-9]{0,17}):(tx|rcp|ticket|reg|users|reps|abuse|repnet):([A-Za-z0-9_-]{1,40})$"), "p360_account_card", "root/downstream rep", lambda m: {"account_id": int(m[1]), "user_id": int(m[2]), "origin": m[3], "ref": m[4]}),
+    (re.compile(r"^v52:p360tkt:([A-Za-z0-9_-]{1,32}):([1-9][0-9]{0,17}):(tx|rcp|ticket|reg|users|reps|abuse|repnet):([A-Za-z0-9_-]{1,40})$"), "p360_ticket", "root/downstream rep", lambda m: {"ticket_id": m[1], "user_id": int(m[2]), "origin": m[3], "ref": m[4]}),
 )
 
 

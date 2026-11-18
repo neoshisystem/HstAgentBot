@@ -481,7 +481,7 @@ def _wizard_summary(answers: Mapping[str, Any]) -> str:
     if answers.get("base_price") is not None:
         collected.append(f"قیمت: {int(answers['base_price']):,} تومان")
     if answers.get("description"):
-        collected.append("توضیحات: ثبت شد")
+        collected.append("راهنمای استفاده: ثبت شد")
     if answers.get("audience"):
         collected.append(f"مخاطب: {_AUDIENCE_LABELS.get(str(answers['audience']), answers['audience'])}")
     if not collected:
@@ -498,29 +498,50 @@ def _render_wizard_step(ctx: Any, step: str, answers: Mapping[str, Any],
         parent_callback=parent_callback, now=_now())
     summary = _wizard_summary(answers)
     cancel = [[button("لغو", parent_callback or "v52:shop")]]
-    if step == "title":
-        return "گام ۱ از ۶ — نام محصول را در پیام بعدی ارسال کنید." + summary, cancel
-    if step == "category":
-        return ("گام ۲ از ۶ — نام دسته‌بندی را ارسال کنید (اگر نباشد ساخته می‌شود)."
-                + summary, cancel)
+    prompts = {
+        "title": "گام ۱ از ۶ — نام محصول را در پیام بعدی ارسال کنید.",
+        "category": "گام ۲ از ۶ — نام دسته‌بندی را ارسال کنید (اگر نباشد ساخته می‌شود).",
+        "price": "گام ۵ از ۶ — قیمت پایه به تومان را ارسال کنید (فقط عدد).",
+        "description": "گام ۶ از ۶ — راهنمای استفاده/توضیحات را ارسال کنید یا رد کنید.",
+    }
+    if step in prompts:
+        rows = cancel
+        if step == "description":
+            rows = [[button("رد کردن راهنما", "v52:shop:wiz:skip:description")], *cancel]
+        return prompts[step] + summary, rows
     if step == "delivery":
-        return ("گام ۳ از ۶ — نوع تحویل را انتخاب کنید." + summary, [
-            [button("تحویل خودکار از موجودی انبار / کد دیجیتال",
-                    "v52:shop:wiz:delivery:auto_inventory")],
+        return "گام ۳ از ۶ — نوع تحویل را انتخاب کنید." + summary, [
+            [button("تحویل خودکار از موجودی انبار / کد دیجیتال", "v52:shop:wiz:delivery:auto_inventory")],
             [button("تحویل دستی توسط ادمین", "v52:shop:wiz:delivery:manual_fulfill")],
             [button("لغو", parent_callback or "v52:shop")],
-        ])
-    if step == "price":
-        return ("گام ۴ از ۶ — قیمت پایه به تومان را ارسال کنید (فقط عدد)."
-                + summary, cancel)
-    if step == "description":
-        return "گام ۵ از ۶ — توضیحات محصول را ارسال کنید." + summary, cancel
-    return ("گام ۶ از ۶ — گروه مخاطب مجاز را انتخاب کنید." + summary, [
-        [button("همه", "v52:shop:wiz:audience:all")],
-        [button("فقط نمایندگان", "v52:shop:wiz:audience:rep")],
-        [button("فقط کاربران", "v52:shop:wiz:audience:user")],
-        [button("لغو", parent_callback or "v52:shop")],
+        ]
+    if step == "audience":
+        return "گام ۴ از ۶ — گروه مخاطب مجاز را انتخاب کنید." + summary, [
+            [button("همه", "v52:shop:wiz:audience:all")],
+            [button("فقط نمایندگان", "v52:shop:wiz:audience:rep")],
+            [button("فقط کاربران", "v52:shop:wiz:audience:user")],
+            [button("لغو", parent_callback or "v52:shop")],
+        ]
+    return _render_product_preview(answers, parent_callback)
+
+
+def _render_product_preview(answers: Mapping[str, Any], parent_callback: str | None):
+    body = "\n".join([
+        "پیش‌نمایش محصول جدید",
+        "",
+        f"نام: {answers.get('title', '')}",
+        f"دسته‌بندی: {answers.get('category_title', '')}",
+        f"نوع تحویل: {_DELIVERY_LABELS.get(str(answers.get('delivery_type')), answers.get('delivery_type', ''))}",
+        f"گروه مخاطب: {_AUDIENCE_LABELS.get(str(answers.get('audience')), answers.get('audience', ''))}",
+        f"قیمت پایه: {int(answers.get('base_price') or 0):,} تومان",
+        f"راهنمای استفاده: {'ثبت شده' if answers.get('description') else 'ندارد'}",
+        "\nبا تأیید نهایی محصول و دستهٔ جدید (در صورت نیاز) ثبت می‌شوند.",
     ])
+    return body, [
+        [button("✅ تأیید و ثبت محصول", "v52:shop:wiz:confirm")],
+        [button("✏️ ویرایش پاسخ‌ها", "v52:shop:wiz:edit")],
+        [button("لغو", parent_callback or "v52:shop")],
+    ]
 
 
 def _persist_wizard_product(ctx: Any, answers: Mapping[str, Any], parent_callback: str | None):
@@ -548,49 +569,60 @@ def _persist_wizard_product(ctx: Any, answers: Mapping[str, Any], parent_callbac
         "is_active": True,
     })
     pid = int(saved["id"])
-    lines = [
-        "✅ محصول ثبت شد.",
-        f"شناسه: {pid}",
-        f"نام: {title}",
-        f"دسته‌بندی: {category_title}",
-        f"نوع تحویل: {_DELIVERY_LABELS.get(delivery, delivery)}",
-        f"گروه مخاطب: {_AUDIENCE_LABELS.get(audience, audience)}",
-        f"قیمت پایه: {base:,} تومان",
-    ]
-    rows = [
+    lines = ["✅ محصول ثبت شد.", f"شناسه: {pid}", f"نام: {title}",
+             f"دسته‌بندی: {category_title}",
+             f"نوع تحویل: {_DELIVERY_LABELS.get(delivery, delivery)}",
+             f"گروه مخاطب: {_AUDIENCE_LABELS.get(audience, audience)}",
+             f"قیمت پایه: {base:,} تومان"]
+    return "\n".join(lines), [
         [button("📦 مشاهده و مدیریت محصول", f"v52:shop:product:{pid}")],
         [button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")],
     ]
-    return "\n".join(lines), rows
+
+
+def confirm_product_wizard(ctx: Any, *, parent_callback: str | None = "v52:shop"):
+    """Explicitly confirm the staged product and persist its category/product."""
+    try:
+        _require_root(ctx)
+        import v52_router
+        entry = v52_router.DEFAULT_FSM.peek(ctx, now=_now())
+        if entry is None or entry.state != "goods_product_draft":
+            raise ValueError("ویزارد افزودن محصول فعال نیست؛ از ابتدا شروع کنید.")
+        payload = dict(entry.payload or {})
+        if payload.get("step") != "preview":
+            raise ValueError("ابتدا همهٔ گام‌ها را تکمیل کنید.")
+        result = _persist_wizard_product(ctx, payload, parent_callback)
+        v52_router.DEFAULT_FSM.clear(ctx)
+        return result
+    except (TypeError, ValueError, PermissionError) as exc:
+        return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
 
 
 def begin_product_wizard(ctx: Any, *, parent_callback: str | None = "v52:shop"):
     """Start the add-product wizard at its first step. Returns ``(text, rows)``."""
     try:
         _require_root(ctx)
-        return build_product_wizard_step(
-            ctx, {"step": "title"}, parent_callback=parent_callback)
+        return build_product_wizard_step(ctx, {"step": "title"}, parent_callback=parent_callback)
     except (TypeError, ValueError, PermissionError) as exc:
         return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
 
 
 def build_product_wizard_step(ctx: Any, payload: Mapping[str, Any], *, value: Any = None,
                               parent_callback: str | None = "v52:shop"):
-    """Advance the add-product wizard one answer and render the resulting step.
-
-    ``payload`` carries the answers collected so far plus the current ``step``.
-    ``value`` is the answer just supplied (text for text steps, the button value
-    for the delivery/audience choice steps). When the final step is answered the
-    product is persisted through ``goods_service.save_product`` and a result page
-    is returned. Returns ``(text, rows)``.
-    """
+    """Advance a product draft; writes happen only in ``confirm_product_wizard``."""
     try:
         _require_root(ctx)
         source = dict(payload or {})
         answers = {key: val for key, val in source.items() if key != "step"}
         current = str(source.get("step") or "title")
-        if current not in _WIZARD_STEPS:
+        # ``preview`` is the staged confirmation card, not one of the answered steps:
+        # the edit control re-enters the wizard from it, so it must be accepted here.
+        if current not in _WIZARD_STEPS and current != "preview":
             raise ValueError("گام ویزارد نامعتبر است.")
+        if current == "preview":
+            if value == "edit":
+                return _render_wizard_step(ctx, "audience", answers, parent_callback)
+            return _render_product_preview(answers, parent_callback)
         if value is not None:
             if current == "title":
                 title = str(value).strip()
@@ -616,8 +648,9 @@ def build_product_wizard_step(ctx: Any, payload: Mapping[str, Any], *, value: An
                 answers["audience"] = str(value)
             index = _WIZARD_STEPS.index(current)
             if index + 1 >= len(_WIZARD_STEPS):
-                return _persist_wizard_product(ctx, answers, parent_callback)
-            current = _WIZARD_STEPS[index + 1]
+                current = "preview"
+            else:
+                current = _WIZARD_STEPS[index + 1]
         return _render_wizard_step(ctx, current, answers, parent_callback)
     except (TypeError, ValueError, PermissionError) as exc:
         return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
@@ -625,7 +658,7 @@ def build_product_wizard_step(ctx: Any, payload: Mapping[str, Any], *, value: An
 
 def handle_product_wizard_choice(ctx: Any, field: str, value: str, *,
                                  parent_callback: str | None = "v52:shop"):
-    """Handle a delivery/audience button press inside the add-product wizard."""
+    """Handle delivery/audience/preview actions in the current product wizard."""
     try:
         _require_root(ctx)
         import v52_router
@@ -633,10 +666,18 @@ def handle_product_wizard_choice(ctx: Any, field: str, value: str, *,
         if entry is None or entry.state != "goods_product_draft":
             raise ValueError("ویزارد افزودن محصول فعال نیست؛ از ابتدا شروع کنید.")
         payload = dict(entry.payload or {})
-        if str(payload.get("step")) != str(field):
+        current = str(payload.get("step"))
+        if field == "confirm":
+            return confirm_product_wizard(ctx, parent_callback=parent_callback)
+        if field == "edit" and current == "preview":
+            return build_product_wizard_step(ctx, payload, value="edit", parent_callback=parent_callback)
+        if field == "skip" and current == "description":
+            if not payload.get("description"):
+                payload["description"] = ""
+            return build_product_wizard_step(ctx, payload, value="", parent_callback=parent_callback)
+        if current != str(field):
             raise ValueError("این گزینه با گام فعلی ویزارد هم‌خوان نیست.")
-        return build_product_wizard_step(
-            ctx, payload, value=value, parent_callback=parent_callback)
+        return build_product_wizard_step(ctx, payload, value=value, parent_callback=parent_callback)
     except (TypeError, ValueError, PermissionError) as exc:
         return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
 

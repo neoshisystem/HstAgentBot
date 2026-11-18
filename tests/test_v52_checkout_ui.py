@@ -44,8 +44,9 @@ def test_full_payment_and_pending_status(monkeypatch):
     assert insufficient.kind == "error" and "موجودی ناکافی" in insufficient.text
     assert card.kind == "preview"
     assert instructions.kind == "payment" and "1111222233334444" in instructions.text
-    assert "وضعیت پرداخت: pending" in pending.text
-    assert "وضعیت عملیات: not_started" in pending.text
-    assert "وضعیت تحویل: not_started" in pending.text
+    # S58 (ARCH-UX-002): the internal state tokens are rendered as Persian labels.
+    assert "وضعیت پرداخت: در انتظار پرداخت" in pending.text
+    assert "وضعیت عملیات: شروع نشده" in pending.text
+    assert "وضعیت تحویل: شروع نشده" in pending.text
     assert mixed.kind == "error"
     assert attempts == []

@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import config
+import service_errors_fa
 from ui_v52 import button, render_error, render_page
 
 
@@ -78,7 +79,7 @@ def begin_register_bot(
             rows=[[button("بازگشت", "v52:bots")]],
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona="admin", parent_callback=parent_callback)
 
 
 def preview_bot_activation(
@@ -117,13 +118,13 @@ def preview_bot_activation(
         body = (
             f"شناسهٔ بات: {bot_id}\nنام کاربری: @{username}\n"
             f"مالک: {'root' if primary else f'نمایندهٔ {rep_id}'}\n"
-            "وضعیت فعلی: pending\n"
-            "توکن در این تأیید نمایش داده نمی‌شود؛ فعال‌سازی فقط با nonce یک‌بارمصرف انجام می‌شود."
+            "وضعیت فعلی: در انتظار تأیید فعال‌سازی\n"
+            "توکن در این تأیید نمایش داده نمی‌شود؛ فعال‌سازی فقط با کد یک‌بارمصرف انجام می‌شود."
         )
         return render_page("پیش‌نمایش فعال‌سازی بات", body, persona="admin",
                            page_kind="preview", parent_callback=parent_callback, rows=rows)
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+        return render_error(service_errors_fa.translate(exc), persona="admin", parent_callback=parent_callback)
 
 
 __all__ = ["begin_register_bot", "preview_bot_activation"]

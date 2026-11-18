@@ -279,7 +279,11 @@ def test_admin_prompt_handler_stores_prompt_message_id(monkeypatch):
     query = FakeCallbackQuery("admin:prompt_card_settings", message_id=911)
     context = SimpleNamespace(user_data={}, bot=FakeBot())
     asyncio.run(admin_panel.handle_admin_callbacks(callback_update(query, uid), context))
-    assert context.user_data["admin_state"]["prompt_msg_id"] == 911
+    # S58: the prompt is now the first step of a wizard, so the message id lives in
+    # the wizard's own state. The guarantee is unchanged — the prompt is recorded so
+    # it can be edited in place and cleaned up afterwards.
+    assert context.user_data["v52_wizard"]["prompt_message_id"] == 911
+    assert context.user_data["v52_wizard"]["flow"] == "admin_card_settings"
 
 
 def test_representative_prompt_handler_stores_prompt_message_id():

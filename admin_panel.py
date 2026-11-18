@@ -3,7 +3,9 @@ import sys
 import time
 import logging
 import re
+import sqlite3
 import asyncio
+import uuid
 from datetime import datetime
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
@@ -14,6 +16,7 @@ import database
 import message_edit
 import nlp_matcher
 import service_errors_fa
+import ui_v52
 
 from server_integrations import load_integration
 xui_manager = load_integration("xui_manager")
@@ -2233,6 +2236,37 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             )
             await query.answer()
 
+        # S58 — the same button now opens the step-by-step wizard. The legacy
+        # ``admin_state`` above is kept for a form that was already in flight when the
+        # upgrade landed and for the hand-built states the tests drive; the wizard
+        # supersedes it for every new form, and owning both at once would let one
+        # swallow the answer the other is waiting for.
+        if action == "prompt_setting":
+            _setting_rows = {s["key"]: s for s in database.get_all_settings()}
+            _setting_row = _setting_rows.get(sub_action)
+            _wizard_flow_key = (
+                _register_setting_wizard(sub_action, setting_label(_setting_row),
+                                         _setting_row.get("value"))
+                if _setting_row else None)
+            _wizard_seed = ({"current_value": _setting_row.get("value")}
+                            if _setting_row else {})
+        else:
+            _wizard_flow_key = ADMIN_WIZARD_FLOW_OF.get(action)
+            _wizard_seed = _admin_wizard_seed(action, sub_action, parts)
+        # A flow that acts on a specific record cannot open without that record's
+        # context; the legacy prompt above then remains the fallback.
+        _wizard_needs_seed = action in {
+            "prompt_edit_rep", "prompt_edit_credit", "prompt_pay", "prompt_edit_plan",
+            "prompt_edit_plan_specs", "prompt_charge_user", "prompt_edit_user_id",
+            "prompt_link_user_id", "prompt_unlink_user_acc",
+        }
+        if _wizard_flow_key and (_wizard_seed or not _wizard_needs_seed):
+            _wizard_state = _start_admin_wizard(
+                context, query, _wizard_flow_key, prompt_parent_cb,
+                seed=_wizard_seed, origin=prompt_origin, ref=prompt_ref)
+            await ui_v52.wizard_render(update, context, _wizard_state)
+            return
+
         _form_state_scope3=context.user_data.get("admin_state")
         if _form_state_scope3:
             _form_state_scope3.setdefault("return_callback",prompt_parent_cb)
@@ -2503,9 +2537,15 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
                 update, context, admin_state, f"یادداشت قابل ثبت نیست: {exc}")
         origin = admin_state.get("origin") or ""
         ref = admin_state.get("ref") or ""
+        # A scoped representative's note keeps its own control set on the page it
+        # lands on; without the viewer the list would offer the root-only
+        # «ثبت یادداشت جدید» button back to them.
+        scoped_rep_id = admin_state.get("scoped_rep_id")
         context.user_data.pop("admin_state", None)
         import profile_360
-        page_text, rows = profile_360.build_notes_page(target_uid, origin, ref)
+        page_text, rows = profile_360.build_notes_page(
+            target_uid, origin, ref,
+            viewer_rep_id=int(scoped_rep_id) if scoped_rep_id else None)
         await update.message.reply_text(
             "✅ یادداشت داخلی ثبت شد.\n\n" + page_text,
             parse_mode=ParseMode.MARKDOWN,
@@ -2879,6 +2919,1006 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
 
     return False
 
+
+
+# --------------------------------------------------------------------------- #
+# S58 — step-by-step operator wizards
+#
+# Every ``admin:prompt_*`` form used to be one raw text line: six positional fields
+# for a representative, six for a plan, three for a card. One wrong field silently
+# reordered the rest and there was no way to see what was about to be written. Each
+# form is now a conversation that ends on a preview card, and nothing reaches the
+# database until the operator presses «✅ تایید و ثبت نهایی».
+#
+# The legacy ``admin_state`` handlers below are deliberately kept intact: they still
+# serve a form that was already in flight when the upgrade landed, and the states the
+# tests build by hand. A wizard only ever starts from the button.
+# --------------------------------------------------------------------------- #
+
+_WZ_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+#: Quick-pick banks for the card form; the operator can still type any other name.
+CARD_BANKS: tuple[str, ...] = (
+    "ملی", "ملت", "سامان", "پاسارگاد", "صادرات", "تجارت", "کشاورزی", "بلوبانک",
+)
+
+#: Quick-pick credit ceilings for a representative, in Toman.
+CREDIT_LIMIT_CHOICES: tuple[tuple[str, str], ...] = (
+    ("بدون سقف (نامحدود)", "0"),
+    ("۱ میلیون تومان", "1000000"),
+    ("۵ میلیون تومان", "5000000"),
+    ("۱۰ میلیون تومان", "10000000"),
+    ("۵۰ میلیون تومان", "50000000"),
+)
+
+
+def _wz_escape(value) -> str:
+    """Escape one dynamic value for the wizard's HTML body."""
+    from html import escape
+    return escape(str(value if value is not None else ""), quote=True)
+
+
+def _wz_int(raw, label: str, *, minimum=None, maximum=None, allow_negative=False):
+    text = str(raw or "").translate(_WZ_DIGITS).replace(",", "").replace("٬", "").strip()
+    if not re.fullmatch(r"-?[0-9]+", text or ""):
+        raise ValueError(f"{label} باید یک عدد صحیح باشد.")
+    value = int(text)
+    if not allow_negative and value < 0:
+        raise ValueError(f"{label} نمی‌تواند منفی باشد.")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{label} نباید کمتر از {minimum} باشد.")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{label} نباید بیشتر از {maximum} باشد.")
+    return value
+
+
+def _wz_gb(raw, label: str = "حجم"):
+    text = str(raw or "").translate(_WZ_DIGITS).replace(",", "").strip()
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} باید یک عدد باشد.")
+    if value < 0:
+        raise ValueError(f"{label} نمی‌تواند منفی باشد.")
+    return value
+
+
+def _wz_text(raw, label: str, *, maximum: int = 120):
+    value = str(raw or "").strip()
+    if not value:
+        raise ValueError(f"{label} نمی‌تواند خالی باشد.")
+    if len(value) > maximum:
+        raise ValueError(f"{label} نباید بیشتر از {maximum} نویسه باشد.")
+    return value
+
+
+def _wz_code(raw, label: str = "کد"):
+    value = str(raw or "").translate(_WZ_DIGITS).strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,47}", value or ""):
+        raise ValueError(
+            f"{label} باید با حرف یا رقم لاتین شروع شود و فقط شامل حرف کوچک، رقم، "
+            "خط تیره و زیرخط باشد.")
+    return value
+
+
+def _wz_scope(raw):
+    value = str(raw or "").strip()
+    return "" if value in ("", "-", "بدون", "هیچ", "بدون فیلتر") else value
+
+
+def _wz_money(value) -> str:
+    try:
+        return f"{int(value):,} تومان"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _wz_rep_tier_choices() -> tuple[tuple[str, str], ...]:
+    """The representative tiers the operator can pick, read live from the catalogue."""
+    rows: list[tuple[str, str]] = []
+    try:
+        with database.get_db() as conn:
+            if database._table_present(conn, "tier_policies"):
+                for row in conn.execute(
+                    "SELECT tier_code,title_fa FROM tier_policies WHERE actor_type='rep' "
+                    "ORDER BY rank,tier_code"
+                ).fetchall():
+                    rows.append((str(row["title_fa"]), str(row["tier_code"])))
+    except Exception:
+        rows = []
+    if not rows:
+        rows = [("سطح عادی", "normal")]
+    return tuple(rows)
+
+
+def _wz_plan_category_choices() -> tuple[tuple[str, str], ...]:
+    try:
+        import pricing_service
+        with database.get_db() as conn:
+            return tuple((f"{row['emoji']} {row['title_fa']}", row["category_key"])
+                         for row in pricing_service.list_plan_categories(conn, active_only=True))
+    except Exception:
+        return ()
+
+
+def _wz_panel_choices() -> tuple[tuple[str, str], ...]:
+    try:
+        with database.get_db() as conn:
+            return tuple((f"پنل {row['name']}", str(int(row["id"])))
+                         for row in conn.execute(
+                             "SELECT id,name FROM panels WHERE lifecycle='active' ORDER BY id"
+                         ).fetchall())
+    except Exception:
+        return ()
+
+
+def _wz_link_new_rep_edge(rep_code: str) -> str:
+    """Give a freshly created representative its single active financial edge.
+
+    ``pricing_service._rep_cost`` refuses the whole price chain when that edge is
+    missing (``BUG-TIER-001``), so a representative created without it cannot buy,
+    renew or quote. The write is best-effort: the representative row exists either
+    way, and the operator is told to finish the link from the tree page.
+    """
+    try:
+        import rep_tree_service
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT id FROM representatives WHERE rep_code=?", (rep_code,)).fetchone()
+            if row is None:
+                return ""
+            rep_id = int(row["id"])
+            if conn.execute("SELECT 1 FROM rep_edges WHERE child_rep_id=? AND active=1",
+                            (rep_id,)).fetchone() is not None:
+                return ""
+            rep_tree_service.link_rep_edge(conn, rep_id, None)
+            conn.commit()
+        return ""
+    except Exception as exc:
+        logger.warning("Could not link the financial edge for %s: %s", rep_code, exc)
+        return ("\n\n⚠️ اتصال مالی این نماینده ثبت نشد؛ از «درخت نمایندگان» آن را تکمیل کنید.")
+
+
+# --- the flows -------------------------------------------------------------- #
+
+def _register_rep_wizards() -> None:
+    """Register the add/edit representative flows with the live tier catalogue."""
+    tier_choices = _wz_rep_tier_choices()
+
+    def commit_add(values, actor):
+        rep_code = str(values["rep_code"])
+        name = str(values["name"])
+        telegram_id = int(values["telegram_id"])
+        database.add_or_update_rep(rep_code, name, telegram_id, 0, 0,
+                                   str(values.get("scope_filter") or ""))
+        database.log_audit(
+            rep_id=None, account_code=rep_code, email=None, action="add_rep",
+            actor_id=int(actor.get("id") or 0), actor_name=actor.get("name") or "Admin",
+            details={"name": name, "telegram_id": telegram_id,
+                     "tier": values.get("tier"), "scope": values.get("scope_filter") or ""},
+            result_status="success")
+        extra = _wz_link_new_rep_edge(rep_code)
+        limit = int(values.get("credit_limit") or 0)
+        if limit or str(values.get("tier") or "normal") != "normal":
+            with database.get_db() as conn:
+                row = conn.execute("SELECT id FROM representatives WHERE rep_code=?",
+                                   (rep_code,)).fetchone()
+                if row is not None:
+                    conn.execute("UPDATE representatives SET tier=? WHERE id=?",
+                                 (str(values.get("tier") or "normal"), int(row["id"])))
+                    conn.commit()
+            if limit:
+                with database.get_db() as conn:
+                    row = conn.execute("SELECT id FROM representatives WHERE rep_code=?",
+                                       (rep_code,)).fetchone()
+                if row is not None:
+                    database.update_rep_credit_limit(int(row["id"]), limit)
+        return (f"نماینده {name} با کد {rep_code} ثبت شد.\n"
+                f"شناسه تلگرام: {telegram_id}\n"
+                f"سطح: {values.get('tier') or 'normal'}\n"
+                f"سقف اعتبار: {'نامحدود' if not limit else _wz_money(limit)}" + extra)
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_add_rep", "افزودن نماینده جدید",
+        steps=(
+            ui_v52.WizardStep("name", "نام نمایشی نماینده",
+                              hint="نام می‌تواند فاصله داشته باشد.", parse=lambda raw: _wz_text(raw, "نام نمایشی")),
+            ui_v52.WizardStep("rep_code", "کد نماینده",
+                              hint="کد لاتین یکتا؛ می‌توانید خودکار بسازید.",
+                              parse=lambda raw: _wz_code(raw, "کد نماینده"),
+                              generate=lambda values: "rep_" + uuid.uuid4().hex[:8]),
+            ui_v52.WizardStep("telegram_id", "شناسه تلگرام نماینده",
+                              parse=lambda raw: _wz_int(raw, "شناسه تلگرام", minimum=1)),
+            ui_v52.WizardStep("tier", "سطح تعرفه نماینده", choices=tier_choices),
+            ui_v52.WizardStep("credit_limit", "سقف اعتبار", choices=CREDIT_LIMIT_CHOICES,
+                              parse=lambda raw: _wz_int(raw, "سقف اعتبار", minimum=0)),
+            ui_v52.WizardStep("scope_filter", "پیشوند فیلتر اسکوپ",
+                              hint="اگر نماینده محدود به یک اسکوپ نیست، این گام را رد کنید.",
+                              skippable=True, skip_label="⏭ بدون فیلتر اسکوپ",
+                              parse=_wz_scope),
+        ),
+        preview=lambda v: "\n".join([
+            f"• نام: <b>{_wz_escape(v.get('name'))}</b>",
+            f"• کد: <code>{_wz_escape(v.get('rep_code'))}</code>",
+            f"• شناسه تلگرام: <code>{_wz_escape(v.get('telegram_id'))}</code>",
+            f"• سطح تعرفه: <b>{_wz_escape(v.get('tier'))}</b>",
+            f"• سقف اعتبار: <b>{'نامحدود' if not int(v.get('credit_limit') or 0) else _wz_money(v.get('credit_limit'))}</b>",
+            f"• فیلتر اسکوپ: {_wz_escape(v.get('scope_filter') or 'بدون فیلتر')}",
+        ]),
+        commit=commit_add,
+        legacy=_legacy_add_rep,
+    ))
+
+    def commit_edit(values, actor):
+        rep_id = int(values["rep_id"])
+        current = database.get_rep_by_id(rep_id)
+        if not current:
+            raise ValueError("نماینده موردنظر یافت نشد.")
+        field = str(values.get("field"))
+        merged = {
+            "rep_code": current.get("rep_code") or "",
+            "name": current.get("name") or "",
+            "telegram_id": int(current.get("telegram_id") or 0),
+            "group_id": int(current.get("group_id") or 0),
+            "topic_id": int(current.get("topic_id") or 0),
+            "scope_filter": current.get("scope_filter") or "",
+        }
+        merged[field] = values["new_value"]
+        database.update_rep_full(
+            rep_id, merged["name"], merged["rep_code"], int(merged["telegram_id"]),
+            int(merged["group_id"]), int(merged["topic_id"]), merged["scope_filter"])
+        return (f"مشخصات نماینده {merged['name']} به‌روز شد.\n"
+                f"«{EDIT_REP_FIELD_FA.get(field, field)}» از "
+                f"«{_wz_escape(values.get('previous_value'))}» به "
+                f"«{_wz_escape(values.get('new_value'))}» تغییر کرد.")
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_edit_rep", "ویرایش مشخصات نماینده",
+        steps=(
+            ui_v52.WizardStep("field", "کدام مشخصه را ویرایش می‌کنید؟",
+                              choices=EDIT_REP_FIELD_CHOICES),
+            ui_v52.WizardStep("new_value", "مقدار جدید", parse=_parse_edit_rep_value),
+        ),
+        preview=lambda v: "\n".join([
+            f"• نماینده: <b>{_wz_escape(v.get('rep_name'))}</b> "
+            f"(<code>{_wz_escape(v.get('rep_code'))}</code>)",
+            f"• مشخصه: <b>{_wz_escape(EDIT_REP_FIELD_FA.get(str(v.get('field')), v.get('field')))}</b>",
+            f"• مقدار قبلی: {_wz_escape(v.get('previous_value') or '—')}",
+            f"• مقدار جدید: <b>{_wz_escape(v.get('new_value'))}</b>",
+        ]),
+        commit=commit_edit,
+        legacy=lambda raw: None,
+    ))
+
+
+#: The representative fields the edit wizard can change, with their Persian titles.
+EDIT_REP_FIELD_CHOICES: tuple[tuple[str, str], ...] = (
+    ("✏️ ویرایش نام", "name"),
+    ("✏️ ویرایش کد", "rep_code"),
+    ("✏️ ویرایش آیدی تلگرام", "telegram_id"),
+    ("✏️ ویرایش گروه/تاپیک", "group_topic"),
+    ("✏️ ویرایش فیلتر اسکوپ", "scope_filter"),
+)
+EDIT_REP_FIELD_FA = {
+    "name": "نام نمایشی",
+    "rep_code": "کد نماینده",
+    "telegram_id": "شناسه تلگرام",
+    "group_topic": "گروه و تاپیک",
+    "scope_filter": "فیلتر اسکوپ",
+}
+
+
+def _parse_edit_rep_value(raw):
+    """Parse the new value for whichever representative field is being edited.
+
+    The field is not known to ``parse`` (it only receives the raw text), so the
+    accepted shapes are deliberately broad: a ``group topic`` pair for the forum
+    binding, a plain integer for the Telegram id, and free text otherwise.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("مقدار جدید نمی‌تواند خالی باشد.")
+    return text
+
+
+def _legacy_add_rep(raw):
+    """Accept the pre-wizard ``code name tg group topic scope`` line at step 1."""
+    parts = str(raw or "").split(maxsplit=5)
+    if len(parts) < 6:
+        return None
+    try:
+        return {"rep_code": _wz_code(parts[0], "کد نماینده"), "name": parts[1],
+                "telegram_id": int(parts[2].translate(_WZ_DIGITS)),
+                "tier": "normal", "credit_limit": 0, "scope_filter": parts[5]}
+    except (ValueError, TypeError):
+        return None
+
+
+def _register_plan_wizards() -> None:
+    """Register the add/edit plan flows with the live category and panel catalogues."""
+    category_choices = _wz_plan_category_choices()
+    panel_choices = _wz_panel_choices()
+
+    def commit_add(values, actor):
+        plan_code = str(values["plan_code"])
+        database.add_or_update_plan(
+            plan_code, str(values["name"]), float(values["gb"]), int(values["days"]),
+            int(values["rep_price"]), int(values["user_price"]))
+        linked = _apply_plan_selection(plan_code, values)
+        return (f"تعرفه {values['name']} با کد {plan_code} ثبت شد.\n"
+                f"مشخصات: {float(values['gb']):g} گیگ / {int(values['days'])} روز\n"
+                f"قیمت نماینده: {_wz_money(values['rep_price'])}\n"
+                f"قیمت کاربر: {_wz_money(values['user_price'])}\n"
+                f"نوع: {PLAN_KIND_FA_FALLBACK.get(str(values.get('plan_kind')), 'حجمی/زمانی ثابت')}"
+                + linked)
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_add_plan", "تعریف تعرفه جدید",
+        steps=(
+            ui_v52.WizardStep("plan_kind", "نوع تعرفه", choices=(
+                ("📦 حجمی/زمانی ثابت", "fixed"),
+                ("♾ نامحدود", "unlimited"),
+                ("🎚 دلخواه", "custom"),
+            )),
+            ui_v52.WizardStep("name", "نام فارسی تعرفه",
+                              parse=lambda raw: _wz_text(raw, "نام تعرفه")),
+            ui_v52.WizardStep("plan_code", "کد تعرفه",
+                              hint="کد لاتین یکتا؛ می‌توانید خودکار بسازید.",
+                              parse=lambda raw: _wz_code(raw, "کد تعرفه"),
+                              generate=_generate_plan_code),
+            ui_v52.WizardStep("gb", "حجم (گیگابایت)", parse=lambda raw: _wz_gb(raw)),
+            ui_v52.WizardStep("days", "مدت (روز)",
+                              parse=lambda raw: _wz_int(raw, "مدت", minimum=1, maximum=3650)),
+            ui_v52.WizardStep("rep_price", "قیمت پایه نماینده (تومان)",
+                              parse=lambda raw: _wz_int(raw, "قیمت نماینده", minimum=0)),
+            ui_v52.WizardStep("user_price", "قیمت پایه کاربر (تومان)",
+                              parse=lambda raw: _wz_int(raw, "قیمت کاربر", minimum=0)),
+            ui_v52.WizardStep("categories", "دسته‌بندی‌های تعرفه",
+                              hint="هر تعداد دسته را انتخاب کنید و سپس «پایان انتخاب» را بزنید.",
+                              choices=category_choices, multi=True, skippable=True,
+                              skip_label="⏭ بدون دسته‌بندی"),
+            ui_v52.WizardStep("panels", "پنل‌های مجاز این تعرفه",
+                              hint="هر تعداد پنل را انتخاب کنید و سپس «پایان انتخاب» را بزنید.",
+                              choices=panel_choices, multi=True, skippable=True,
+                              skip_label="⏭ همهٔ پنل‌ها"),
+        ),
+        preview=lambda v: "\n".join([
+            f"• نام: <b>{_wz_escape(v.get('name'))}</b>",
+            f"• کد: <code>{_wz_escape(v.get('plan_code'))}</code>",
+            f"• نوع: <b>{_wz_escape(PLAN_KIND_FA_FALLBACK.get(str(v.get('plan_kind')), v.get('plan_kind')))}</b>",
+            f"• حجم و مدت: <b>{float(v.get('gb') or 0):g} گیگ / {int(v.get('days') or 0)} روز</b>",
+            f"• قیمت نماینده: <b>{_wz_money(v.get('rep_price'))}</b>",
+            f"• قیمت کاربر: <b>{_wz_money(v.get('user_price'))}</b>",
+            f"• دسته‌بندی: {_wz_escape(_wz_category_titles(v.get('categories')))}",
+            f"• پنل‌های مجاز: {_wz_escape(_wz_panel_titles(v.get('panels')))}",
+        ]),
+        commit=commit_add,
+        legacy=_legacy_add_plan,
+    ))
+
+    def commit_edit(values, actor):
+        plan_code = str(values["plan_code"])
+        plan = database.get_plan(plan_code)
+        if not plan:
+            raise ValueError("تعرفه موردنظر یافت نشد.")
+        field = str(values.get("field"))
+        rep_price = int(plan["rep_price"])
+        user_price = int(plan["user_price"])
+        if field == "rep_price":
+            rep_price = int(values["new_value"])
+        elif field == "user_price":
+            user_price = int(values["new_value"])
+        else:
+            rep_price = int(values["rep_price"])
+            user_price = int(values["user_price"])
+        database.update_plan_price(plan_code, rep_price, user_price)
+        return (f"نرخ‌های تعرفه {plan.get('name')} به‌روز شد.\n"
+                f"قیمت نماینده: {_wz_money(rep_price)}\n"
+                f"قیمت کاربر: {_wz_money(user_price)}")
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_edit_plan", "ویرایش نرخ تعرفه",
+        steps=(
+            ui_v52.WizardStep("field", "کدام نرخ را ویرایش می‌کنید؟", choices=(
+                ("✏️ قیمت نماینده", "rep_price"),
+                ("✏️ قیمت کاربر", "user_price"),
+                ("✏️ هر دو نرخ", "both"),
+            )),
+            ui_v52.WizardStep("new_value", "نرخ جدید (تومان)",
+                              parse=lambda raw: _wz_int(raw, "نرخ", minimum=0)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• تعرفه: <b>{_wz_escape(v.get('plan_name'))}</b> "
+            f"(<code>{_wz_escape(v.get('plan_code'))}</code>)",
+            f"• نرخ فعلی نماینده: {_wz_money(v.get('rep_price'))}",
+            f"• نرخ فعلی کاربر: {_wz_money(v.get('user_price'))}",
+            f"• تغییر: <b>{_wz_escape(_wz_price_change_label(v))}</b>",
+        ]),
+        commit=commit_edit,
+        legacy=_legacy_edit_plan,
+    ))
+
+    def commit_specs(values, actor):
+        plan_code = str(values["plan_code"])
+        database.update_plan_specs(plan_code, str(values["name"]),
+                                   float(values["gb"]), int(values["days"]))
+        return (f"حجم، زمان و نام تعرفه {values['name']} به‌روز شد.\n"
+                f"مشخصات جدید: {float(values['gb']):g} گیگ / {int(values['days'])} روز")
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_edit_plan_specs", "ویرایش حجم و زمان تعرفه",
+        steps=(
+            ui_v52.WizardStep("gb", "حجم جدید (گیگابایت)", parse=lambda raw: _wz_gb(raw)),
+            ui_v52.WizardStep("days", "مدت جدید (روز)",
+                              parse=lambda raw: _wz_int(raw, "مدت", minimum=1, maximum=3650)),
+            ui_v52.WizardStep("name", "نام فارسی تعرفه",
+                              parse=lambda raw: _wz_text(raw, "نام تعرفه")),
+        ),
+        preview=lambda v: "\n".join([
+            f"• تعرفه: <b>{_wz_escape(v.get('plan_name'))}</b> "
+            f"(<code>{_wz_escape(v.get('plan_code'))}</code>)",
+            f"• حجم قبلی ← جدید: {_wz_escape(v.get('previous_gb'))} ← <b>{float(v.get('gb') or 0):g}</b> گیگ",
+            f"• مدت قبلی ← جدید: {_wz_escape(v.get('previous_days'))} ← <b>{int(v.get('days') or 0)}</b> روز",
+            f"• نام: {_wz_escape(v.get('previous_name'))} ← <b>{_wz_escape(v.get('name'))}</b>",
+        ]),
+        commit=commit_specs,
+        legacy=_legacy_edit_plan_specs,
+    ))
+
+
+PLAN_KIND_FA_FALLBACK = {"fixed": "حجمی/زمانی ثابت", "unlimited": "نامحدود", "custom": "دلخواه"}
+
+
+def _generate_plan_code(values) -> str:
+    """Derive a plan code from the quota, exactly as the old prompt suggested."""
+    gb = values.get("gb")
+    days = values.get("days")
+    if gb is None or days is None:
+        return "plan_" + uuid.uuid4().hex[:8]
+    quota = f"{float(gb):g}".replace(".", "p")
+    return f"{quota}gb_{int(days)}d"
+
+
+def _wz_category_titles(keys) -> str:
+    if not keys:
+        return "بدون دسته‌بندی"
+    mapping = dict(_wz_plan_category_choices())
+    return "، ".join(mapping.get(str(key), str(key)) for key in keys)
+
+
+def _wz_panel_titles(ids) -> str:
+    if not ids:
+        return "همهٔ پنل‌ها"
+    mapping = dict(_wz_panel_choices())
+    return "، ".join(mapping.get(str(item), f"پنل {item}") for item in ids)
+
+
+def _wz_price_change_label(values) -> str:
+    field = str(values.get("field"))
+    new_value = values.get("new_value")
+    if field == "rep_price":
+        return f"قیمت نماینده ← {_wz_money(new_value)}"
+    if field == "user_price":
+        return f"قیمت کاربر ← {_wz_money(new_value)}"
+    return f"هر دو نرخ ← {_wz_money(new_value)}"
+
+
+def _apply_plan_selection(plan_code: str, values) -> str:
+    """Attach the chosen categories and panel bindings to a freshly created plan.
+
+    The tariff hub owns the same relations, so this reuses its service rather than
+    writing the link tables directly — one implementation, one set of invariants.
+    """
+    notes: list[str] = []
+    categories = list(values.get("categories") or [])
+    panels = list(values.get("panels") or [])
+    try:
+        import pricing_service
+        with database.get_db() as conn:
+            if categories:
+                pricing_service.set_plan_categories(conn, plan_code, categories)
+            for panel_id in panels:
+                pricing_service.set_plan_panel_allowed(conn, plan_code, int(panel_id), True)
+            conn.commit()
+    except Exception as exc:
+        logger.warning("Could not attach the plan selection for %s: %s", plan_code, exc)
+        notes.append("\n\n⚠️ دسته‌بندی یا پنل‌های این تعرفه ثبت نشد؛ از کارت تعرفه تکمیل کنید.")
+    return "".join(notes)
+
+
+def _legacy_add_plan(raw):
+    """Accept the pre-wizard ``code name gb days rep_price user_price`` line."""
+    parts = str(raw or "").split()
+    if len(parts) < 6:
+        return None
+    try:
+        numeric = parts[-4:]
+        return {"plan_kind": "fixed", "plan_code": _wz_code(parts[0], "کد تعرفه"),
+                "name": " ".join(parts[1:-4]).strip(),
+                "gb": float(numeric[0].translate(_WZ_DIGITS)),
+                "days": int(numeric[1].translate(_WZ_DIGITS)),
+                "rep_price": int(numeric[2].replace(",", "").translate(_WZ_DIGITS)),
+                "user_price": int(numeric[3].replace(",", "").translate(_WZ_DIGITS)),
+                "categories": [], "panels": []}
+    except (ValueError, TypeError):
+        return None
+
+
+def _legacy_edit_plan(raw):
+    """Accept the pre-wizard ``rep_price user_price`` line."""
+    parts = str(raw or "").split()
+    if len(parts) < 2:
+        return None
+    try:
+        return {"field": "both", "new_value": int(parts[0].replace(",", "").translate(_WZ_DIGITS)),
+                "rep_price": int(parts[0].replace(",", "").translate(_WZ_DIGITS)),
+                "user_price": int(parts[1].replace(",", "").translate(_WZ_DIGITS))}
+    except (ValueError, TypeError):
+        return None
+
+
+def _legacy_edit_plan_specs(raw):
+    """Accept the pre-wizard ``gb days name`` line."""
+    parts = str(raw or "").split(maxsplit=2)
+    if len(parts) != 3:
+        return None
+    try:
+        return {"gb": float(parts[0].translate(_WZ_DIGITS)),
+                "days": int(parts[1].translate(_WZ_DIGITS)), "name": parts[2]}
+    except (ValueError, TypeError):
+        return None
+
+
+def _register_money_wizards() -> None:
+    """Register the card, settlement, wallet, credit and identity flows."""
+
+    def commit_card(values, actor):
+        number = str(values["card_number"])
+        holder = str(values["card_holder"])
+        bank = str(values["bank_name"])
+        database.update_card_info(number, holder, bank)
+        return (f"اطلاعات کارت بانکی ویرایش شد.\n"
+                f"شماره کارت: {number}\nصاحب حساب: {holder}\nبانک: {bank}\n\n"
+                "این کارت هم در تنظیمات و هم در فهرست کارت‌های پرداخت ثبت شد.")
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_card_settings", "تنظیمات شماره کارت بانکی",
+        steps=(
+            ui_v52.WizardStep("card_number", "شماره ۱۶ رقمی کارت",
+                              hint="می‌توانید با خط تیره یا فاصله بنویسید.",
+                              parse=lambda raw: parse_card_settings_input(raw)[0]),
+            ui_v52.WizardStep("card_holder", "نام صاحب حساب",
+                              parse=lambda raw: _wz_text(raw, "نام صاحب حساب", maximum=80)),
+            ui_v52.WizardStep("bank_name", "نام بانک",
+                              choices=tuple((name, name) for name in CARD_BANKS),
+                              parse=lambda raw: _wz_text(raw, "نام بانک", maximum=60)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• شماره کارت: <code>{_wz_escape(v.get('card_number'))}</code>",
+            f"• صاحب حساب: <b>{_wz_escape(v.get('card_holder'))}</b>",
+            f"• بانک: <b>{_wz_escape(v.get('bank_name'))}</b>",
+        ]),
+        commit=commit_card,
+        legacy=_legacy_card_settings,
+    ))
+
+    def commit_pay(values, actor):
+        rep_code = str(values["rep_code"])
+        rep = database.get_rep_by_code(rep_code)
+        if not rep:
+            raise ValueError("نماینده موردنظر یافت نشد.")
+        amount = int(values["amount"])
+        description = str(values.get("description") or "تسویه حساب نماینده")
+        new_balance = database.register_rep_payment(
+            rep_id=rep["id"], amount=amount, description=description,
+            actor_id=int(actor.get("id") or 0), actor_name=actor.get("name") or "Admin")
+        return (f"واریزی ثبت شد.\n"
+                f"نماینده: {rep['name']}\n"
+                f"مبلغ تسویه‌شده: {_wz_money(amount)}\n"
+                f"شرح: {description}\n"
+                f"مانده بدهی جدید: {_wz_money(new_balance)}")
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_pay", "ثبت تسویه حساب نماینده",
+        steps=(
+            ui_v52.WizardStep("amount", "مبلغ واریزی (تومان)",
+                              parse=lambda raw: _wz_int(raw, "مبلغ", minimum=1)),
+            ui_v52.WizardStep("description", "شرح واریزی",
+                              hint="اگر شرح خاصی ندارید این گام را رد کنید.",
+                              skippable=True, skip_label="⏭ ثبت با شرح پیش‌فرض",
+                              skip_value="تسویه حساب نماینده",
+                              parse=lambda raw: _wz_text(raw, "شرح", maximum=200)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• نماینده: <b>{_wz_escape(v.get('rep_name'))}</b> "
+            f"(<code>{_wz_escape(v.get('rep_code'))}</code>)",
+            f"• بدهی فعلی: <b>{_wz_money(v.get('current_debt'))}</b>",
+            f"• مبلغ واریزی: <b>{_wz_money(v.get('amount'))}</b>",
+            f"• بدهی پس از تسویه: <b>{_wz_money(v.get('debt_after'))}</b>",
+            f"• شرح: {_wz_escape(v.get('description') or 'تسویه حساب نماینده')}",
+        ]),
+        commit=commit_pay,
+        legacy=_legacy_pay,
+    ))
+
+    def commit_charge(values, actor):
+        target = int(values["user_id"])
+        amount = int(values["amount"])
+        new_balance = database.update_user_wallet_manual(
+            target, amount, "شارژ / کسر دستی توسط ادمین کل",
+            actor_id=int(actor.get("id") or 0), actor_name=actor.get("name") or "Admin")
+        return (f"کیف پول کاربر {target} بروزرسانی شد.\n"
+                f"میزان {'افزایش' if amount >= 0 else 'کاهش'}: {_wz_money(abs(amount))}\n"
+                f"مانده جدید: {_wz_money(new_balance)}")
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_charge_user", "شارژ یا کسر دستی کیف پول",
+        steps=(
+            ui_v52.WizardStep("amount", "مبلغ (تومان)",
+                              hint="عدد مثبت شارژ می‌کند و عدد منفی کسر می‌کند.",
+                              parse=lambda raw: _wz_int(raw, "مبلغ", allow_negative=True)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• کاربر: <code>{_wz_escape(v.get('user_id'))}</code>",
+            f"• مانده فعلی: <b>{_wz_money(v.get('current_balance'))}</b>",
+            f"• تغییر: <b>{_wz_money(v.get('amount'))}</b>",
+            f"• مانده پس از اعمال: <b>{_wz_money(v.get('balance_after'))}</b>",
+        ]),
+        commit=commit_charge,
+        legacy=_legacy_charge_user,
+    ))
+
+    def commit_credit(values, actor):
+        rep_id = int(values["rep_id"])
+        limit = int(values["limit"])
+        database.update_rep_credit_limit(rep_id, limit)
+        return (f"سقف اعتبار نماینده بروزرسانی شد.\n"
+                f"سقف جدید: {'نامحدود' if limit <= 0 else _wz_money(limit)}")
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_edit_credit", "تغییر سقف اعتبار نماینده",
+        steps=(
+            ui_v52.WizardStep("limit", "سقف اعتبار جدید", choices=CREDIT_LIMIT_CHOICES,
+                              parse=lambda raw: _wz_int(raw, "سقف اعتبار", minimum=0)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• نماینده: <b>{_wz_escape(v.get('rep_name'))}</b>",
+            f"• سقف فعلی: {_wz_money(v.get('current_limit'))}",
+            f"• سقف جدید: <b>{'نامحدود' if not int(v.get('limit') or 0) else _wz_money(v.get('limit'))}</b>",
+        ]),
+        commit=commit_credit,
+        legacy=_legacy_edit_credit,
+    ))
+
+    def commit_user_id(values, actor):
+        old_id = int(values["user_id"])
+        new_id = int(values["new_id"])
+        database.change_user_tg_id(old_id, new_id)
+        return (f"شناسه کاربر از {old_id} به {new_id} تغییر کرد؛ "
+                "سوابق و مالکیت‌های مرتبط منتقل شدند.")
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_edit_user_id", "تغییر شناسه تلگرام کاربر",
+        steps=(
+            ui_v52.WizardStep("new_id", "شناسه عددی جدید",
+                              parse=lambda raw: _wz_int(raw, "شناسه جدید", minimum=1)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• شناسه فعلی: <code>{_wz_escape(v.get('user_id'))}</code>",
+            f"• شناسه جدید: <code>{_wz_escape(v.get('new_id'))}</code>",
+        ]),
+        commit=commit_user_id,
+        legacy=_legacy_edit_user_id,
+    ))
+
+    def commit_link_account(values, actor):
+        target = int(values["user_id"])
+        code = str(values["account_code"])
+        linked = database.link_user_to_account(code, target, allow_reassign=True)
+        if linked.get("status") != "ok":
+            raise ValueError(linked.get("message") or "کد اکانت معتبر نیست.")
+        database.log_audit(
+            rep_id=None, account_code=code, email=None, action="admin_link_user_account",
+            actor_id=int(actor.get("id") or 0), actor_name=actor.get("name") or "Admin",
+            details={"target_user_id": target}, result_status="success")
+        return f"اکانت {code} به کاربر {target} متصل شد."
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_link_user_account", "اتصال اکانت به کاربر",
+        steps=(
+            ui_v52.WizardStep("account_code", "کد دقیق اکانت",
+                              parse=lambda raw: _wz_text(raw, "کد اکانت", maximum=64)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• کاربر: <code>{_wz_escape(v.get('user_id'))}</code>",
+            f"• اکانت: <code>{_wz_escape(v.get('account_code'))}</code>",
+        ]),
+        commit=commit_link_account,
+        legacy=lambda raw: None,
+    ))
+
+    def commit_unlink_account(values, actor):
+        target = int(values["user_id"])
+        code = str(values["account_code"])
+        if not database.unlink_account_owner(code, target):
+            raise ValueError("اکانت متعلق به این کاربر نیست یا یافت نشد.")
+        return f"اتصال اکانت {code} از کاربر {target} قطع شد."
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_unlink_user_account", "قطع اتصال اکانت از کاربر",
+        steps=(
+            ui_v52.WizardStep("account_code", "کد دقیق اکانت",
+                              parse=lambda raw: _wz_text(raw, "کد اکانت", maximum=64)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• کاربر: <code>{_wz_escape(v.get('user_id'))}</code>",
+            f"• اکانت برای قطع اتصال: <code>{_wz_escape(v.get('account_code'))}</code>",
+        ]),
+        commit=commit_unlink_account,
+        legacy=lambda raw: None,
+    ))
+
+    def commit_note(values, actor):
+        target = int(values["user_id"])
+        database.add_profile_note(target, int(actor.get("id") or 0),
+                                  actor.get("name") or "Admin", str(values["note"]))
+        return f"یادداشت داخلی برای کاربر {target} ثبت شد."
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_profile_note", "ثبت یادداشت مدیریتی",
+        steps=(
+            ui_v52.WizardStep("note", "متن یادداشت",
+                              parse=lambda raw: _wz_text(raw, "یادداشت", maximum=1000)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• کاربر: <code>{_wz_escape(v.get('user_id'))}</code>",
+            f"• یادداشت: <b>{_wz_escape(v.get('note'))}</b>",
+        ]),
+        commit=commit_note,
+        legacy=lambda raw: None,
+    ))
+
+
+def _legacy_card_settings(raw):
+    """Accept the pre-wizard ``number | holder | bank`` line."""
+    try:
+        number, holder, bank = parse_card_settings_input(raw)
+    except (ValueError, TypeError):
+        return None
+    return {"card_number": number, "card_holder": holder, "bank_name": bank}
+
+
+def _legacy_pay(raw):
+    """Accept the pre-wizard ``amount description`` line."""
+    parts = str(raw or "").split(maxsplit=1)
+    if not parts:
+        return None
+    try:
+        return {"amount": int(parts[0].replace(",", "").translate(_WZ_DIGITS)),
+                "description": parts[1] if len(parts) > 1 else "تسویه حساب نماینده"}
+    except (ValueError, TypeError):
+        return None
+
+
+def _legacy_charge_user(raw):
+    try:
+        return {"amount": int(str(raw).replace(",", "").translate(_WZ_DIGITS))}
+    except (ValueError, TypeError):
+        return None
+
+
+def _legacy_edit_credit(raw):
+    try:
+        return {"limit": int(str(raw).replace(",", "").translate(_WZ_DIGITS))}
+    except (ValueError, TypeError):
+        return None
+
+
+def _legacy_edit_user_id(raw):
+    try:
+        return {"new_id": int(str(raw).translate(_WZ_DIGITS))}
+    except (ValueError, TypeError):
+        return None
+
+
+def _register_setting_wizard(key: str, label: str, current_value=None) -> str:
+    """Register (or refresh) the wizard for one settings key and return its flow key.
+
+    The choices and the current value depend on the key, so the flow is registered on
+    demand rather than once at import: a switch gets inline on/off buttons, a keyword
+    setting gets one button per allowed value, and anything else gets a validated text
+    step. All three end on the same preview card.
+
+    The current value is rendered into the card's own body — an operator changing a
+    switch must see what it is set to now, in Persian, before pressing anything.
+    """
+    flow_key = f"admin_setting_{key}"
+    if key in BOOLEAN_SETTINGS:
+        choices = ((BOOLEAN_ON, "1"), (BOOLEAN_OFF, "0"))
+        step = ui_v52.WizardStep("value", label, choices=choices)
+    elif key in SETTING_VALUE_LABELS:
+        choices = tuple((text, value) for value, text in SETTING_VALUE_LABELS[key].items())
+        step = ui_v52.WizardStep("value", label, choices=choices)
+    else:
+        step = ui_v52.WizardStep(
+            "value", label,
+            hint="مقدار جدید را وارد کنید. برای شناسهٔ گروه، عدد را همان‌طور که هست بفرستید.",
+            parse=lambda raw: _wz_text(raw, label, maximum=200))
+
+    intro = f"مقدار فعلی این پارامتر: {setting_value_display(key, current_value)}"
+
+    def commit(values, actor):
+        raw_value = str(values.get("value") or "").strip()
+        new_value = raw_value
+        if key in database.GROUP_ID_SETTING_KEYS:
+            new_value = str(database.normalize_group_chat_id(raw_value))
+        database.set_setting(key, new_value, actor_id=int(actor.get("id") or 0),
+                             actor_name=actor.get("name") or "Admin")
+        return (f"تنظیمات با موفقیت بروزرسانی شد.\n"
+                f"پارامتر: {label}\n"
+                f"مقدار جدید: {setting_value_display(key, new_value)}\n\n"
+                "تغییرات به‌صورت آنی در سامانه اعمال شد.")
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        flow_key, f"ویرایش تنظیمات — {label}",
+        steps=(step,),
+        preview=lambda v: "\n".join([
+            f"• پارامتر: <b>{_wz_escape(label)}</b>",
+            f"• مقدار فعلی: {setting_value_display(key, v.get('current_value'))}",
+            f"• مقدار جدید: <b>{_wz_escape(setting_value_display(key, v.get('value')))}</b>",
+        ]),
+        commit=commit,
+        legacy=lambda raw: {"value": str(raw).strip()} if str(raw).strip() else None,
+        intro=intro,
+    ))
+    return flow_key
+
+
+def _register_link_user_wizard() -> None:
+    """The two-step «attach an account to a Telegram id» flow."""
+
+    def commit(values, actor):
+        chat_id = int(values["chat_id"])
+        code = str(values["account_code"])
+        result = database.link_user_to_account(code, chat_id, allow_reassign=True)
+        if result.get("status") != "ok":
+            raise ValueError(result.get("message") or "ورودی معتبر نیست.")
+        return f"اکانت {code} به Chat ID {chat_id} متصل شد."
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        "admin_link_user", "اتصال اکانت به Chat ID تلگرام",
+        steps=(
+            ui_v52.WizardStep("account_code", "کد یا ایمیل اکانت",
+                              hint="پس از وارد کردن، مشخصات اکانت نمایش داده می‌شود.",
+                              parse=_parse_link_account),
+            ui_v52.WizardStep("chat_id", "Chat ID کاربر مقصد",
+                              parse=lambda raw: _wz_int(raw, "شناسه کاربر", minimum=1)),
+        ),
+        preview=lambda v: "\n".join([
+            f"• اکانت: <code>{_wz_escape(v.get('account_code'))}</code>",
+            f"• مشتری اکانت: {_wz_escape(v.get('account_owner') or 'بدون مالک')}",
+            f"• مقصد: <code>{_wz_escape(v.get('chat_id'))}</code>",
+        ]),
+        commit=commit,
+        legacy=_legacy_link_user,
+    ))
+
+
+def _parse_link_account(raw):
+    """Resolve the account now, so the operator sees what they are about to link."""
+    code = _wz_text(raw, "کد اکانت", maximum=64)
+    account = database.get_account_by_code_or_email(code)
+    if not account:
+        raise ValueError("اکانتی با این کد یا ایمیل پیدا نشد؛ ورودی را بررسی کنید.")
+    return {"account_code": account["account_code"],
+            "account_owner": account.get("owner_tg_id") or ""}
+
+
+def _legacy_link_user(raw):
+    """Accept the pre-wizard ``chat_id account_code`` line."""
+    parts = str(raw or "").split()
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None
+    return {"chat_id": int(parts[0]), "account_code": parts[1]}
+
+
+def _register_admin_wizards() -> None:
+    """Register every operator flow. Called once at import.
+
+    Registration reads the live catalogues (tiers, categories, panels) so the
+    buttons match what the operator actually configured. It must therefore never
+    take the module down: a database that is not ready yet leaves the flow with its
+    fallback choices, and the wizard still opens.
+    """
+    for register in (_register_rep_wizards, _register_plan_wizards,
+                     _register_money_wizards, _register_link_user_wizard):
+        try:
+            register()
+        except Exception:
+            logger.exception("Could not register the %s wizard flow", register.__name__)
+
+
+_register_admin_wizards()
+
+
+#: Which wizard each ``admin:prompt_*`` button now opens.
+ADMIN_WIZARD_FLOW_OF = {
+    "prompt_card_settings": "admin_card_settings",
+    "prompt_charge_user": "admin_charge_user",
+    "prompt_edit_credit": "admin_edit_credit",
+    "prompt_pay": "admin_pay",
+    "prompt_add_rep": "admin_add_rep",
+    "prompt_edit_plan": "admin_edit_plan",
+    "prompt_add_plan": "admin_add_plan",
+    "prompt_edit_user_id": "admin_edit_user_id",
+    "prompt_link_user": "admin_link_user",
+    "prompt_link_user_id": "admin_link_user_account",
+    "prompt_unlink_user_acc": "admin_unlink_user_account",
+    "prompt_edit_rep": "admin_edit_rep",
+    "prompt_edit_plan_specs": "admin_edit_plan_specs",
+}
+
+
+def _admin_wizard_seed(action: str, sub_action: str, parts: list[str]) -> dict:
+    """The context a flow needs to build its preview, gathered from the callback."""
+    seed: dict = {}
+    if action in ("prompt_charge_user", "prompt_edit_user_id",
+                  "prompt_link_user_id", "prompt_unlink_user_acc"):
+        try:
+            seed["user_id"] = int(sub_action)
+        except (TypeError, ValueError):
+            return {}
+        seed["current_balance"] = database.get_user_wallet_balance(seed["user_id"])
+    elif action in ("prompt_edit_credit", "prompt_edit_rep"):
+        try:
+            rep_id = int(sub_action)
+        except (TypeError, ValueError):
+            return {}
+        rep = database.get_rep_by_id(rep_id)
+        if not rep:
+            return {}
+        seed["rep_id"] = rep_id
+        seed["rep_name"] = rep.get("name") or ""
+        seed["rep_code"] = rep.get("rep_code") or ""
+        seed["current_limit"] = int(rep.get("credit_limit_toman") or 0)
+        if action == "prompt_edit_rep":
+            seed["previous_value"] = ""
+    elif action == "prompt_pay":
+        rep = database.get_rep_by_code(sub_action)
+        if not rep:
+            return {}
+        seed["rep_code"] = rep.get("rep_code") or sub_action
+        seed["rep_name"] = rep.get("name") or ""
+        seed["current_debt"] = int(database.get_rep_balance(rep["id"]) or 0)
+    elif action in ("prompt_edit_plan", "prompt_edit_plan_specs"):
+        plan = database.get_plan(sub_action)
+        if not plan:
+            return {}
+        seed["plan_code"] = plan.get("plan_code") or sub_action
+        seed["plan_name"] = plan.get("name") or ""
+        seed["rep_price"] = int(plan.get("rep_price") or 0)
+        seed["user_price"] = int(plan.get("user_price") or 0)
+        seed["previous_gb"] = plan.get("gb")
+        seed["previous_days"] = plan.get("days")
+        seed["previous_name"] = plan.get("name") or ""
+    return seed
+
+
+def _start_admin_wizard(context, query, flow_key: str, parent_cb: str, *,
+                        seed: dict | None = None, origin: str = "", ref: str = ""):
+    """Open one operator wizard on the live conversation store.
+
+    ``admin_state`` is dropped on purpose: the wizard supersedes it, and leaving both
+    live would let the legacy handler swallow the answer the wizard is waiting for.
+    """
+    message = getattr(query, "message", None)
+    chat = getattr(message, "chat", None)
+    state = ui_v52.start_wizard(
+        context.user_data, flow_key, return_callback=parent_cb, origin=origin, ref=ref,
+        seed=seed, message_id=getattr(message, "message_id", None),
+        chat_id=getattr(chat, "id", None))
+    context.user_data.pop("admin_state", None)
+    return state
 
 
 async def _reply_profile_after_action(update, admin_state, user_id, notice: str) -> bool:

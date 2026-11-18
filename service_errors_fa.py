@@ -6,9 +6,17 @@ representative: the UI layer translates them here, and any message without a
 translation degrades to a generic Persian sentence rather than leaking English
 into a Telegram page.
 
-The mapping is keyed by the literal strings raised by :mod:`access_service` and
-:mod:`support_service`. A message that already contains Persian is returned
-unchanged, so a service that raises a user-facing Persian message keeps it.
+The mapping is keyed by the literal strings raised by :mod:`access_service`,
+:mod:`support_service` and the S58 operator surfaces (:mod:`checkout_ui`,
+:mod:`account_actions_ui`, :mod:`access_ui`, :mod:`bot_admin_ui`). A message that
+already contains Persian is returned unchanged, so a service that raises a
+user-facing Persian message keeps it.
+
+Two shapes of key are used. A *literal* key is the exact message a module raises.
+A *template* key carries a parametrised message whose field name varies
+(``{label} must be a positive integer``) or a standard-library message whose tail
+varies (``invalid isoformat string``); those are matched by the containment pass,
+so the field name or parser detail never reaches the operator.
 """
 from __future__ import annotations
 
@@ -92,6 +100,121 @@ _MESSAGES = {
         "هم‌زمانی در بازگشایی تیکت رخ داد؛ صفحه را تازه کنید و دوباره تلاش کنید.",
     "ticket escalation lost a concurrent update":
         "هم‌زمانی در ارجاع تیکت رخ داد؛ صفحه را تازه کنید و دوباره تلاش کنید.",
+    # --- S58: the checkout, account-action, access and bot-admin surfaces ---- #
+    # Parametrised validators. ``_positive``/``_money``/``_positive_id`` build the
+    # message from the field name, so only the suffix carries meaning; the field
+    # name itself must never be echoed to the operator.
+    "{label} must be a positive integer":
+        "شناسهٔ واردشده معتبر نیست؛ باید یک عدد صحیح و مثبت باشد.",
+    "must be a positive integer":
+        "شناسهٔ واردشده معتبر نیست؛ باید یک عدد صحیح و مثبت باشد.",
+    "{label} must be a non-negative integer toman amount":
+        "مبلغ واردشده معتبر نیست؛ باید یک عدد صحیح و نامنفی به تومان باشد.",
+    "must be a non-negative integer toman amount":
+        "مبلغ واردشده معتبر نیست؛ باید یک عدد صحیح و نامنفی به تومان باشد.",
+    # checkout_ui
+    "an immutable price quote is required":
+        "برای این صفحه به یک برآورد قیمت قفل‌شده نیاز است؛ آن را از مسیر خرید باز کنید.",
+    "plan_code is required":
+        "پلن انتخاب نشده است؛ پلن را از فهرست تعرفه‌ها انتخاب کنید.",
+    "quote snapshot is malformed":
+        "اطلاعات برآورد قیمت ناقص است؛ خرید را از ابتدا آغاز کنید.",
+    "quote price edge is malformed":
+        "زنجیرهٔ قیمت این برآورد ناقص است؛ خرید را از ابتدا آغاز کنید.",
+    "quote final price edge does not match the frozen amount":
+        "مبلغ نهایی با برآورد قفل‌شده یکسان نیست؛ برای جلوگیری از اختلاف، خرید متوقف شد.",
+    "quote purpose is not a purchase":
+        "این برآورد قیمت برای خرید صادر نشده است.",
+    "quote purpose is not a renewal":
+        "این برآورد قیمت برای تمدید صادر نشده است.",
+    "paid purchase quote must be positive":
+        "مبلغ خرید باید بزرگ‌تر از صفر باشد.",
+    "plan_code and immutable renewal quote are required":
+        "برای تمدید، انتخاب پلن و برآورد قیمت قفل‌شده لازم است.",
+    "renewal quote must contain before and after snapshots":
+        "برآورد تمدید باید وضعیت پیش و پس از تمدید را همراه داشته باشد؛ صفحه را دوباره باز کنید.",
+    "before snapshot differs from the frozen quote":
+        "وضعیت پیش از تمدید با برآورد قفل‌شده یکسان نیست؛ صفحه را تازه کنید.",
+    "after snapshot differs from the frozen quote":
+        "وضعیت پس از تمدید با برآورد قفل‌شده یکسان نیست؛ صفحه را تازه کنید.",
+    "addon_type must be gib or day":
+        "نوع افزونه معتبر نیست؛ فقط افزایش حجم یا افزایش زمان مجاز است.",
+    "order snapshot is required":
+        "اطلاعات سفارش در دسترس نیست؛ سفارش را از فهرست سفارش‌ها باز کنید.",
+    "order_id is required":
+        "شناسهٔ سفارش مشخص نیست؛ سفارش را از فهرست سفارش‌ها باز کنید.",
+    "order belongs to another actor":
+        "این سفارش به شما تعلق ندارد.",
+    "order is not awaiting payment":
+        "این سفارش در وضعیت انتظار پرداخت نیست.",
+    "payment attempt and order snapshots are required":
+        "اطلاعات پرداخت یا سفارش در دسترس نیست؛ صفحه را دوباره باز کنید.",
+    "payment instructions are private to the payer":
+        "اطلاعات پرداخت فقط برای پرداخت‌کنندهٔ همین سفارش نمایش داده می‌شود.",
+    "partial or mixed receipt amounts are not accepted":
+        "مبلغ رسید باید دقیقاً برابر مبلغ سفارش باشد؛ پرداخت جزئی یا ترکیبی پذیرفته نمی‌شود.",
+    "assigned bank card snapshot is unavailable":
+        "کارت مقصد برای این سفارش ثبت نشده است؛ با پشتیبانی تماس بگیرید.",
+    "payer card details are incomplete":
+        "اطلاعات کارت مقصد کامل نیست؛ با پشتیبانی تماس بگیرید.",
+    # account_actions_ui
+    "rotation_type must be sub or cred":
+        "نوع چرخش معتبر نیست؛ فقط چرخش لینک اشتراک یا چرخش اعتبارنامهٔ اتصال مجاز است.",
+    "actor cannot rotate this account":
+        "شما مجاز به چرخش این حساب نیستید.",
+    "unlimited must be boolean":
+        "انتخاب حالت نامحدود معتبر نیست؛ صفحه را دوباره باز کنید.",
+    "reset_usage does not accept quota value or unlimited flag":
+        "در حالت بازنشانی مصرف نه مقدار حجم و نه حالت نامحدود قابل ثبت نیست.",
+    "unlimited must not be combined with a finite value":
+        "حالت نامحدود را نمی‌توان همراه با مقدار حجم ثبت کرد.",
+    "unit must be B, KiB, MiB or GiB":
+        "واحد حجم معتبر نیست؛ واحدهای مجاز بایت، کیلوبایت، مگابایت یا گیگابایت است.",
+    "quota must resolve to an integer byte count":
+        "مقدار حجم باید به تعداد صحیح بایت برسد؛ مقدار اعشاری مجاز نیست.",
+    "mode must be reset_usage or set_quota_bytes":
+        "حالت ترافیک انتخاب‌شده معتبر نیست؛ یکی از دو گزینهٔ همین صفحه را انتخاب کنید.",
+    "mode must be set_expiry_utc or set_remaining_days":
+        "حالت زمان حساب انتخاب‌شده معتبر نیست؛ یکی از دو گزینهٔ همین صفحه را انتخاب کنید.",
+    "set_remaining_days requires a positive finite integer":
+        "تعداد روز باقی‌مانده باید یک عدد صحیح و مثبت باشد.",
+    "remaining days must be a positive integer":
+        "تعداد روز باقی‌مانده باید یک عدد صحیح و مثبت باشد.",
+    "unlimited expiry cannot include a date":
+        "برای انقضای نامحدود نمی‌توان تاریخ ثبت کرد.",
+    "expiry datetime is required":
+        "تاریخ و زمان انقضا ارسال نشده است.",
+    # access_ui. The rest of this module's messages are mapped above.
+    "account not found":
+        "حساب مورد نظر یافت نشد یا حذف شده است.",
+    "grant access_level must be viewer or manager":
+        "سطح دسترسی این واگذاری معتبر نیست؛ فقط «مشاهده‌گر» یا «مدیر حساب» مجاز است.",
+    # account_link_service, surfaced by the access page's candidate list.
+    "identifier must be text":
+        "شناسهٔ ارسالی معتبر نیست؛ کد حساب را به‌صورت متن بفرستید.",
+    # bot_admin_ui
+    "is_primary must be boolean":
+        "انتخاب بات اصلی بودن معتبر نیست؛ صفحه را دوباره باز کنید.",
+    "primary bot cannot be assigned to a representative":
+        "بات اصلی را نمی‌توان به یک نماینده نسبت داد.",
+    "bot token is required":
+        "توکن بات ارسال نشده است.",
+    "verified registration snapshot is required":
+        "اطلاعات ثبت‌شدهٔ بات در دسترس نیست؛ ثبت را از ابتدا آغاز کنید.",
+    "only a pending verified bot can be activated":
+        "فقط بات تأییدشده‌ای که در وضعیت انتظار است قابل فعال‌سازی است.",
+    "verified bot username is required":
+        "نام کاربری بات تأییدشده ثبت نشده است.",
+    # Standard-library messages these pages can surface. The operator gets the
+    # Persian sentence instead of the raw parser text.
+    "invalid isoformat string":
+        "قالب تاریخ و زمان معتبر نیست؛ نمونهٔ درست: 2026-12-01T12:00:00",
+    "invalid date string":
+        "قالب تاریخ معتبر نیست؛ نمونهٔ درست: 2026-12-01T12:00:00",
+    "no time zone found":
+        "منطقهٔ زمانی انتخاب‌شده شناخته نشد؛ منطقهٔ پیش‌فرض تهران استفاده می‌شود.",
+    "invalid literal for int()":
+        "مقدار عددی واردشده معتبر نیست.",
 }
 
 DEFAULT_FALLBACK = "این عملیات انجام نشد. اگر تکرار شد با مدیریت هماهنگ کنید."

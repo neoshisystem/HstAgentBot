@@ -89,8 +89,13 @@ DEFAULT_TIER_PLAN_PRICES: tuple[tuple[str, str, str, int], ...] = (
     ("gold", "rep", "20gb_30d", 250000),
 )
 
+#: The sample sub-representative seeded under ``root_admin_rep`` so the four-level
+#: hierarchy (super admin / master rep / sub-rep / end user) is exercisable.
+SAMPLE_SUB_REP_CODE = "sub_rep_tehran"
+SAMPLE_SUB_REP_NAME = "زیرنمایندگی تهران (نمونه)"
+
 #: ``(product_code, category title, title, description, delivery_type, rep, user,
-#: usage guide, inventory items)`` used only when the store has no product at all.
+#: usage guide, inventory items)`` sample products, seeded per product code.
 DEFAULT_STORE_SAMPLES: tuple[tuple[str, str, str, str, str, int, int, str, tuple[str, ...]], ...] = (
     (
         "sample-crunchyroll-1m", "سرویس‌های اشتراکی",
@@ -974,7 +979,7 @@ def _seed_default_sample_ecosystem(conn) -> dict:
     """
     seeded = {"plan_categories": 0, "plan_links": 0, "plan_panels": 0,
               "tiers": 0, "tier_plan_prices": 0, "store_products": 0,
-              "store_inventory": 0, "coupons": 0}
+              "store_inventory": 0, "coupons": 0, "sub_reps": 0}
     now = int(time.time())
     from crypto_store import encrypt_secret
 
@@ -1095,24 +1100,30 @@ def _seed_default_sample_ecosystem(conn) -> dict:
             )
             seeded["tier_plan_prices"] += max(cursor.rowcount, 0)
 
-    # 5. Digital store samples, only when the store has no product at all.
+    # 5. Digital store samples, seeded per product.
+    #
+    #    The guard used to be all-or-nothing ("the store has no product at all"),
+    #    which silently skipped the whole sample catalogue on any deployment where
+    #    an operator had already created a single product — the live staging
+    #    database had exactly one operator product, so the samples never landed and
+    #    the store, its inventory and the auto-delivery path stayed untestable.
+    #    Each sample is now inserted on its own ``product_code`` with
+    #    ``ON CONFLICT DO NOTHING``, so an operator product is never touched, and
+    #    the sample inventory is written only for a sample product that has none.
     if all(_table_present(conn, name) for name in
            ("digital_products", "digital_inventory", "digital_categories")):
         # A restored/test database may have the migration-owned store tables but
         # not the lazy post-migration helper column yet. ``init_db`` installs it
         # before seeding; mirror that sequence for direct, read-only seed callers.
         ensure_product_usage_guide_column(conn)
-        product_count = int(conn.execute(
-            "SELECT COUNT(*) FROM digital_products").fetchone()[0])
         # The sample inventory is secret-bearing, so it needs the column master key.
         # A deployment without one (a CI runner, a plain ``init_db`` smoke test) must
         # still get a fully provisioned database: the catalogue is sample data, so it
         # is skipped with a warning instead of aborting the whole bootstrap.
-        if product_count == 0 and not _store_samples_encryptable():
+        if not _store_samples_encryptable():
             logger.warning(
                 "Sample store catalogue skipped: BACKUP_ENCRYPTION_KEY is not configured")
-            product_count = -1
-        if product_count == 0:
+        else:
             for (product_code, category_title, title, description, delivery_type,
                  rep_price, user_price, usage_guide, items) in DEFAULT_STORE_SAMPLES:
                 category_id = _ensure_digital_category(conn, category_title)
@@ -1131,6 +1142,13 @@ def _seed_default_sample_ecosystem(conn) -> dict:
                 if row is None:
                     continue
                 product_id = int(row["id"])
+                # Never top up an existing product's stock: a replay must not add a
+                # second batch of secrets to a product the operator has sold from.
+                stocked = int(conn.execute(
+                    "SELECT COUNT(*) FROM digital_inventory WHERE product_id=?",
+                    (product_id,)).fetchone()[0])
+                if stocked:
+                    continue
                 for index, secret in enumerate(items):
                     conn.execute(
                         "INSERT INTO digital_inventory(product_id,secret_cipher,notes,status,"
@@ -1151,6 +1169,40 @@ def _seed_default_sample_ecosystem(conn) -> dict:
                 (now + 90 * 86400,),
             )
             seeded["coupons"] += max(cursor.rowcount, 0)
+
+    # 7. A sample sub-representative under the master representative.
+    #
+    #    The hierarchy has four levels (super admin, master rep, sub-rep, end user)
+    #    and the staging deployment only ever had ``root_admin_rep``, so the
+    #    sub-rep surfaces — the scoped profile controls, the tree page, the
+    #    per-edge ledger — had no subject to render. The child is created once,
+    #    under the root, and its financial edge is written through the canonical
+    #    ``link_rep_edge`` so the price chain resolves exactly as it does for a
+    #    representative promoted through the UI.
+    if (_table_present(conn, "representatives") and _table_present(conn, "rep_edges")
+            and _table_present(conn, "bot_users")):
+        root_rep = conn.execute(
+            "SELECT id FROM representatives WHERE rep_code='root_admin_rep' "
+            "AND deleted_at IS NULL ORDER BY id LIMIT 1").fetchone()
+        if root_rep is not None:
+            root_rep_id = int(root_rep["id"])
+            child = conn.execute(
+                "SELECT 1 FROM representatives WHERE parent_rep_id=? "
+                "AND deleted_at IS NULL LIMIT 1", (root_rep_id,)).fetchone()
+            if child is None:
+                cursor = conn.execute(
+                    "INSERT INTO representatives(rep_code,name,telegram_id,group_id,topic_id,"
+                    "scope_filter,balance_toman,is_active,parent_rep_id,tier,billing_mode,"
+                    "can_create_sub_reps,max_sub_reps,custom_prefix,markup_bps) "
+                    "VALUES(?,?,NULL,NULL,NULL,'',0,1,?,'normal','credit',0,0,'',0) "
+                    "ON CONFLICT(rep_code) DO NOTHING",
+                    (SAMPLE_SUB_REP_CODE, SAMPLE_SUB_REP_NAME, root_rep_id),
+                )
+                if cursor.rowcount == 1:
+                    seeded["sub_reps"] += 1
+                    import rep_tree_service
+                    rep_tree_service.link_rep_edge(
+                        conn, int(cursor.lastrowid), root_rep_id, now=now)
     return seeded
 
 

@@ -36,6 +36,7 @@ import admin_panel
 import rep_panel
 import user_portal
 import v52_router
+import ui_v52
 import finance_manager
 import message_edit
 import profile_360
@@ -401,11 +402,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _v52_actor_context(update, context, persona=None, rep=None):
     user, chat = getattr(update, "effective_user", None), getattr(update, "effective_chat", None)
     bot = getattr(context, "bot", None)
+    query = getattr(update, "callback_query", None)
+    source_message = getattr(query, "message", None) or getattr(update, "effective_message", None)
     return {"actor_tg_id": getattr(user, "id", None), "telegram_id": getattr(user, "id", None),
             "bot_id": getattr(bot, "id", None), "chat_id": getattr(chat, "id", None),
             "chat_type": getattr(chat, "type", None), "persona": persona or "user",
             "rep_id": rep.get("id") if isinstance(rep, dict) else None,
-            "is_root": bool(getattr(user, "id", None) == ADMIN_TELEGRAM_ID)}
+            "is_root": bool(getattr(user, "id", None) == ADMIN_TELEGRAM_ID),
+            # The live conversation store and the message the button sits on. A
+            # wizard started from a bridge handler must own the SAME ``user_data``
+            # the text router reads, or its state is orphaned: the first step renders
+            # and no answer ever reaches it. The message id lets it edit in place.
+            "user_data": getattr(context, "user_data", None),
+            "message_id": getattr(source_message, "message_id", None)}
 
 
 _V52_TECHNICAL_ERRORS = (TypeError, AttributeError, NameError, ModuleNotFoundError,
@@ -1555,7 +1564,26 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
     if page is None and isinstance(route, v52_router.Route):
         name, params = route.handler, route.params
         try:
-            if name == "show_panel":
+            if name.startswith("wizard_"):
+                # The shared step-by-step wizard engine. It owns its own state and
+                # renders into the message the wizard itself opened, so it returns a
+                # page only when nothing is live any more.
+                from ui_v52 import wizard_handle_callback, render_error
+                action = name[len("wizard_"):]
+                if action == "pick":
+                    args = (int(params["step"]), int(params["choice"]))
+                elif action == "generate":
+                    action, args = "gen", (int(params["step"]),)
+                elif action in ("skip", "done"):
+                    args = (int(params["step"]),)
+                else:
+                    args = ()
+                if await wizard_handle_callback(update, context, action, args):
+                    return True
+                page = render_error(
+                    "این ویزارد دیگر فعال نیست؛ آن را از منو دوباره آغاز کنید.",
+                    persona=persona, parent_callback=f"v52:home:{persona}")
+            elif name == "show_panel":
                 from ui_v52 import render_page, button, render_error
                 panel_id = int(params["panel_id"])
                 with database.get_db() as conn:
@@ -2007,32 +2035,55 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         ctx, ticket_id, action="escalate", confirm=True, parent_callback="v52:tickets",
                     )
                 else:
-                    import support_ui
-                    ticket_id = str(params["ticket_id"])
-                    ticket = _ticket_row(ticket_id)
-                    if ticket is None:
-                        raise ValueError("این تیکت دیگر در دسترس نیست.")
-                    messages = support_service.list_ticket_messages(ctx, ticket_id)
-                    summary = "\n".join(
-                        f"{item.get('visibility', 'customer')}: {str(item.get('body') or '')[:180]}"
-                        for item in messages[-4:]
-                    ) or "هنوز پیامی برای این تیکت ثبت نشده است."
-                    v52_router.DEFAULT_FSM.set(
-                        ctx, "support_reply", payload={"ticket_id": ticket_id},
-                        parent_callback=data, now=int(time.time()),
-                    )
-                    is_author = int(ticket.get("sender_tg_id") or 0) == int(ctx.get("actor_tg_id") or 0)
-                    page = render_page(
-                        "🎫 تیکت " + support_service.ticket_code_label(ticket_id),
-                        support_ui.ticket_status_header(ticket.get("status"), ticket_id)
-                        + "\n\n" + summary
-                        + "\n\nپاسخ خود را در پیام بعدی ارسال کنید.",
-                        persona=persona, page_kind="form",
-                        rows=support_ui.ticket_page_rows(
-                            ticket_id, ticket.get("status"),
-                            is_operator=(persona in ("admin", "rep")), is_author=is_author,
-                            sender_tg_id=int(ticket.get("sender_tg_id") or 0) or None),
-                    )
+                    page = _v52_ticket_page(ctx, persona, str(params["ticket_id"]),
+                                            fsm_parent=data)
+            elif name == "p360_ticket":
+                # A ticket opened from a 360-degree profile: the card carries an
+                # explicit Back button to the profile it was opened from, and the
+                # reply draft's stale-form escape hatch goes there too.
+                import profile_360
+                user_id = int(params["user_id"])
+                origin, ref = str(params["origin"]), str(params["ref"])
+                back = profile_360.profile_callback("view", user_id, origin, ref)
+                page = _v52_ticket_page(ctx, persona, str(params["ticket_id"]),
+                                        fsm_parent=back, page_parent=back)
+            elif name == "p360_account_card":
+                # The account card, with its Back button rebuilt from the profile it
+                # was opened from. ``v52:sub:<id>`` alone had no registered parent,
+                # so the operator who drilled in from a profile lost the card.
+                import account_card_service
+                import profile_360
+                user_id = int(params["user_id"])
+                origin, ref = str(params["origin"]), str(params["ref"])
+                card = await account_card_service.build_account_card(
+                    ctx, int(params["account_id"]),
+                    adapter_factory=admin_panel._get_admin_panel_adapter_factory(context),
+                    parent_callback=profile_360.profile_callback(
+                        "view", user_id, origin, ref))
+                page = type("V52Page", (), {"text": card.text,
+                                            "reply_markup": card.reply_markup})()
+            elif name in {"p360_issue_service", "p360_transfer_ownership"}:
+                # The two management actions the 360-degree card offers at every
+                # level. Both are re-authorised here: the card is not the only way
+                # to reach a callback, and a scoped representative must not be able
+                # to act on somebody who is not downstream of them.
+                import profile_360
+                from ui_v52 import render_page
+                user_id = int(params["user_id"])
+                origin, ref = str(params["origin"]), str(params["ref"])
+                viewer_rep_id = _v52_viewer_rep_id(ctx)
+                if viewer_rep_id is not None and not profile_360.scoped_rep_scope_holds(
+                        user_id, viewer_rep_id):
+                    raise PermissionError("این عملیات برای این کاربر مجاز نیست.")
+                builder = (profile_360.build_issue_service_page
+                           if name == "p360_issue_service"
+                           else profile_360.build_transfer_ownership_page)
+                title, body, rows = builder(
+                    user_id, viewer_rep_id=viewer_rep_id, origin=origin, ref=ref)
+                page = render_page(
+                    title, body, persona=persona, rows=rows,
+                    parent_callback=profile_360.profile_callback(
+                        "view", user_id, origin, ref))
             elif name == "sync_topics":
                 if persona != "admin" or not ctx.get("is_root"):
                     raise PermissionError("همگام‌سازی تاپیک‌ها فقط در اختیار root است.")
@@ -3605,6 +3656,10 @@ CONVERSATION_STATE_KEYS = (
     "user_state", "admin_state", "rep_state", "fsm_state",
     "deposit_role", "deposit_amount", "deposit_form_state",
     "active_receipt_code", "transfer_confirm", "referral_pending",
+    # The step-by-step wizard is a conversation state like any other: leaving it
+    # live would let it swallow the next message of whatever workflow the actor
+    # started instead.
+    ui_v52.WIZARD_STATE_KEY,
 )
 
 # Callbacks that mean "I am leaving whatever I was doing": every main-menu entry,
@@ -3703,6 +3758,85 @@ def _ticket_row(ticket_id: str) -> dict | None:
     except Exception:
         logger.debug("Ticket row read failed", exc_info=True)
         return None
+
+
+def _v52_viewer_rep_id(ctx) -> int | None:
+    """The representative a v5.2 surface is acting as, or ``None`` for the root.
+
+    ``profile_360`` renders its scoped control set only for a representative, so
+    the bridge has to translate its own actor context into that one value instead
+    of passing a persona string the profile would have to re-derive.
+    """
+    if ctx.get("is_root"):
+        return None
+    try:
+        rep_id = int(ctx.get("rep_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    return rep_id if rep_id > 0 else None
+
+
+def _v52_retarget_back_row(rows, callback: str, replacement: str, label: str):
+    """Point a page's own generic exit at the surface it was actually opened from.
+
+    ``support_ui`` closes a ticket with «بازگشت به تیکت‌ها» → ``v52:tickets``, and the
+    v5.2 footer deliberately never adds a second back control to a page that already
+    ships one. A ticket opened from a 360-degree profile therefore has to *retarget*
+    that row, or the operator is dropped on the generic list instead of the card
+    they came from.
+    """
+    retargeted = []
+    for row in rows:
+        new_row = []
+        for item in row:
+            if str(getattr(item, "callback_data", "") or "") == callback:
+                new_row.append(InlineKeyboardButton(label, callback_data=replacement))
+            else:
+                new_row.append(item)
+        retargeted.append(new_row)
+    return retargeted
+
+
+def _v52_ticket_page(ctx, persona: str, ticket_id: str, *,
+                     fsm_parent: str | None = None, page_parent: str | None = None):
+    """The ticket card and its reply form, shared by the plain and contextual routes.
+
+    ``fsm_parent`` is what the reply draft offers as its way back when the form
+    expires; ``page_parent`` is the Back button on the card itself. A ticket opened
+    from the 360-degree profile passes the profile for both, so a reply that lands
+    after the form went stale still returns to the person it was about.
+    """
+    import support_service
+    import support_ui
+    from ui_v52 import render_page
+    ticket = _ticket_row(ticket_id)
+    if ticket is None:
+        raise ValueError("این تیکت دیگر در دسترس نیست.")
+    messages = support_service.list_ticket_messages(ctx, ticket_id)
+    summary = "\n".join(
+        f"{item.get('visibility', 'customer')}: {str(item.get('body') or '')[:180]}"
+        for item in messages[-4:]
+    ) or "هنوز پیامی برای این تیکت ثبت نشده است."
+    v52_router.DEFAULT_FSM.set(
+        ctx, "support_reply", payload={"ticket_id": ticket_id},
+        parent_callback=fsm_parent, now=int(time.time()),
+    )
+    is_author = int(ticket.get("sender_tg_id") or 0) == int(ctx.get("actor_tg_id") or 0)
+    rows = support_ui.ticket_page_rows(
+        ticket_id, ticket.get("status"),
+        is_operator=(persona in ("admin", "rep")), is_author=is_author,
+        sender_tg_id=int(ticket.get("sender_tg_id") or 0) or None)
+    if page_parent:
+        rows = _v52_retarget_back_row(rows, "v52:tickets", page_parent,
+                                      "🔙 بازگشت به پروفایل ۳۶۰ درجه")
+    return render_page(
+        "🎫 تیکت " + support_service.ticket_code_label(ticket_id),
+        support_ui.ticket_status_header(ticket.get("status"), ticket_id)
+        + "\n\n" + summary
+        + "\n\nپاسخ خود را در پیام بعدی ارسال کنید.",
+        persona=persona, page_kind="form", parent_callback=page_parent,
+        rows=rows,
+    )
 
 
 def _rep_may_open_profile(data: str, rep) -> bool:
@@ -4862,6 +4996,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Message & NLP Router ---
 
+def _p360_scoped_note_pending(context) -> bool:
+    """True while a scoped representative's 360-profile note form owns the next message.
+
+    The note writer lives in ``admin_panel`` (``action == "profile_note"``) and is
+    reached through the same ``admin_state`` FSM the super admin uses, so the form is
+    handed to it rather than duplicated. The marker is written by
+    ``profile_360._begin_note_input`` and only for a scoped representative, so no
+    other admin form action becomes reachable for a non-root actor.
+    """
+    state = (getattr(context, "user_data", None) or {}).get("admin_state") or {}
+    return state.get("action") == "profile_note" and bool(state.get("scoped_rep_id"))
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -4900,6 +5047,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # A live step-by-step wizard owns the next text message. It is consulted before
+    # the draft FSM and the legacy per-module forms because it is the most recently
+    # started conversation state, and it keeps the chat on a single screen.
+    from ui_v52 import wizard_handle_text
+    if await wizard_handle_text(update, context):
+        return
+
     if await _route_v52_fsm_text(update, context):
         return
 
@@ -4916,8 +5070,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await user_portal.show_user_portal(update, context)
             return
 
-    # Check Admin Interactive Input State (FSM) - STRICTLY in private DM only
-    if role == "super_admin" and chat.type == "private":
+    # Check Admin Interactive Input State (FSM) - STRICTLY in private DM only.
+    # A scoped representative's own 360-profile note form is the one admin form
+    # action they may complete, and it is recognised by its explicit marker.
+    if chat.type == "private" and (role == "super_admin"
+                                   or _p360_scoped_note_pending(context)):
         if await admin_panel.process_admin_text_input(update, context):
             return
 

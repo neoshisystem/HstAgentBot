@@ -39,6 +39,7 @@ def test_root_only_modes_and_units(monkeypatch):
     assert unlimited.kind == "preview" and "نامحدود" in unlimited.text
     assert zero.kind == "error"
     assert denied.kind == "error"
-    assert "UTC epoch seconds" in expiry.text
+    # S58 (ARCH-UX-002): the epoch is labelled in Persian, not as a technical key.
+    assert "معادل به وقت جهانی: 1796113800" in expiry.text
     assert "5 روز" in days.text
     assert attempts == []
