@@ -1,11 +1,14 @@
 """Small, transport-neutral Telegram page primitives for v5.2."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from html import escape
 from typing import Any, Iterable, Sequence
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+logger = logging.getLogger(__name__)
 
 _PERSONAS = {"admin": "admin", "rep": "rep", "representative": "rep",
               "user": "user", "end_user": "user"}
@@ -245,6 +248,10 @@ class WizardFlow:
     legacy: Any = None
     persona: str = "admin"
     intro: str = ""
+    #: Optional ``async def (update, context, values, notice) -> str`` run after a
+    #: successful commit, for work the synchronous ``commit`` cannot do — sending a
+    #: message, or syncing forum topics. Its return value is appended to the notice.
+    after_commit: Any = None
 
 
 #: Flows registered by the module that owns the domain (``admin_panel``,
@@ -810,7 +817,20 @@ async def wizard_handle_callback(update: Any, context: Any, action: str,
             await _wizard_render(update, context, state, error=str(exc))
             return True
         parent = state.get("return_callback") or None
+        # The hook needs the collected values, so they are read before the state is
+        # cleared. A failure here must not hide the write that already succeeded.
+        _flow = flow_by_key(state.get("flow"))
+        _values = dict(state.get("values") or {})
         clear_wizard(context.user_data)
+        _hook = getattr(_flow, "after_commit", None) if _flow is not None else None
+        if _hook is not None:
+            try:
+                _extra = await _hook(update, context, _values, notice)
+            except Exception as exc:
+                logger.exception("wizard after_commit hook failed")
+                _extra = f"\n⚠️ تکمیل پس از ثبت انجام نشد: {type(exc).__name__}"
+            if _extra:
+                notice = f"{notice}{_extra}"
         page = render_page("ثبت شد", notice, persona=state.get("persona") or "admin",
                           parent_callback=parent)
         await _wizard_edit_or_send(update, context, page, state)

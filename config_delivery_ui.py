@@ -97,6 +97,34 @@ def _qr_bytes(uri: str, qr_factory: Callable[[str], Any] | None = None) -> bytes
     return output.getvalue()
 
 
+def _subscription_fallback(account: Mapping[str, Any]) -> dict[str, Any] | None:
+    """One config item built from the account's subscription link, or ``None``.
+
+    A production account can answer the panel with no configs while still having a
+    perfectly good subscription URL — the panel may simply not enumerate it. Falling
+    back to that URL means the operator can always copy the link and get its QR code
+    instead of being told there is nothing to deliver.
+    """
+    sub_id = str(account.get("sub_id") or "").strip()
+    if not sub_id:
+        return None
+    url = ""
+    try:
+        import internal_panel_compat
+        url = internal_panel_compat.get_sub_url(sub_id, account_ref=account)
+    except Exception:
+        url = ""
+    if not url:
+        try:
+            import sub_manager
+            url = sub_manager.get_subscription_url(sub_id, account_ref=account)
+        except Exception:
+            url = ""
+    if not isinstance(url, str) or not url or "\n" in url or "\r" in url:
+        return None
+    return {"uri": url, "label": "لینک اشتراک"}
+
+
 async def _fetch(
     account_id: int,
     *,
@@ -121,6 +149,12 @@ async def _fetch(
     else:
         result = await _await(adapter.get_client_configs(str(account.get("email", ""))))
     items, next_cursor = _page_result(result)
+    if not items and cursor is None:
+        # Only the first page falls back: an empty later page is the real end of the
+        # server cursor, not a panel that failed to enumerate the account.
+        fallback = _subscription_fallback(account)
+        if fallback is not None:
+            items = [fallback]
     for item in items:
         _uri(item)
     return dict(account), items, next_cursor

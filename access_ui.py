@@ -40,13 +40,19 @@ def _persona(ctx, fallback: str) -> str:
     return "rep" if rep_id is not None else fallback
 
 
+#: Persian names for the two grant levels. The English token is kept in parentheses
+#: only where an existing contract pins it (the level buttons and the grant list line),
+#: so the operator reads Persian while the token stays greppable for the tests.
+_LEVEL_FA = {"viewer": "مشاهده‌گر", "manager": "مدیر حساب"}
+
+
 def _grant_line(item: Mapping) -> str:
     grantee = _positive(item.get("grantee_tg_id"), "grantee_tg_id")
     level = str(item.get("access_level") or "").strip().lower()
     if level not in {"viewer", "manager"}:
         raise ValueError("grant access_level must be viewer or manager")
     meaning = "مشاهدهٔ حساب و آمار" if level == "viewer" else "مشاهده، تمدید و چرخش مجاز"
-    return f"کاربر {grantee} — {level}: {meaning}"
+    return f"کاربر {grantee} — {_LEVEL_FA.get(level, level)} ({level}): {meaning}"
 
 
 def _load_grants(account_id: int):
@@ -101,7 +107,7 @@ def show_grants(
             safe_grants.append(item)
         lines = [f"شناسهٔ حساب: {exact_id}",
                  f"مالک اصلی: {owner_tg_id if owner_tg_id is not None else 'ثبت نشده'}",
-                 "مالک اصلی با grant اشتباه گرفته نمی‌شود."]
+                 "مالک اصلی با مجوز دسترسی (grant) اشتباه گرفته نمی‌شود."]
         rows = [
             [button("افزودن دسترسی مشاهده", f"v52:gset:{exact_id}:viewer"),
              button("افزودن دسترسی مدیر", f"v52:gset:{exact_id}:manager")]
@@ -111,7 +117,7 @@ def show_grants(
             grantee = _positive(item.get("grantee_tg_id"), "grantee_tg_id")
             rows.append([button(f"پیش‌نمایش لغو {grantee}", f"v52:grevoke:{exact_id}:{grantee}")])
         if not safe_grants:
-            lines.append("هیچ grant فعالی ثبت نشده است.")
+            lines.append("هیچ مجوز دسترسی (grant) فعالی ثبت نشده است.")
         return render_page("مدیریت دسترسی حساب", "\n".join(lines),
                            persona=_persona(ctx, persona), page_kind="access",
                            parent_callback=parent_callback, rows=rows)
@@ -144,12 +150,15 @@ def begin_grant(
                 rows = [[button("👁 مشاهده‌گر (Viewer)", f"v52:gset:{exact_id}:viewer"),
                          button("⚙️ مدیر حساب (Manager)", f"v52:gset:{exact_id}:manager")]]
             text = (f"حساب {exact_id}\nشناسهٔ عددی و مثبت تلگرامِ دریافت‌کننده را ارسال کنید."
-                    + (f" سطح انتخاب‌شده: {selected_level}." if selected_level else " ابتدا سطح viewer یا manager را انتخاب کنید."))
+                    + (f" سطح انتخاب‌شده: {_LEVEL_FA.get(selected_level, selected_level)}."
+                       if selected_level
+                       else " ابتدا سطح مشاهده‌گر یا مدیر حساب را انتخاب کنید."))
             return render_page("شروع اعطای دسترسی", text, persona=_persona(ctx, persona),
                                page_kind="form", parent_callback=parent_callback, rows=rows)
         if selected_level is None:
             return render_page("انتخاب سطح دسترسی",
-                               f"کاربر {selected_grantee} برای حساب {exact_id}. سطح viewer یا manager را انتخاب کنید.",
+                               f"کاربر {selected_grantee} برای حساب {exact_id}. "
+                               "سطح مشاهده‌گر یا مدیر حساب را انتخاب کنید.",
                                persona=_persona(ctx, persona), page_kind="form",
                                parent_callback=parent_callback,
                                rows=[[button("👁 مشاهده‌گر (Viewer)", f"v52:gset:{exact_id}:viewer"),
@@ -183,8 +192,10 @@ def preview_grant(
         meaning = "فقط مشاهده" if level == "viewer" else "مشاهده، تمدید و چرخش مجاز"
         return render_page(
             "پیش‌نمایش اعطای دسترسی",
-            f"حساب: {aid}\nمالک اصلی تغییر نمی‌کند.\nدریافت‌کننده: {grantee}\nسطح: {level} — {meaning}\n"
-            "مانده، مالکیت و اطلاعات محرمانه تغییر نمی‌کنند. ثبت grant فقط پس از تأیید نهایی انجام می‌شود.",
+            f"حساب: {aid}\nمالک اصلی تغییر نمی‌کند.\nدریافت‌کننده: {grantee}\n"
+            f"سطح: {_LEVEL_FA.get(level, level)} — {meaning}\n"
+            "مانده، مالکیت و اطلاعات محرمانه تغییر نمی‌کنند. "
+            "ثبت مجوز دسترسی (grant) فقط پس از تأیید نهایی انجام می‌شود.",
             persona=_persona(ctx, persona), page_kind="preview",
             parent_callback=parent_callback,
             rows=[[button("بازگشت به دسترسی‌ها", f"v52:grants:{aid}")]],
@@ -228,8 +239,10 @@ def preview_revoke(
             raise ValueError("grant access_level is invalid")
         return render_page(
             "پیش‌نمایش لغو دسترسی",
-            f"حساب: {aid}\nدریافت‌کننده: {grantee}\nسطح فعلی: {level}\n"
+            f"حساب: {aid}\nدریافت‌کننده: {grantee}\n"
+            f"سطح فعلی: {_LEVEL_FA.get(level, level)}\n"
             "لغو فقط دسترسی همین دریافت‌کننده را می‌بندد؛ مالک اصلی و سایر grantها دست‌نخورده می‌مانند.\n"
+            "«grant» در این صفحه به معنای مجوز دسترسی است.\n"
             "این صفحه هنوز هیچ تغییری در پایگاه داده ایجاد نکرده است.",
             persona=_persona(ctx, persona), page_kind="preview",
             parent_callback=parent_callback,

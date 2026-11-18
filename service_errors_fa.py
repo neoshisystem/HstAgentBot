@@ -199,6 +199,79 @@ _MESSAGES = {
         "بات اصلی را نمی‌توان به یک نماینده نسبت داد.",
     "bot token is required":
         "توکن بات ارسال نشده است.",
+    "bot token must be in <bot_id>:<secret> form":
+        "قالب توکن بات معتبر نیست؛ توکن را به شکل «شناسه:کلید» بفرستید.",
+    # bot_registry_service, surfaced by the bot-registration wizard. Every refusal an
+    # operator can hit while registering, activating or disabling a bot gets its own
+    # sentence instead of the generic fallback.
+    "only the configured root may manage bot registrations":
+        "ثبت و مدیریت بات فقط در اختیار مدیر کل است.",
+    "this Telegram bot token is already registered":
+        "این توکن بات پیش‌تر ثبت شده است؛ برای هر بات فقط یک توکن معتبر پذیرفته می‌شود.",
+    "bot ID is already registered":
+        "این شناسهٔ بات پیش‌تر ثبت شده است؛ اگر بات را جابه‌جا کرده‌اید ابتدا ثبت قبلی را غیرفعال کنید.",
+    "representative is inactive or unavailable":
+        "نمایندهٔ انتخاب‌شده فعال نیست؛ نمایندهٔ دیگری را انتخاب کنید.",
+    "declared bot ID does not match Telegram getMe":
+        "شناسهٔ داخل توکن با پاسخ تأیید تلگرام یکسان نیست؛ توکن را دوباره بررسی کنید.",
+    "Telegram getMe verification failed":
+        "تلگرام این توکن را تأیید نکرد؛ توکن را دوباره بررسی کنید.",
+    "Telegram getMe returned no valid bot ID":
+        "پاسخ تأیید تلگرام شناسهٔ بات معتبری نداشت؛ توکن را دوباره بررسی کنید.",
+    "an existing bot credential cannot be verified safely":
+        "این توکن پیش‌تر در سامانه ثبت شده و بازبینی مجدد آن ایمن نیست.",
+    "only a pending bot can be activated":
+        "فقط باتی که در انتظار تأیید است قابل فعال‌سازی است.",
+    "only an active bot can be disabled":
+        "فقط بات فعال قابل غیرفعال‌سازی است.",
+    "bot registration does not exist":
+        "این ثبت بات در سامانه وجود ندارد.",
+    "bot token and get_me callable are required":
+        "توکن بات ارسال نشده است.",
+    "bot credential encryption failed":
+        "ذخیرهٔ امن توکن بات انجام نشد؛ با مدیر کل هماهنگ کنید.",
+    "activation preview could not be created":
+        "ساخت پیش‌نمایش فعال‌سازی بات انجام نشد؛ دوباره تلاش کنید.",
+    "activation confirmation is invalid, stale or expired":
+        "این تأیید فعال‌سازی معتبر نیست یا منقضی شده است؛ ثبت را از ابتدا آغاز کنید.",
+    "bot status is not recognised":
+        "وضعیت این بات شناخته نشد؛ صفحهٔ بات‌ها را دوباره باز کنید.",
+    # The enable / reassign / delete half of the bot lifecycle, so an operator never
+    # sees the generic fallback while managing a bot.
+    "only a disabled bot can be enabled":
+        "فقط بات غیرفعال قابل فعال‌سازی مجدد است.",
+    "enable preview could not be created":
+        "ساخت پیش‌نمایش فعال‌سازی مجدد بات انجام نشد؛ دوباره تلاش کنید.",
+    "enable confirmation is invalid, stale or expired":
+        "این تأیید فعال‌سازی مجدد معتبر نیست یا منقضی شده است؛ از ابتدا آغاز کنید.",
+    "another primary bot is already registered":
+        "یک بات اصلی دیگر در سامانه ثبت شده است؛ ابتدا آن را غیرفعال کنید.",
+    "this representative already has an active bot; disable or reassign it first":
+        "این نماینده از قبل یک بات فعال دارد؛ ابتدا آن بات را غیرفعال یا منتقل کنید.",
+    "the primary bot cannot be reassigned":
+        "بات اصلی سامانه قابل انتقال یا مصادره نیست.",
+    "reassign preview could not be created":
+        "ساخت پیش‌نمایش تغییر مالکیت بات انجام نشد؛ دوباره تلاش کنید.",
+    "reassign confirmation is invalid, stale or expired":
+        "این تأیید تغییر مالکیت معتبر نیست یا منقضی شده است؛ از ابتدا آغاز کنید.",
+    "this representative already has an active bot; disable it first":
+        "این نماینده از قبل یک بات فعال دارد؛ ابتدا آن بات را غیرفعال کنید.",
+    "an active bot must be disabled before deletion":
+        "بات فعال را نمی‌توان حذف کرد؛ ابتدا آن را غیرفعال کنید.",
+    "the primary bot cannot be deleted":
+        "بات اصلی سامانه قابل حذف نیست.",
+    "this bot has operational history; disable it instead of deleting it":
+        "این بات سابقهٔ عملیاتی دارد و حذف نمی‌شود؛ به‌جای حذف آن را غیرفعال کنید.",
+    "delete preview could not be created":
+        "ساخت پیش‌نمایش حذف بات انجام نشد؛ دوباره تلاش کنید.",
+    "delete confirmation is invalid, stale or expired":
+        "این تأیید حذف معتبر نیست یا منقضی شده است؛ از ابتدا آغاز کنید.",
+    "prepared bot action is required":
+        "پیش‌نمایش عملیات بات در دسترس نیست؛ کارت بات را دوباره باز کنید.",
+    "bot action result is required":
+        "نتیجهٔ عملیات بات در دسترس نیست؛ فهرست بات‌ها را دوباره باز کنید.",
+    "unknown bot action":
+        "این عملیات بات شناخته نشد؛ کارت بات را دوباره باز کنید.",
     "verified registration snapshot is required":
         "اطلاعات ثبت‌شدهٔ بات در دسترس نیست؛ ثبت را از ابتدا آغاز کنید.",
     "only a pending verified bot can be activated":

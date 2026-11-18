@@ -54,6 +54,18 @@ SETTINGS_OTHER_TITLE = "🧩 سایر پارامترها"
 # because there is nothing an operator could usefully change about them.
 HIDDEN_SETTINGS = frozenset({"ticket_code_seq"})
 
+#: Whole namespaces of internal bookkeeping. ``bootstrap_v52`` writes machine-readable
+#: JSON markers here (``v52.bootstrap.financial_cutoff``); they are not operator
+#: settings. They used to leak into «سایر پارامترها», where the ``_`` in every JSON
+#: key was read as Markdown italic and Telegram rejected the whole page.
+HIDDEN_SETTING_PREFIXES = ("v52.bootstrap.",)
+
+
+def is_hidden_setting(key) -> bool:
+    """True for an internal row that must never appear in the settings centre."""
+    text = str(key or "")
+    return text in HIDDEN_SETTINGS or text.startswith(HIDDEN_SETTING_PREFIXES)
+
 # Settings whose value is a switch rather than a number or an identifier. Only
 # these render as فعال/غیرفعال: a topic id of 0 is a real identifier, not "off".
 BOOLEAN_SETTINGS = frozenset({
@@ -98,15 +110,23 @@ def setting_description(setting) -> str:
     return SETTING_DESCRIPTION_FALLBACK
 
 
-def setting_value_display(key: str, value) -> str:
-    """Readable current value: a switch reads as فعال/غیرفعال, a keyword in Persian."""
+def setting_value_display(key: str, value, *, markdown: bool = True) -> str:
+    """Readable current value: a switch reads as فعال/غیرفعال, a keyword in Persian.
+
+    ``markdown`` wraps a raw value in a code span for the legacy Markdown pages, where
+    a stray backtick or underscore in the value would otherwise break the message. The
+    wizard pages render HTML and escape the text themselves, so they pass
+    ``markdown=False`` and receive the bare value.
+    """
     text = str(value if value is not None else "").strip()
     keywords = SETTING_VALUE_LABELS.get(str(key))
     if keywords and text in keywords:
         return keywords[text]
     if str(key) in BOOLEAN_SETTINGS and text in {"0", "1"}:
         return BOOLEAN_ON if text == "1" else BOOLEAN_OFF
-    return f"`{text}`" if text else "—"
+    if not text:
+        return "—"
+    return f"`{escape_markdown_code(text)}`" if markdown else text
 
 
 def settings_category_of(key: str) -> str:
@@ -123,7 +143,7 @@ def settings_category_title(cat_key: str) -> str:
 def _settings_category_members(cat_key: str):
     """Live settings rows for one category, in the category's declared order."""
     settings_list = [s for s in database.get_all_settings()
-                     if s["key"] not in HIDDEN_SETTINGS]
+                     if not is_hidden_setting(s["key"])]
     if cat_key == "other":
         return [s for s in settings_list if s["key"] not in SETTINGS_CATEGORY_OF]
     order = {k: i for i, k in enumerate(
@@ -148,9 +168,13 @@ def build_settings_category_page(cat_key: str):
     for setting in members:
         key = setting["key"]
         label = setting_label(setting)
-        value = setting_value_display(key, setting["value"])
-        description = setting_description(setting)
-        lines.append(f"• **{label}**\n   مقدار فعلی: {value}\n   {description}")
+        # The body is sent as Markdown v1, so every interpolated field is escaped: a
+        # single ``_`` in a stored value made Telegram reject the entire page with
+        # «Can't parse entities». The button label stays raw — buttons are plain text.
+        lines.append(
+            f"• **{escape_markdown(label)}**\n"
+            f"   مقدار فعلی: {setting_value_display(key, setting['value'])}\n"
+            f"   {escape_markdown(setting_description(setting))}")
         rows.append([InlineKeyboardButton(
             f"⚙️ {label}",
             callback_data=f"admin:prompt_setting:{key}:{cat_key}",
@@ -728,6 +752,55 @@ def _transfer_source_snapshot(account: dict) -> dict:
     }
 
 
+def _finance_ctx(user, chat) -> dict:
+    """The context ``finance_admin_ui`` pages expect from the admin desk.
+
+    ``admin:plans`` already rendered the unified hub with this shape; the plan card
+    and the plan mutations need the same one, otherwise the operator would leave the
+    unified card for a legacy v4 view that hides the category, kind, audience and
+    panel controls.
+    """
+    return {
+        "actor_tg_id": user.id, "telegram_id": user.id, "is_root": True,
+        "chat_type": getattr(chat, "type", "private"), "persona": "admin",
+    }
+
+
+def _plan_card_keyboard(plan: dict, plan_code: str, user, chat):
+    """The plan card's controls, followed by the unified tariff controls.
+
+    The card's own text and its four edit buttons are pinned by existing tests, so
+    they stay exactly as they were; the tariff kind, audience, category and panel
+    checkboxes are appended so the card is no longer a half-view of the tariff. The
+    footer must remain the last row, which is why the unified rows are inserted
+    before ``build_back_to_admin_keyboard`` rather than after it.
+
+    A plan the catalogue cannot resolve (a synthetic record in a test, or a plan
+    deleted between the press and the render) leaves the legacy controls in place and
+    records the reason instead of failing the whole card.
+    """
+    rows = [
+        [InlineKeyboardButton("✏️ ویرایش قیمت‌ها", callback_data=f"admin:prompt_edit_plan:{plan_code}"),
+         InlineKeyboardButton("📐 ویرایش حجم/زمان", callback_data=f"admin:prompt_edit_plan_specs:{plan_code}")],
+        [InlineKeyboardButton(
+            "⚡️ تغییر حالت سریع/عادی",
+            callback_data=f"admin:set_plan_quick:{plan_code}:{0 if plan.get('is_quick') else 1}"
+        )],
+        [InlineKeyboardButton(
+            "⏸ غیرفعال‌سازی موقت تعرفه" if plan.get("is_active", 1) else "🟢 فعال‌سازی تعرفه",
+            callback_data=f"admin:set_plan_active:{plan_code}:{0 if plan.get('is_active', 1) else 1}")],
+        [InlineKeyboardButton("🗑 حذف این تعرفه", callback_data=f"admin:confirm_del_plan:{plan_code}")],
+    ]
+    try:
+        import finance_admin_ui
+        rows.extend(finance_admin_ui.plan_control_rows(_finance_ctx(user, chat), plan_code))
+    except Exception:
+        logger.warning(
+            "Could not render the unified tariff controls for plan %s", plan_code,
+            exc_info=True)
+    return build_back_to_admin_keyboard(rows, parent_cb="admin:plans")
+
+
 async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Guard callback dispatch so unexpected failures do not leave Telegram's spinner running."""
     query = update.callback_query
@@ -1177,32 +1250,15 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         await query.answer("مدیریت تعرفه‌ها، دسته‌بندی‌ها و پنل‌ها")
 
     elif action == "plan_detail":
-        plan_code = sub_action
-        plan = database.get_plan(plan_code)
-        if not plan:
-            await query.answer("❌ پلن یافت نشد.", show_alert=True)
-            return
-
-        quick_text = "⚡️ نمایش سریع (Quick Enabled)" if plan.get("is_quick") else "📦 نمایش عادی"
-        lines = [
-            f"⚙️ **مشخصات و مدیریت پلن: {escape_markdown(plan.get('name') or '')}**\n",
-            f"• کد پلن: `{escape_markdown_code(plan['plan_code'])}`",
-            f"• مشخصات: **{plan['gb']} گیگابایت / {plan['days']} روز**",
-            f"• قیمت نماینده: **{plan['rep_price']:,} تومان**",
-            f"• قیمت کاربر نهایی: **{plan['user_price']:,} تومان**",
-            f"• حالت نمایش: **{quick_text}**",
-            f"• وضعیت تعرفه: **{'🟢 فعال' if plan.get('is_active', 1) else '🔴 غیرفعال'}**"
-        ]
-        active_button = "⏸ غیرفعال‌سازی موقت تعرفه" if plan.get("is_active", 1) else "🟢 فعال‌سازی تعرفه"
-        keyboard = build_back_to_admin_keyboard([
-            [InlineKeyboardButton("✏️ ویرایش قیمت‌ها", callback_data=f"admin:prompt_edit_plan:{plan_code}"),
-             InlineKeyboardButton("📐 ویرایش حجم/زمان", callback_data=f"admin:prompt_edit_plan_specs:{plan_code}")],
-            [InlineKeyboardButton("⚡️ تغییر حالت سریع/عادی", callback_data=f"admin:set_plan_quick:{plan_code}:{0 if plan.get('is_quick') else 1}")],
-            [InlineKeyboardButton(active_button, callback_data=f"admin:set_plan_active:{plan_code}:{0 if plan.get('is_active', 1) else 1}")],
-            [InlineKeyboardButton("🗑 حذف این تعرفه", callback_data=f"admin:confirm_del_plan:{plan_code}")]
-        ], parent_cb="admin:plans")
-        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        await query.answer()
+        # S59 — the plan card is the unified tariff card, not the legacy v4 view.
+        # The old card hid the tariff kind, the audience, the categories and the panel
+        # bindings, so a plan reached from the admin desk offered only half of its
+        # controls and the operator had to leave for ``v52:plans`` to finish the job.
+        import finance_admin_ui
+        page = finance_admin_ui.plan_detail(
+            _finance_ctx(user, chat), sub_action, parent_callback="admin:plans")
+        await query.edit_message_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+        await query.answer("کارت تعرفه")
 
     elif action == "toggle_plan_quick":
         await query.answer(
@@ -1243,17 +1299,9 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             f"• حالت نمایش: **{quick_text}**",
             f"• وضعیت تعرفه: **{'🟢 فعال' if plan.get('is_active', 1) else '🔴 غیرفعال'}**"
         ]
-        active_button = "⏸ غیرفعال‌سازی موقت تعرفه" if plan.get("is_active", 1) else "🟢 فعال‌سازی تعرفه"
-        keyboard = build_back_to_admin_keyboard([
-            [InlineKeyboardButton("✏️ ویرایش قیمت‌ها", callback_data=f"admin:prompt_edit_plan:{plan_code}"),
-             InlineKeyboardButton("📐 ویرایش حجم/زمان", callback_data=f"admin:prompt_edit_plan_specs:{plan_code}")],
-            [InlineKeyboardButton(
-                "⚡️ تغییر حالت سریع/عادی",
-                callback_data=f"admin:set_plan_quick:{plan_code}:{0 if plan.get('is_quick') else 1}"
-            )],
-            [InlineKeyboardButton(active_button, callback_data=f"admin:set_plan_active:{plan_code}:{0 if plan.get('is_active', 1) else 1}")],
-            [InlineKeyboardButton("🗑 حذف این تعرفه", callback_data=f"admin:confirm_del_plan:{plan_code}")]
-        ], parent_cb="admin:plans")
+        # S59 — the same unified controls the tariff card carries, so this refresh is
+        # not a half-view of the plan either.
+        keyboard = _plan_card_keyboard(plan, plan_code, user, chat)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         return
 
@@ -1289,17 +1337,9 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             f"• حالت نمایش: **{quick_text}**",
             f"• وضعیت تعرفه: **{'🟢 فعال' if plan.get('is_active', 1) else '🔴 غیرفعال'}**",
         ]
-        active_button = "⏸ غیرفعال‌سازی موقت تعرفه" if plan.get("is_active", 1) else "🟢 فعال‌سازی تعرفه"
-        keyboard = build_back_to_admin_keyboard([
-            [InlineKeyboardButton("✏️ ویرایش قیمت‌ها", callback_data=f"admin:prompt_edit_plan:{plan_code}"),
-             InlineKeyboardButton("📐 ویرایش حجم/زمان", callback_data=f"admin:prompt_edit_plan_specs:{plan_code}")],
-            [InlineKeyboardButton(
-                "⚡️ تغییر حالت سریع/عادی",
-                callback_data=f"admin:set_plan_quick:{plan_code}:{0 if plan.get('is_quick') else 1}"
-            )],
-            [InlineKeyboardButton(active_button, callback_data=f"admin:set_plan_active:{plan_code}:{0 if plan.get('is_active', 1) else 1}")],
-            [InlineKeyboardButton("🗑 حذف این تعرفه", callback_data=f"admin:confirm_del_plan:{plan_code}")]
-        ], parent_cb="admin:plans")
+        # S59 — the same unified controls the tariff card carries, so this refresh is
+        # not a half-view of the plan either.
+        keyboard = _plan_card_keyboard(plan, plan_code, user, chat)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         return
 
@@ -1320,23 +1360,13 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             await query.answer(str(exc), show_alert=True)
             return
         await query.answer("🗑 تعرفه حذف شد." if deleted else "تعرفه یافت نشد.", show_alert=True)
-        # Refresh and return to plans list cleanly
-        plans = database.get_pricing_plans()
-        lines = ["⚙️ **تعرفه‌ها و پلن‌های سیستم:**\n"]
-        extra_btns = []
-        for p in plans:
-            quick_tag = "⚡️ [سریع]" if p.get("is_quick") else "📦"
-            active_tag = "🟢" if p.get("is_active", 1) else "🔴 [غیرفعال]"
-            lines.append(
-                f"{active_tag} {quick_tag} **{p['name']}** (`{p['plan_code']}`):\n"
-                f"   • {p['gb']}GB / {p['days']} روز | خرید: **{p['rep_price']:,} ت** | فروش: **{p['user_price']:,} ت**"
-            )
-            extra_btns.append([
-                InlineKeyboardButton(f"⚙️ مدیریت {p['name']}", callback_data=f"admin:plan_detail:{p['plan_code']}")
-            ])
-        extra_btns.append([InlineKeyboardButton("➕ تعریف پلن جدید", callback_data="admin:prompt_add_plan")])
-        keyboard = build_back_to_admin_keyboard(extra_btns)
-        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        # S59 — return to the unified hub, not the legacy v4 list. The old list had no
+        # categories, no tariff kind, no audience and no panel bindings, so deleting a
+        # plan dropped the operator onto a menu that could not finish the job.
+        import finance_admin_ui
+        page = finance_admin_ui.tariff_hub(
+            _finance_ctx(user, chat), parent_callback="admin:main")
+        await query.edit_message_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
         return
 
     # 4. Scope & Account Transfer
@@ -1981,6 +2011,46 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         if profile_prompt and prompt_origin and prompt_ref:
             prompt_parent_cb = build_profile_callback(
                 int(sub_action), prompt_origin, prompt_ref)
+        # S59 — a price or spec edit is started from one plan's card, so finishing or
+        # cancelling it must land back on that card instead of dumping the operator on
+        # the whole list and losing the plan they were working on.
+        if action in ("prompt_edit_plan", "prompt_edit_plan_specs") and sub_action:
+            prompt_parent_cb = f"admin:plan_detail:{sub_action}"
+
+        # S59 — the wizard is resolved BEFORE the legacy chain, not after it. Each
+        # legacy branch below edits the prompt message and answers the query, so
+        # resolving the flow afterwards drew the old prompt first and then rendered
+        # the wizard over the same message: a visible double edit on every launch.
+        # A flow that can open now owns the message and returns from here.
+        if action == "prompt_setting":
+            _setting_cat = parts[3] if len(parts) > 3 else settings_category_of(sub_action)
+            prompt_parent_cb = f"admin:settings_cat:{_setting_cat}"
+            _setting_rows = {s["key"]: s for s in database.get_all_settings()}
+            _setting_row = _setting_rows.get(sub_action)
+            _wizard_flow_key = (
+                _register_setting_wizard(sub_action, setting_label(_setting_row),
+                                         _setting_row.get("value"))
+                if _setting_row else None)
+            _wizard_seed = ({"current_value": _setting_row.get("value")}
+                            if _setting_row else {})
+        else:
+            _wizard_flow_key = ADMIN_WIZARD_FLOW_OF.get(action)
+            _wizard_seed = _admin_wizard_seed(action, sub_action, parts)
+        # A flow that acts on a specific record cannot open without that record's
+        # context; the legacy prompt below then remains the fallback.
+        _wizard_needs_seed = action in {
+            "prompt_edit_rep", "prompt_edit_credit", "prompt_pay", "prompt_edit_plan",
+            "prompt_edit_plan_specs", "prompt_charge_user", "prompt_edit_user_id",
+            "prompt_link_user_id", "prompt_unlink_user_acc",
+        }
+        if _wizard_flow_key and (_wizard_seed or not _wizard_needs_seed):
+            _wizard_state = _start_admin_wizard(
+                context, query, _wizard_flow_key, prompt_parent_cb,
+                seed=_wizard_seed, origin=prompt_origin, ref=prompt_ref)
+            await ui_v52.wizard_render(update, context, _wizard_state)
+            await query.answer()
+            return
+
         if action == "prompt_card_settings":
             context.user_data["admin_state"] = {"action": "edit_card_settings", "ts": now_ts}
             card_info = database.get_card_info()
@@ -2236,36 +2306,10 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             )
             await query.answer()
 
-        # S58 — the same button now opens the step-by-step wizard. The legacy
-        # ``admin_state`` above is kept for a form that was already in flight when the
-        # upgrade landed and for the hand-built states the tests drive; the wizard
-        # supersedes it for every new form, and owning both at once would let one
-        # swallow the answer the other is waiting for.
-        if action == "prompt_setting":
-            _setting_rows = {s["key"]: s for s in database.get_all_settings()}
-            _setting_row = _setting_rows.get(sub_action)
-            _wizard_flow_key = (
-                _register_setting_wizard(sub_action, setting_label(_setting_row),
-                                         _setting_row.get("value"))
-                if _setting_row else None)
-            _wizard_seed = ({"current_value": _setting_row.get("value")}
-                            if _setting_row else {})
-        else:
-            _wizard_flow_key = ADMIN_WIZARD_FLOW_OF.get(action)
-            _wizard_seed = _admin_wizard_seed(action, sub_action, parts)
-        # A flow that acts on a specific record cannot open without that record's
-        # context; the legacy prompt above then remains the fallback.
-        _wizard_needs_seed = action in {
-            "prompt_edit_rep", "prompt_edit_credit", "prompt_pay", "prompt_edit_plan",
-            "prompt_edit_plan_specs", "prompt_charge_user", "prompt_edit_user_id",
-            "prompt_link_user_id", "prompt_unlink_user_acc",
-        }
-        if _wizard_flow_key and (_wizard_seed or not _wizard_needs_seed):
-            _wizard_state = _start_admin_wizard(
-                context, query, _wizard_flow_key, prompt_parent_cb,
-                seed=_wizard_seed, origin=prompt_origin, ref=prompt_ref)
-            await ui_v52.wizard_render(update, context, _wizard_state)
-            return
+        # S59 — the wizard was resolved and started at the top of this branch, before
+        # the legacy prompts, so nothing is rendered twice here. What remains below is
+        # the pre-wizard ``admin_state`` fallback, kept for a form that was already in
+        # flight when the upgrade landed and for the hand-built states the tests drive.
 
         _form_state_scope3=context.user_data.get("admin_state")
         if _form_state_scope3:
@@ -2445,6 +2489,31 @@ def _remember_form_prompt(state: dict, query) -> None:
     message_id = getattr(message, "message_id", None)
     if message_id is not None:
         state["prompt_msg_id"] = message_id
+
+
+async def _replace_incoming(update, context, text: str, **kwargs) -> None:
+    """Delete the operator's raw input and post the result as one fresh message.
+
+    The admin flows are single-message: the prompt card is edited in place and the raw
+    answer is removed, so a search does not leave the query and its result sitting in
+    the chat as two separate messages. Telegram refuses a reply whose target was just
+    deleted, so the result is always sent as a new message rather than through
+    ``update.message.reply_text``. A failed delete (too old, already gone, no
+    permission) is logged and never fails the flow.
+    """
+    chat = getattr(update, "effective_chat", None)
+    bot = getattr(context, "bot", None)
+    if chat is None or bot is None:
+        return
+    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    message_id = getattr(message, "message_id", None)
+    if message_id is not None:
+        try:
+            await bot.delete_message(chat_id=chat.id, message_id=message_id)
+        except Exception as delete_error:
+            logger.warning(
+                "Could not delete admin input message %s: %s", message_id, delete_error)
+    await bot.send_message(chat_id=chat.id, text=text, **kwargs)
 
 
 def build_fsm_validation_keyboard(role: str) -> InlineKeyboardMarkup:
@@ -2773,7 +2842,9 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
         insp = await asyncio.to_thread(xui_manager.inspect_client, text, scope="all")
         if insp.get("status") == "ok":
             status_text = xui_manager.format_status_report(insp["data"], is_admin=True)
-            await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_main_keyboard())
+            await _replace_incoming(
+                update, context, status_text, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_back_to_admin_keyboard(parent_cb="admin:scope"))
         else:
             return await _reply_fsm_validation_error(update,context,admin_state,f"اکانت {text} روی سرور پیدا نشد؛ شناسه را بررسی کنید.")
         context.user_data.pop("admin_state",None)
@@ -2832,10 +2903,9 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
                     f"{label[:24]} ({item['telegram_id']})",
                     callback_data=f"admin:user_detail:{item['telegram_id']}"
                 )])
-            await update.message.reply_text(
-                f"🔎 {len(matches)} نتیجه برای جستجوی شما:",
-                reply_markup=build_back_to_admin_keyboard(rows)
-            )
+            await _replace_incoming(
+                update, context, f"🔎 {len(matches)} نتیجه برای جستجوی شما:",
+                reply_markup=build_back_to_admin_keyboard(rows, parent_cb="admin:users:1"))
         context.user_data.pop("admin_state", None)
         return True
 
@@ -2972,6 +3042,48 @@ def _wz_int(raw, label: str, *, minimum=None, maximum=None, allow_negative=False
     return value
 
 
+def _wz_price_input(raw) -> list[int]:
+    """Accept one price for a single rate, or ``rep user`` for the «both» choice.
+
+    The step cannot see which rate was chosen — ``parse`` only receives the raw text —
+    so the shape of the answer carries it: one number means «the rate I picked», two
+    numbers mean «the representative rate, then the user rate». The flow resolves the
+    pair against the chosen field in ``commit_edit`` and in the preview.
+    """
+    # U+066C is the Arabic thousands separator, so «۱۲۰٬۰۰۰» is one number and not two.
+    # It is stripped before splitting; «,»/«،»/whitespace still separate two values.
+    cleaned = str(raw or "").replace("\u066c", "")
+    chunks = [chunk for chunk in re.split(r"[\s,،]+", cleaned) if chunk]
+    if not chunks:
+        raise ValueError("نرخ نمی‌تواند خالی باشد.")
+    if len(chunks) > 2:
+        raise ValueError(
+            "حداکثر دو عدد وارد کنید: نرخ نماینده و سپس نرخ کاربر.")
+    return [_wz_int(chunk, "نرخ", minimum=0) for chunk in chunks]
+
+
+def _wz_resolve_prices(field: str, new_value, current_rep: int, current_user: int):
+    """Resolve the chosen rate(s) into ``(rep_price, user_price)``.
+
+    One implementation for the preview and the write, so the card can never promise a
+    change the commit does not make. «both» with a single number sets both rates to
+    that number; with a pair it sets each rate to its own.
+    """
+    numbers = new_value if isinstance(new_value, (list, tuple)) else [new_value]
+    numbers = [int(item) for item in numbers if item is not None]
+    if not numbers:
+        raise ValueError("نرخ جدید مشخص نیست؛ گام قبل را دوباره پر کنید.")
+    rep_price, user_price = int(current_rep), int(current_user)
+    if field == "rep_price":
+        rep_price = numbers[0]
+    elif field == "user_price":
+        user_price = numbers[0]
+    else:
+        rep_price = numbers[0]
+        user_price = numbers[1] if len(numbers) > 1 else numbers[0]
+    return rep_price, user_price
+
+
 def _wz_gb(raw, label: str = "حجم"):
     text = str(raw or "").translate(_WZ_DIGITS).replace(",", "").strip()
     try:
@@ -3011,6 +3123,31 @@ def _wz_money(value) -> str:
         return f"{int(value):,} تومان"
     except (TypeError, ValueError):
         return "—"
+
+
+def _wz_debt_after(values) -> int:
+    """The representative's debt once this settlement is applied.
+
+    The preview rendered ``values['debt_after']``, which no step ever set, so the card
+    always promised «۰» regardless of the amount. The arithmetic now mirrors
+    ``commit_pay``: a payment reduces the debt by the amount received.
+    """
+    explicit = values.get("debt_after")
+    if explicit is not None:
+        return int(explicit)
+    return int(values.get("current_debt") or 0) - int(values.get("amount") or 0)
+
+
+def _wz_balance_after(values) -> int:
+    """The wallet balance once this manual charge or deduction is applied.
+
+    Same defect as the settlement card: ``balance_after`` was never set, so the operator
+    confirmed a change without seeing the resulting balance.
+    """
+    explicit = values.get("balance_after")
+    if explicit is not None:
+        return int(explicit)
+    return int(values.get("current_balance") or 0) + int(values.get("amount") or 0)
 
 
 def _wz_rep_tier_choices() -> tuple[tuple[str, str], ...]:
@@ -3155,6 +3292,13 @@ def _register_rep_wizards() -> None:
         if not current:
             raise ValueError("نماینده موردنظر یافت نشد.")
         field = str(values.get("field"))
+        if field not in EDIT_REP_FIELD_FA:
+            raise ValueError("مشخصه انتخابی معتبر نیست؛ فرم را دوباره باز کنید.")
+        # S59 — the value is coerced for the chosen field before it is written, and the
+        # notice reports the record's real previous value. It used to copy the seed's
+        # empty ``previous_value`` into the message and to write the raw text straight
+        # into an integer column.
+        new_value = _parse_edit_rep_value(values.get("new_value"), field)
         merged = {
             "rep_code": current.get("rep_code") or "",
             "name": current.get("name") or "",
@@ -3163,14 +3307,15 @@ def _register_rep_wizards() -> None:
             "topic_id": int(current.get("topic_id") or 0),
             "scope_filter": current.get("scope_filter") or "",
         }
-        merged[field] = values["new_value"]
+        previous = merged.get(field)
+        merged[field] = new_value
         database.update_rep_full(
             rep_id, merged["name"], merged["rep_code"], int(merged["telegram_id"]),
             int(merged["group_id"]), int(merged["topic_id"]), merged["scope_filter"])
         return (f"مشخصات نماینده {merged['name']} به‌روز شد.\n"
                 f"«{EDIT_REP_FIELD_FA.get(field, field)}» از "
-                f"«{_wz_escape(values.get('previous_value'))}» به "
-                f"«{_wz_escape(values.get('new_value'))}» تغییر کرد.")
+                f"«{_wz_escape(previous)}» به "
+                f"«{_wz_escape(new_value)}» تغییر کرد.")
 
     ui_v52.register_flow(ui_v52.WizardFlow(
         "admin_edit_rep", "ویرایش مشخصات نماینده",
@@ -3183,8 +3328,8 @@ def _register_rep_wizards() -> None:
             f"• نماینده: <b>{_wz_escape(v.get('rep_name'))}</b> "
             f"(<code>{_wz_escape(v.get('rep_code'))}</code>)",
             f"• مشخصه: <b>{_wz_escape(EDIT_REP_FIELD_FA.get(str(v.get('field')), v.get('field')))}</b>",
-            f"• مقدار قبلی: {_wz_escape(v.get('previous_value') or '—')}",
-            f"• مقدار جدید: <b>{_wz_escape(v.get('new_value'))}</b>",
+            f"• مقدار قبلی: {_wz_escape(_wz_rep_previous_value(v))}",
+            f"• مقدار جدید: <b>{_wz_escape(_wz_rep_preview_value(v))}</b>",
         ]),
         commit=commit_edit,
         legacy=lambda raw: None,
@@ -3192,33 +3337,66 @@ def _register_rep_wizards() -> None:
 
 
 #: The representative fields the edit wizard can change, with their Persian titles.
+#: The forum binding is two separate columns, so it is two separate choices: a single
+#: «گروه/تاپیک» entry could never write both ``group_id`` and ``topic_id``.
 EDIT_REP_FIELD_CHOICES: tuple[tuple[str, str], ...] = (
     ("✏️ ویرایش نام", "name"),
     ("✏️ ویرایش کد", "rep_code"),
     ("✏️ ویرایش آیدی تلگرام", "telegram_id"),
-    ("✏️ ویرایش گروه/تاپیک", "group_topic"),
+    ("✏️ ویرایش شناسه گروه", "group_id"),
+    ("✏️ ویرایش شناسه تاپیک", "topic_id"),
     ("✏️ ویرایش فیلتر اسکوپ", "scope_filter"),
 )
 EDIT_REP_FIELD_FA = {
     "name": "نام نمایشی",
     "rep_code": "کد نماینده",
     "telegram_id": "شناسه تلگرام",
-    "group_topic": "گروه و تاپیک",
+    "group_id": "شناسه گروه",
+    "topic_id": "شناسه تاپیک",
     "scope_filter": "فیلتر اسکوپ",
 }
 
+#: The fields that must reach the database as integers; everything else is free text.
+_REP_INTEGER_FIELDS = frozenset({"telegram_id", "group_id", "topic_id"})
 
-def _parse_edit_rep_value(raw):
-    """Parse the new value for whichever representative field is being edited.
 
-    The field is not known to ``parse`` (it only receives the raw text), so the
-    accepted shapes are deliberately broad: a ``group topic`` pair for the forum
-    binding, a plain integer for the Telegram id, and free text otherwise.
+def _parse_edit_rep_value(raw, field: str | None = None):
+    """Parse the new value for a representative field.
+
+    At step 1 the field is unknown — ``parse`` only receives the raw text — so only the
+    shape valid for *every* field is enforced there (a non-empty string). Once the field
+    is known, on the preview card and in ``commit_edit``, the value is coerced for that
+    field, so a Telegram, group or topic id can never reach the database as text.
     """
-    text = str(raw or "").strip()
+    text = str(raw if raw is not None else "").strip()
     if not text:
         raise ValueError("مقدار جدید نمی‌تواند خالی باشد.")
-    return text
+    if field is None:
+        return text
+    if field in _REP_INTEGER_FIELDS:
+        return _wz_int(text, EDIT_REP_FIELD_FA.get(field, "شناسه"), minimum=0)
+    return _wz_text(text, EDIT_REP_FIELD_FA.get(field, "مقدار جدید"))
+
+
+def _wz_rep_previous_value(values) -> str:
+    """The chosen field's real current value, so the preview never shows a blank."""
+    current = values.get("current") or {}
+    value = current.get(str(values.get("field") or ""), "")
+    text = str(value)
+    return text if text.strip() else "—"
+
+
+def _wz_rep_preview_value(values) -> str:
+    """The new value as it will be stored, or the reason it cannot be stored yet.
+
+    Returning the reason inside the card keeps the confirm/edit/cancel buttons live, so
+    the operator can fix the value instead of losing the whole form to an error page.
+    """
+    try:
+        return str(_parse_edit_rep_value(
+            values.get("new_value"), str(values.get("field") or "") or None))
+    except (TypeError, ValueError) as exc:
+        return f"⚠️ {exc}"
 
 
 def _legacy_add_rep(raw):
@@ -3301,16 +3479,13 @@ def _register_plan_wizards() -> None:
         plan = database.get_plan(plan_code)
         if not plan:
             raise ValueError("تعرفه موردنظر یافت نشد.")
-        field = str(values.get("field"))
-        rep_price = int(plan["rep_price"])
-        user_price = int(plan["user_price"])
-        if field == "rep_price":
-            rep_price = int(values["new_value"])
-        elif field == "user_price":
-            user_price = int(values["new_value"])
-        else:
-            rep_price = int(values["rep_price"])
-            user_price = int(values["user_price"])
+        # S59 — «هر دو نرخ» used to read the seed's old prices straight back out of
+        # ``values["rep_price"]``/``values["user_price"]``, so choosing it interactively
+        # changed nothing at all. The preview and the write now both resolve the answer
+        # through one helper, so the card cannot promise a change the commit omits.
+        rep_price, user_price = _wz_resolve_prices(
+            str(values.get("field")), values.get("new_value"),
+            int(plan["rep_price"]), int(plan["user_price"]))
         database.update_plan_price(plan_code, rep_price, user_price)
         return (f"نرخ‌های تعرفه {plan.get('name')} به‌روز شد.\n"
                 f"قیمت نماینده: {_wz_money(rep_price)}\n"
@@ -3325,13 +3500,14 @@ def _register_plan_wizards() -> None:
                 ("✏️ هر دو نرخ", "both"),
             )),
             ui_v52.WizardStep("new_value", "نرخ جدید (تومان)",
-                              parse=lambda raw: _wz_int(raw, "نرخ", minimum=0)),
+                              hint="برای «هر دو نرخ» می‌توانید دو عدد بدهید: نرخ نماینده و سپس نرخ کاربر.",
+                              parse=_wz_price_input),
         ),
         preview=lambda v: "\n".join([
             f"• تعرفه: <b>{_wz_escape(v.get('plan_name'))}</b> "
             f"(<code>{_wz_escape(v.get('plan_code'))}</code>)",
-            f"• نرخ فعلی نماینده: {_wz_money(v.get('rep_price'))}",
-            f"• نرخ فعلی کاربر: {_wz_money(v.get('user_price'))}",
+            f"• نرخ فعلی نماینده: {_wz_money(v.get('current_rep_price'))}",
+            f"• نرخ فعلی کاربر: {_wz_money(v.get('current_user_price'))}",
             f"• تغییر: <b>{_wz_escape(_wz_price_change_label(v))}</b>",
         ]),
         commit=commit_edit,
@@ -3394,13 +3570,21 @@ def _wz_panel_titles(ids) -> str:
 
 
 def _wz_price_change_label(values) -> str:
+    """The preview's change line, resolved exactly as ``commit_edit`` will write it."""
+    try:
+        rep_price, user_price = _wz_resolve_prices(
+            str(values.get("field")), values.get("new_value"),
+            int(values.get("current_rep_price") or 0),
+            int(values.get("current_user_price") or 0))
+    except (TypeError, ValueError):
+        return "در انتظار نرخ جدید"
     field = str(values.get("field"))
-    new_value = values.get("new_value")
     if field == "rep_price":
-        return f"قیمت نماینده ← {_wz_money(new_value)}"
+        return f"قیمت نماینده ← {_wz_money(rep_price)}"
     if field == "user_price":
-        return f"قیمت کاربر ← {_wz_money(new_value)}"
-    return f"هر دو نرخ ← {_wz_money(new_value)}"
+        return f"قیمت کاربر ← {_wz_money(user_price)}"
+    return (f"قیمت نماینده ← {_wz_money(rep_price)} و "
+            f"قیمت کاربر ← {_wz_money(user_price)}")
 
 
 def _apply_plan_selection(plan_code: str, values) -> str:
@@ -3445,14 +3629,12 @@ def _legacy_add_plan(raw):
 
 
 def _legacy_edit_plan(raw):
-    """Accept the pre-wizard ``rep_price user_price`` line."""
+    """Accept the pre-wizard ``rep_price user_price`` line at step 1."""
     parts = str(raw or "").split()
     if len(parts) < 2:
         return None
     try:
-        return {"field": "both", "new_value": int(parts[0].replace(",", "").translate(_WZ_DIGITS)),
-                "rep_price": int(parts[0].replace(",", "").translate(_WZ_DIGITS)),
-                "user_price": int(parts[1].replace(",", "").translate(_WZ_DIGITS))}
+        return {"field": "both", "new_value": _wz_price_input(" ".join(parts[:2]))}
     except (ValueError, TypeError):
         return None
 
@@ -3534,7 +3716,7 @@ def _register_money_wizards() -> None:
             f"(<code>{_wz_escape(v.get('rep_code'))}</code>)",
             f"• بدهی فعلی: <b>{_wz_money(v.get('current_debt'))}</b>",
             f"• مبلغ واریزی: <b>{_wz_money(v.get('amount'))}</b>",
-            f"• بدهی پس از تسویه: <b>{_wz_money(v.get('debt_after'))}</b>",
+            f"• بدهی پس از تسویه: <b>{_wz_money(_wz_debt_after(v))}</b>",
             f"• شرح: {_wz_escape(v.get('description') or 'تسویه حساب نماینده')}",
         ]),
         commit=commit_pay,
@@ -3562,7 +3744,7 @@ def _register_money_wizards() -> None:
             f"• کاربر: <code>{_wz_escape(v.get('user_id'))}</code>",
             f"• مانده فعلی: <b>{_wz_money(v.get('current_balance'))}</b>",
             f"• تغییر: <b>{_wz_money(v.get('amount'))}</b>",
-            f"• مانده پس از اعمال: <b>{_wz_money(v.get('balance_after'))}</b>",
+            f"• مانده پس از اعمال: <b>{_wz_money(_wz_balance_after(v))}</b>",
         ]),
         commit=commit_charge,
         legacy=_legacy_charge_user,
@@ -3745,7 +3927,9 @@ def _register_setting_wizard(key: str, label: str, current_value=None) -> str:
             hint="مقدار جدید را وارد کنید. برای شناسهٔ گروه، عدد را همان‌طور که هست بفرستید.",
             parse=lambda raw: _wz_text(raw, label, maximum=200))
 
-    intro = f"مقدار فعلی این پارامتر: {setting_value_display(key, current_value)}"
+    # The wizard renders HTML and escapes its own text, so the value is taken bare.
+    intro = (f"مقدار فعلی این پارامتر: "
+             f"{setting_value_display(key, current_value, markdown=False)}")
 
     def commit(values, actor):
         raw_value = str(values.get("value") or "").strip()
@@ -3756,18 +3940,27 @@ def _register_setting_wizard(key: str, label: str, current_value=None) -> str:
                              actor_name=actor.get("name") or "Admin")
         return (f"تنظیمات با موفقیت بروزرسانی شد.\n"
                 f"پارامتر: {label}\n"
-                f"مقدار جدید: {setting_value_display(key, new_value)}\n\n"
+                f"مقدار جدید: {setting_value_display(key, new_value, markdown=False)}\n\n"
                 "تغییرات به‌صورت آنی در سامانه اعمال شد.")
+
+    async def after_commit(update, context, values, notice):
+        """A new group id must provision its report topics, exactly as the legacy
+        text handler did — otherwise the operator saved an id with no topics."""
+        if key not in database.GROUP_ID_SETTING_KEYS:
+            return ""
+        return await _provision_topics_after_group_change(
+            update, context, values.get("value"))
 
     ui_v52.register_flow(ui_v52.WizardFlow(
         flow_key, f"ویرایش تنظیمات — {label}",
         steps=(step,),
         preview=lambda v: "\n".join([
             f"• پارامتر: <b>{_wz_escape(label)}</b>",
-            f"• مقدار فعلی: {setting_value_display(key, v.get('current_value'))}",
-            f"• مقدار جدید: <b>{_wz_escape(setting_value_display(key, v.get('value')))}</b>",
+            f"• مقدار فعلی: <b>{_wz_escape(setting_value_display(key, v.get('current_value'), markdown=False))}</b>",
+            f"• مقدار جدید: <b>{_wz_escape(setting_value_display(key, v.get('value'), markdown=False))}</b>",
         ]),
         commit=commit,
+        after_commit=after_commit,
         legacy=lambda raw: {"value": str(raw).strip()} if str(raw).strip() else None,
         intro=intro,
     ))
@@ -3882,7 +4075,17 @@ def _admin_wizard_seed(action: str, sub_action: str, parts: list[str]) -> dict:
         seed["rep_code"] = rep.get("rep_code") or ""
         seed["current_limit"] = int(rep.get("credit_limit_toman") or 0)
         if action == "prompt_edit_rep":
-            seed["previous_value"] = ""
+            # S59 — the preview needs the record's real current values. The seed used to
+            # carry ``previous_value = ""``, so «مقدار قبلی» always rendered as «—» and
+            # the confirmation card could not be checked against anything.
+            seed["current"] = {
+                "name": rep.get("name") or "",
+                "rep_code": rep.get("rep_code") or "",
+                "telegram_id": int(rep.get("telegram_id") or 0),
+                "group_id": int(rep.get("group_id") or 0),
+                "topic_id": int(rep.get("topic_id") or 0),
+                "scope_filter": rep.get("scope_filter") or "",
+            }
     elif action == "prompt_pay":
         rep = database.get_rep_by_code(sub_action)
         if not rep:
@@ -3896,8 +4099,8 @@ def _admin_wizard_seed(action: str, sub_action: str, parts: list[str]) -> dict:
             return {}
         seed["plan_code"] = plan.get("plan_code") or sub_action
         seed["plan_name"] = plan.get("name") or ""
-        seed["rep_price"] = int(plan.get("rep_price") or 0)
-        seed["user_price"] = int(plan.get("user_price") or 0)
+        seed["current_rep_price"] = int(plan.get("rep_price") or 0)
+        seed["current_user_price"] = int(plan.get("user_price") or 0)
         seed["previous_gb"] = plan.get("gb")
         seed["previous_days"] = plan.get("days")
         seed["previous_name"] = plan.get("name") or ""

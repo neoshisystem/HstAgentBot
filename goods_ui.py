@@ -704,15 +704,85 @@ def begin_stock_import(ctx: Any, product_id: int, *, parent_callback: str | None
             raise ValueError("محصول غیرفعال است؛ ابتدا آن را فعال کنید.")
         if str(_value(ctx, "chat_type", "private")).lower() != "private":
             raise PermissionError("ورود کد/آیتم انبار فقط در پیوی مدیریت انجام می‌شود.")
-        import v52_router
-        v52_router.DEFAULT_FSM.set(
-            ctx, "inventory_digital_batch", payload={"product_id": pid},
-            parent_callback=parent_callback, now=_now())
         text = (
             f"محصول: {pid} · {row['title']}\n\n"
-            "هر کد/آیتم را در یک خط جداگانه در پیام بعدی ارسال کنید. "
-            "مقادیر رمزنگاری می‌شوند و در لاگ نمایش داده نمی‌شوند."
+            "روش ورود موجودی را انتخاب کنید؛ مقادیر رمزنگاری می‌شوند و در لاگ "
+            "نمایش داده نمی‌شوند."
         )
+        return text, [
+            [button("📄 افزودن فهرست تک‌خطی (هر خط یک کد)",
+                    f"v52:shop:stock:line:{pid}")],
+            [button("📦 افزودن کارت چندخطی (با جداکننده ---)",
+                    f"v52:shop:stock:block:{pid}")],
+            [button("🧩 ویزارد ساخت آیتم ساختاریافته",
+                    f"v52:shop:stock:wiz:{pid}")],
+            [button("بازگشت به محصول", f"v52:shop:product:{pid}")],
+        ]
+    except (TypeError, ValueError, PermissionError) as exc:
+        return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
+
+
+#: The two explicit split modes, each with a worked Persian example. The operator
+#: picks the shape instead of relying on the auto-detector guessing right.
+_STOCK_MODE_PROMPTS = {
+    "line": (
+        "📄 فهرست تک‌خطی\n\n"
+        "هر خط را یک کد/آیتم جداگانه در پیام بعدی ارسال کنید.\n"
+        "مثال:\n"
+        "CODE-AAAA-1111\n"
+        "CODE-BBBB-2222\n\n"
+        "مقادیر رمزنگاری می‌شوند و در لاگ نمایش داده نمی‌شوند."
+    ),
+    "block": (
+        "📦 کارت چندخطی\n\n"
+        "هر کارت را در چند خط بنویسید و بین کارت‌ها یک خط «---» بگذارید. "
+        "کل هر کارت یک قلم کامل ذخیره می‌شود.\n"
+        "مثال:\n"
+        "نام کاربری: ali@example.com\n"
+        "رمز عبور: p@ssw0rd\n"
+        "کلید: API-ONE\n"
+        "توضیحات: پس از ورود، رمز را تغییر دهید.\n"
+        "---\n"
+        "نام کاربری: sara@example.com\n"
+        "رمز عبور: qwerty\n\n"
+        "مقادیر رمزنگاری می‌شوند و در لاگ نمایش داده نمی‌شوند."
+    ),
+}
+
+
+def begin_stock_import_mode(ctx: Any, product_id: int, mode: str, *,
+                            parent_callback: str | None = "v52:shop"):
+    """Arm the inventory text route with an explicit split mode.
+
+    ``line`` treats every line as its own item and ``block`` keeps each ``---``
+    separated card together, so the operator states the shape rather than leaving it
+    to the auto-detector.
+    """
+    try:
+        _require_root(ctx)
+        pid = _positive(product_id, "product_id")
+        selected = str(mode or "").strip().lower()
+        if selected not in _STOCK_MODE_PROMPTS:
+            raise ValueError("حالت ورود موجودی نامعتبر است.")
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT id,title,delivery_type,is_active FROM digital_products WHERE id=?",
+                (pid,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("محصول موردنظر یافت نشد.")
+        if str(row["delivery_type"]) != "auto_inventory":
+            raise ValueError("افزودن کد/آیتم فقط برای محصول با تحویل خودکار از انبار ممکن است.")
+        if not row["is_active"]:
+            raise ValueError("محصول غیرفعال است؛ ابتدا آن را فعال کنید.")
+        if str(_value(ctx, "chat_type", "private")).lower() != "private":
+            raise PermissionError("ورود کد/آیتم انبار فقط در پیوی مدیریت انجام می‌شود.")
+        import v52_router
+        v52_router.DEFAULT_FSM.set(
+            ctx, "inventory_digital_batch",
+            payload={"product_id": pid, "mode": selected},
+            parent_callback=parent_callback, now=_now())
+        text = f"محصول: {pid} · {row['title']}\n\n" + _STOCK_MODE_PROMPTS[selected]
         return text, [[button("بازگشت به محصول", f"v52:shop:product:{pid}")]]
     except (TypeError, ValueError, PermissionError) as exc:
         return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from html import escape as _html_escape
 from typing import Any, Callable
 
 import config
@@ -425,9 +426,125 @@ def cancel_digital_import(ctx: Any, token: str, *, now: int | None = None,
         return render_error(str(exc), persona="admin", parent_callback=parent_callback)
 
 
+# ---------------------------------------------------------------------------
+# Structured item wizard (S60)
+# ---------------------------------------------------------------------------
+
+STRUCTURED_ITEM_WIZARD_KEY = "inv_structured_item"
+
+#: The labels the assembled card uses. They are the same ones
+#: :func:`inventory_parser.looks_like_credential_card` recognises, so a card built
+#: here and a card pasted by hand are read back identically.
+_CARD_LABELS = (
+    ("username", "نام کاربری"),
+    ("password", "رمز عبور"),
+    ("secret", "کلید"),
+    ("guide", "توضیحات"),
+)
+
+
+def _wz_optional(raw) -> str:
+    """Keep an optional answer as typed and trimmed; an empty answer stays empty."""
+    return str(raw or "").strip()
+
+
+def _structured_card(values: Mapping[str, Any]) -> str:
+    """Assemble one multi-line credential card from the wizard's answers.
+
+    An empty answer is dropped rather than written as an empty label, so a card with
+    only a key is a one-line card and not four lines of noise.
+    """
+    return "\n".join(
+        f"{label}: {str(values.get(key) or '').strip()}"
+        for key, label in _CARD_LABELS
+        if str(values.get(key) or "").strip()
+    )
+
+
+def _preview_structured_item(values) -> str:
+    """The confirmation card: the exact multi-line item that will be stored."""
+    card = _structured_card(values)
+    if not card:
+        return "⚠️ هیچ فیلدی پر نشده است؛ برای ساخت آیتم حداقل یک مقدار لازم است."
+    return ("کارت ساخته‌شده (یک قلم کامل):\n"
+            f"<pre>{_html_escape(card)}</pre>\n\n"
+            "این کارت با تمام خطوطش به‌عنوان یک آیتم ذخیره می‌شود.")
+
+
+def _commit_structured_item(values, actor):
+    product_id = int(values.get("product_id") or 0)
+    card = _structured_card(values)
+    if not card:
+        raise ValueError("هیچ فیلدی پر نشده است؛ برای ساخت آیتم حداقل یک مقدار لازم است.")
+    from goods_service import import_inventory
+    inserted = import_inventory(product_id, [card])
+    if not inserted:
+        raise ValueError("درج آیتم در انبار انجام نشد.")
+    return (f"آیتم ساختاریافته در انبار محصول {product_id} ثبت شد.\n"
+            f"تعداد رکورد رمزنگاری‌شده: {len(inserted)}")
+
+
+def begin_structured_item(context, query, product_id: int, *,
+                          parent_callback: str | None = None):
+    """Open the structured-item wizard on the live conversation store.
+
+    The legacy text draft is cleared on purpose: the wizard supersedes it, and
+    leaving both armed would let the FSM text route swallow the answer the wizard is
+    waiting for.
+    """
+    import ui_v52
+    import v52_router
+    pid = _positive(product_id, "product_id")
+    message = getattr(query, "message", None)
+    chat = getattr(message, "chat", None)
+    state = ui_v52.start_wizard(
+        context.user_data, STRUCTURED_ITEM_WIZARD_KEY,
+        return_callback=parent_callback or f"v52:shop:product:{pid}",
+        seed={"product_id": pid},
+        message_id=getattr(message, "message_id", None),
+        chat_id=getattr(chat, "id", None),
+    )
+    try:
+        v52_router.DEFAULT_FSM.clear(context)
+    except Exception:
+        pass
+    return state
+
+
+def _register_inventory_wizards() -> None:
+    """Publish the structured-item flow; called once at import."""
+    import ui_v52
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        STRUCTURED_ITEM_WIZARD_KEY, "آیتم ساختاریافته انبار",
+        intro=("هر گام را می‌توانید با «⏭ رد کردن» نادیده بگیرید. کارت نهایی با تمام "
+               "خطوطش یک قلم کامل در انبار ذخیره می‌شود."),
+        steps=(
+            ui_v52.WizardStep("username", "نام کاربری / ایمیل",
+                              hint="اختیاری؛ اگر ندارد رد کنید.",
+                              parse=_wz_optional, skippable=True),
+            ui_v52.WizardStep("password", "رمز عبور",
+                              hint="اختیاری؛ اگر ندارد رد کنید.",
+                              parse=_wz_optional, skippable=True),
+            ui_v52.WizardStep("secret", "کلید / لینک / کد",
+                              hint="اختیاری؛ اگر ندارد رد کنید.",
+                              parse=_wz_optional, skippable=True),
+            ui_v52.WizardStep("guide", "توضیحات راه‌اندازی",
+                              hint="اختیاری؛ اگر ندارد رد کنید.",
+                              parse=_wz_optional, skippable=True),
+        ),
+        preview=_preview_structured_item,
+        commit=_commit_structured_item,
+    ))
+
+
+_register_inventory_wizards()
+
+
 __all__ = [
+    "STRUCTURED_ITEM_WIZARD_KEY",
     "begin_digital_import",
     "begin_manual_import",
+    "begin_structured_item",
     "cancel_digital_import",
     "cancel_manual_import",
     "confirm_digital_import",

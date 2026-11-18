@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any, Callable, Mapping
 
@@ -81,6 +82,66 @@ def _format_bytes(value: int | None) -> str:
     if amount >= 1024 ** 2:
         return f"{amount / (1024 ** 2):.1f} MiB"
     return f"{amount} B"
+
+
+#: Iran has not observed daylight saving since 2022, so a fixed offset is exact and
+#: avoids depending on a tzdata database being present in the image.
+TEHRAN = timezone(timedelta(hours=3, minutes=30))
+
+#: Below this, a number is a duration or a placeholder (``0``), not a real timestamp.
+_EPOCH_FLOOR = 1_000_000_000
+
+
+def _format_epoch(value: Any) -> str:
+    """Render a Unix epoch as ``YYYY-MM-DD HH:MM`` in Tehran time, else ``""``.
+
+    A panel that reports a remaining duration rather than a deadline (or a ``0``
+    placeholder) is not a date, so anything below :data:`_EPOCH_FLOOR` is left alone
+    and the caller keeps showing whatever it showed before.
+    """
+    try:
+        epoch = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if epoch < _EPOCH_FLOOR:
+        return ""
+    return datetime.fromtimestamp(epoch, TEHRAN).strftime("%Y-%m-%d %H:%M")
+
+
+def _remaining_days(expires_at: Any, now: int) -> str:
+    """``X روز باقی‌مانده`` (or ``X روز گذشته``) for an epoch expiry, else ``""``."""
+    try:
+        epoch = int(expires_at)
+    except (TypeError, ValueError):
+        return ""
+    if epoch < _EPOCH_FLOOR:
+        return ""
+    days = (epoch - int(now)) // 86400
+    return f"{days} روز باقی‌مانده" if days >= 0 else f"{abs(days)} روز گذشته"
+
+
+def _cached_lines(account: Mapping[str, Any], now: int) -> list[str]:
+    """Body lines rebuilt from the local ``accounts`` row when the panel is silent.
+
+    The row is the last thing the platform itself wrote, so it is a far better answer
+    than a blank error: the operator still sees whether the account is enabled, how
+    much traffic it was sold and when it was due. It is labelled as cached so nobody
+    mistakes it for a fresh panel read.
+    """
+    lines: list[str] = []
+    enabled = account.get("enable")
+    if enabled is not None:
+        lines.append("وضعیت: " + ("فعال" if int(enabled) else "غیرفعال"))
+    total_gb = account.get("total_gb")
+    if total_gb is not None:
+        lines.append(f"حجم خریداری‌شده: {float(total_gb):g} گیگابایت")
+    expiry = account.get("expiry_time")
+    human = _format_epoch(expiry)
+    if human:
+        lines.append(f"انقضا: {human} ({_remaining_days(expiry, now)})")
+    elif expiry is not None:
+        lines.append(f"انقضا: {expiry}")
+    return lines
 
 
 async def build_account_card(
@@ -161,13 +222,32 @@ async def build_account_card(
         enabled_label = "فعال" if enabled is True else "غیرفعال" if enabled is False else "نامعلوم"
         quota_label = "نامحدود" if quota_mode == "unlimited" else _format_bytes(quota_bytes)
         used_label = _format_bytes(used_bytes)
-        expiry_label = "نامحدود" if time_mode == "unlimited" else "در انتظار" if time_mode == "on_hold" else str(expires_at) if expires_at is not None else "نامعلوم"
+        if time_mode == "unlimited":
+            expiry_label = "نامحدود"
+        elif time_mode == "on_hold":
+            expiry_label = "در انتظار"
+        elif expires_at is None:
+            expiry_label = "نامعلوم"
+        else:
+            human = _format_epoch(expires_at)
+            expiry_label = (f"{human} ({_remaining_days(expires_at, observed)})"
+                            if human else str(expires_at))
+        seen_label = _format_epoch(seen_at) or str(seen_at)
         body = (f"وضعیت: {enabled_label}\nمصرف: {used_label} / {quota_label}\n"
-                f"انقضا: {expiry_label}\nمشاهده: {seen_at}")
+                f"انقضا: {expiry_label}\nمشاهده: {seen_label}")
     elif status == "not_found":
         body = "این حساب در پنل متصل پیدا نشد؛ مقادیر مصرف و انقضا نامعلوم‌اند."
     else:
-        body = "دریافت snapshot از پنل ممکن نشد؛ مقادیر مصرف و انقضا نامعلوم‌اند."
+        # The production loader is the local ``accounts`` row, so when the panel is
+        # silent the operator still gets the last figures the platform itself wrote.
+        # A caller that injected its own loader is exercising the unavailable path on
+        # purpose and must keep seeing the plain notice.
+        cached = _cached_lines(account, observed) if account_loader is None else []
+        if cached:
+            body = ("دریافت snapshot تازه از پنل ممکن نشد؛ آخرین مقادیر ثبت‌شده:\n"
+                    + "\n".join(cached))
+        else:
+            body = "دریافت snapshot از پنل ممکن نشد؛ مقادیر مصرف و انقضا نامعلوم‌اند."
 
     rows = [[button("کانفیگ‌ها و پروفایل‌ها", f"v52:sub:{exact_id}")],
             [button("دریافت کانفیگ‌ها", f"v52:cfg:{exact_id}")],

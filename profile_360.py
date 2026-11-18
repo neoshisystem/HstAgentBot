@@ -583,6 +583,16 @@ def _services_page(user_id: int, origin: str, ref: str):
                 f"📦 {code[:28]}",
                 callback_data=account_card_callback(
                     int(account_id), user_id, origin, ref))])
+            # The two direct routes the operator reaches for most often, so a service
+            # does not have to be opened twice to reach its status card or its config.
+            rows.append([
+                InlineKeyboardButton(
+                    "📊 کارت وضعیت سرویس",
+                    callback_data=f"v52:account:{int(account_id)}"),
+                InlineKeyboardButton(
+                    "🔗 کانفیگ و اشتراک",
+                    callback_data=f"v52:sub:{int(account_id)}"),
+            ])
         else:
             rows.append([InlineKeyboardButton(
                 f"📦 {code[:28]}", callback_data=f"user:view_acc:{code}")])

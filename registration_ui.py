@@ -24,6 +24,30 @@ def _value(obj: Any, key: str, default=None):
     return obj.get(key, default) if isinstance(obj, Mapping) else getattr(obj, key, default)
 
 
+def _md(value: Any) -> str:
+    """Escape untrusted text before interpolating it into a Markdown v1 page.
+
+    A Telegram full name or username is arbitrary text and very often contains an
+    underscore. These pages are sent with ``parse_mode=Markdown``, so a single ``_``
+    or ``*`` made Telegram reject the entire message with «Can't parse entities» —
+    the crash operators hit on the registration policy and pending-queue screens.
+    """
+    text = "" if value is None else str(value)
+    for char in ("\\", "_", "*", "[", "`"):
+        text = text.replace(char, "\\" + char)
+    return text
+
+
+def _md_code(value: Any) -> str:
+    """Escape a value rendered *inside* a Markdown v1 code span.
+
+    Only the backtick and the backslash matter there; escaping an underscore would
+    print the backslash literally, because a code span is not parsed for entities.
+    """
+    text = "" if value is None else str(value)
+    return text.replace("\\", "\\\\").replace("`", "\\`")
+
+
 def _display_name(row: Mapping[str, Any]) -> str:
     name = str(_value(row, "full_name") or "").strip()
     username = str(_value(row, "username") or "").strip().lstrip("@")
@@ -70,7 +94,7 @@ def build_registration_rejected_page() -> tuple[str, InlineKeyboardMarkup]:
 
 
 def build_registration_status_page(status: str) -> tuple[str, InlineKeyboardMarkup]:
-    label = _STATUS_LABELS.get(status, status)
+    label = _md(_STATUS_LABELS.get(status, status))
     if status == registration_service.STATUS_APPROVED:
         text = f"✅ **وضعیت عضویت شما: {label}**\n\nدسترسی شما فعال است."
         rows = [[InlineKeyboardButton("🏠 منوی اصلی کاربری", callback_data="user:main")]]
@@ -88,10 +112,10 @@ def build_referral_page(
     """The invite page: the actor's own code, deep link, totals and reward rules."""
     lines = [
         "🎁 **دعوت از دوستان (کد معرف)**\n",
-        f"• کد معرف اختصاصی شما: `{code}`",
+        f"• کد معرف اختصاصی شما: `{_md_code(code)}`",
     ]
     if link:
-        lines.append(f"• لینک دعوت مستقیم:\n{link}")
+        lines.append(f"• لینک دعوت مستقیم:\n{_md(link)}")
     lines += [
         "",
         f"• تعداد دعوت‌شدگان: **{int(stats.get('invited') or 0)}**",
@@ -129,7 +153,7 @@ def build_referral_list_page(referrals: Sequence[Mapping[str, Any]]) -> tuple[st
             status = _STATUS_LABELS.get(
                 str(_value(item, "registration_status") or ""), "نامشخص")
             joined = str(_value(item, "created_at") or "")[:16]
-            lines.append(f"• {_display_name(item)} — {status} | `{joined}`")
+            lines.append(f"• {_md(_display_name(item))} — {status} | `{_md_code(joined)}`")
     return "\n".join(lines), InlineKeyboardMarkup([
         [InlineKeyboardButton("↩️ بازگشت به صفحه دعوت", callback_data="user:referral")],
         [InlineKeyboardButton("🏠 منوی اصلی کاربری", callback_data="user:main")],
@@ -142,11 +166,11 @@ def build_approval_card(user: Mapping[str, Any]) -> tuple[str, InlineKeyboardMar
     referrer = str(_value(user, "referred_by_code") or "").strip()
     text = (
         "🆕 **درخواست عضویت جدید**\n\n"
-        f"• نام: {_display_name(user)}\n"
+        f"• نام: {_md(_display_name(user))}\n"
         f"• شناسه عددی: `{user_id}`\n"
-        f"• بات ورودی: `{_value(user, 'origin_bot_id') or '—'}`\n"
-        f"• کد معرف: `{referrer or 'ندارد'}`\n"
-        f"• زمان: `{str(_value(user, 'created_at') or '')[:19]}`"
+        f"• بات ورودی: `{_md_code(_value(user, 'origin_bot_id') or '—')}`\n"
+        f"• کد معرف: `{_md_code(referrer or 'ندارد')}`\n"
+        f"• زمان: `{_md_code(str(_value(user, 'created_at') or '')[:19])}`"
     )
     rows = [
         [InlineKeyboardButton("✅ تایید عضویت", callback_data=f"admin:reg_approve:{user_id}"),
@@ -183,7 +207,7 @@ def build_pending_registrations_page(
             user_id = int(_value(item, "telegram_id") or 0)
             status = _STATUS_LABELS.get(
                 str(_value(item, "registration_status") or ""), "نامشخص")
-            lines.append(f"• `{user_id}` — {_display_name(item)} | {status}")
+            lines.append(f"• `{user_id}` — {_md(_display_name(item))} | {status}")
             rows.append([
                 InlineKeyboardButton(f"✅ تایید {user_id}", callback_data=f"{prefix}:reg_approve:{user_id}"),
                 InlineKeyboardButton(f"❌ رد {user_id}", callback_data=f"{prefix}:reg_reject:{user_id}"),

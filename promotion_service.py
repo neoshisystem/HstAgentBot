@@ -81,14 +81,20 @@ def hold_coupon(
         if order is None or str(order[1]) not in {"awaiting_payment", "pending_review", "accepted"}:
             raise PromotionError("coupon requires an open payment order")
         coupon = conn.execute(
-            "SELECT issuer_key,discount_toman,budget_toman,used_toman,max_uses,expires_at,is_active "
-            "FROM coupons WHERE code=?",
+            "SELECT issuer_key,discount_toman,budget_toman,used_toman,max_uses,expires_at,is_active,"
+            f"{_percent_select(conn)} FROM coupons WHERE code=?",
             (code,),
         ).fetchone()
         if coupon is None or not bool(coupon[6]) or int(coupon[5]) <= now:
             raise PromotionError("coupon is missing, inactive or expired")
         issuer_key = str(coupon[0])
-        value = min(int(coupon[1]), exact_price)
+        cap = int(coupon[1])
+        percent = int(coupon[7])
+        # A percentage coupon discounts ``percent`` of the price but never more than
+        # its cap (``discount_toman``); a fixed coupon's ``discount_toman`` *is* the
+        # discount, which the same ``min`` then clamps to the price.
+        computed = max(1, exact_price * percent // 100) if percent else cap
+        value = min(computed, cap, exact_price)
         budget, used, max_uses = int(coupon[2]), int(coupon[3]), int(coupon[4])
         existing = conn.execute(
             "SELECT code,amount_toman,state FROM coupon_uses WHERE order_id=?",
@@ -333,6 +339,8 @@ MAX_COUPON_DISCOUNT_TOMAN = 10 ** 12
 MAX_COUPON_BUDGET_TOMAN = 10 ** 15
 MAX_COUPON_USES = 1_000_000
 MAX_COUPON_DAYS = 3650
+#: A percentage coupon's rate. ``0`` means "fixed amount", so the range is 1..100.
+MAX_COUPON_PERCENT = 100
 
 
 def _clean_coupon_code(value: Any) -> str:
@@ -356,11 +364,35 @@ def _clean_amount(value: Any, field_fa: str, maximum: int, *, minimum: int = 0) 
     return number
 
 
+def _clean_percent(value: Any) -> int:
+    """Validate a coupon rate: ``0`` (a fixed-amount coupon) or 1..100.
+
+    ``0`` is accepted so a fixed coupon travels the same path; a rate above 100
+    would discount more than the whole price, so it is refused rather than clamped.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0
+    return _clean_amount(value, "درصد تخفیف", MAX_COUPON_PERCENT, minimum=0)
+
+
+def _percent_select(conn: sqlite3.Connection, qualifier: str = "") -> str:
+    """``discount_percent`` when the column exists, otherwise a literal ``0``.
+
+    The column is added by ``database.ensure_plan_catalog_schema`` rather than by a
+    migration (the count is frozen at 18), so a database built from the migrations
+    alone must still answer these reads instead of raising ``no such column``.
+    """
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(coupons)")}
+    if "discount_percent" in columns:
+        return f"{qualifier}discount_percent"
+    return "0 AS discount_percent"
+
+
 def coupon_row(conn: sqlite3.Connection, code: Any) -> dict | None:
     """One coupon row, or ``None``."""
     row = conn.execute(
         "SELECT code,issuer_key,discount_toman,budget_toman,used_toman,max_uses,"
-        "expires_at,is_active FROM coupons WHERE code=?",
+        f"expires_at,is_active,{_percent_select(conn)} FROM coupons WHERE code=?",
         (_clean_coupon_code(code),),
     ).fetchone()
     if row is None:
@@ -370,6 +402,7 @@ def coupon_row(conn: sqlite3.Connection, code: Any) -> dict | None:
         "discount_toman": int(row[2]), "budget_toman": int(row[3]),
         "used_toman": int(row[4]), "max_uses": int(row[5]),
         "expires_at": int(row[6]), "is_active": bool(row[7]),
+        "discount_percent": int(row[8]),
     }
 
 
@@ -378,6 +411,7 @@ def list_coupons(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT c.code,c.issuer_key,c.discount_toman,c.budget_toman,c.used_toman,"
         "c.max_uses,c.expires_at,c.is_active,"
+        f"{_percent_select(conn, 'c.')},"
         "(SELECT COUNT(*) FROM coupon_uses u WHERE u.code=c.code AND u.state='held') AS held_uses,"
         "(SELECT COUNT(*) FROM coupon_uses u WHERE u.code=c.code AND u.state='used') AS used_uses "
         "FROM coupons c ORDER BY c.is_active DESC,c.code"
@@ -388,7 +422,8 @@ def list_coupons(conn: sqlite3.Connection) -> list[dict]:
             "discount_toman": int(row[2]), "budget_toman": int(row[3]),
             "used_toman": int(row[4]), "max_uses": int(row[5]),
             "expires_at": int(row[6]), "is_active": bool(row[7]),
-            "held_uses": int(row[8]), "used_uses": int(row[9]),
+            "discount_percent": int(row[8]),
+            "held_uses": int(row[9]), "used_uses": int(row[10]),
         }
         for row in rows
     ]
@@ -397,19 +432,45 @@ def list_coupons(conn: sqlite3.Connection) -> list[dict]:
 def create_coupon(
     conn: sqlite3.Connection, *, code: Any, discount_toman: Any, budget_toman: Any,
     max_uses: Any, expires_at: Any, issuer_key: str = "root",
+    discount_percent: Any = 0,
 ) -> dict:
-    """Create one issuer-funded coupon; the code is unique and upper-case."""
+    """Create one issuer-funded coupon; the code is unique and upper-case.
+
+    ``discount_percent`` of ``0`` makes a fixed-amount coupon, and ``discount_toman``
+    is then the discount itself. A rate of 1..100 makes a percentage coupon, and
+    ``discount_toman`` becomes its *cap*: the discount is the percentage of the price,
+    never more than the cap. Keeping the cap in ``discount_toman`` is what lets the
+    column stay ``CHECK(discount_toman>0)`` without rebuilding the table or adding a
+    19th migration.
+    """
     selected = _clean_coupon_code(code)
     if coupon_row(conn, selected) is not None:
         raise PromotionError(f"کوپن «{selected}» از قبل وجود دارد.")
-    discount = _clean_amount(discount_toman, "مبلغ تخفیف", MAX_COUPON_DISCOUNT_TOMAN, minimum=1)
-    budget = _clean_amount(budget_toman, "سقف بودجه", MAX_COUPON_BUDGET_TOMAN, minimum=discount)
+    percent = _clean_percent(discount_percent)
+    if percent and discount_toman in (None, ""):
+        cap = MAX_COUPON_DISCOUNT_TOMAN
+    else:
+        cap = _clean_amount(discount_toman, "سقف تخفیف" if percent else "مبلغ تخفیف",
+                            MAX_COUPON_DISCOUNT_TOMAN, minimum=1)
+    budget = _clean_amount(budget_toman, "سقف بودجه", MAX_COUPON_BUDGET_TOMAN,
+                           minimum=1 if percent else cap)
     uses = _clean_amount(max_uses, "حداکثر تعداد استفاده", MAX_COUPON_USES, minimum=1)
     expires = _clean_amount(expires_at, "زمان انقضا", 2 ** 53)
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(coupons)")}
+    if "discount_percent" not in columns:
+        if percent:
+            raise PromotionError(
+                "این پایگاه‌داده ستون درصد تخفیف را ندارد؛ ابتدا طرح کاتالوگ را به‌روزرسانی کنید.")
+        conn.execute(
+            "INSERT INTO coupons(code,issuer_key,discount_toman,budget_toman,used_toman,"
+            "max_uses,expires_at,is_active) VALUES(?,?,?,?,0,?,?,1)",
+            (selected, str(issuer_key or "root"), cap, budget, uses, expires),
+        )
+        return coupon_row(conn, selected)
     conn.execute(
         "INSERT INTO coupons(code,issuer_key,discount_toman,budget_toman,used_toman,"
-        "max_uses,expires_at,is_active) VALUES(?,?,?,?,0,?,?,1)",
-        (selected, str(issuer_key or "root"), discount, budget, uses, expires),
+        "max_uses,expires_at,is_active,discount_percent) VALUES(?,?,?,?,0,?,?,1,?)",
+        (selected, str(issuer_key or "root"), cap, budget, uses, expires, percent),
     )
     return coupon_row(conn, selected)
 
@@ -425,6 +486,13 @@ def update_coupon(conn: sqlite3.Connection, code: Any, **fields) -> dict:
         assignments.append("discount_toman=?")
         params.append(_clean_amount(fields["discount_toman"], "مبلغ تخفیف",
                                     MAX_COUPON_DISCOUNT_TOMAN, minimum=1))
+    if fields.get("discount_percent") is not None:
+        if "discount_percent" not in {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(coupons)")}:
+            raise PromotionError(
+                "این پایگاه‌داده ستون درصد تخفیف را ندارد؛ ابتدا طرح کاتالوگ را به‌روزرسانی کنید.")
+        assignments.append("discount_percent=?")
+        params.append(_clean_percent(fields["discount_percent"]))
     if fields.get("budget_toman") is not None:
         assignments.append("budget_toman=?")
         params.append(_clean_amount(fields["budget_toman"], "سقف بودجه",
@@ -439,8 +507,8 @@ def update_coupon(conn: sqlite3.Connection, code: Any, **fields) -> dict:
     if fields.get("is_active") is not None:
         assignments.append("is_active=?")
         params.append(1 if fields["is_active"] else 0)
-    unknown = sorted(set(fields) - {"discount_toman", "budget_toman", "max_uses",
-                                    "expires_at", "is_active"})
+    unknown = sorted(set(fields) - {"discount_toman", "discount_percent", "budget_toman",
+                                    "max_uses", "expires_at", "is_active"})
     if unknown:
         raise PromotionError("فیلد ناشناخته: " + ", ".join(unknown))
     if not assignments:

@@ -1,9 +1,12 @@
 """Scoped bank-card, plan and settlement administration pages for v5.2."""
 from __future__ import annotations
 
+import html
+import re
 from collections.abc import Mapping
 
 import config
+import ui_v52
 from ui_v52 import button, render_error, render_page
 
 
@@ -74,6 +77,7 @@ def edit_bank_card(
                 "فهرست و پیش‌نمایش مدیریتی فقط چهار رقم پایانی را نشان می‌دهد.",
                 persona="admin" if _root(ctx) else "rep", page_kind="form",
                 parent_callback=parent_callback,
+                rows=[[button("➕ افزودن کارت بانکی", "v52:card:new")]],
             )
         if not isinstance(card, Mapping):
             raise ValueError("bank card snapshot is required")
@@ -390,6 +394,52 @@ def tariff_hub(ctx, *, parent_callback: str | None = None):
         return render_error(str(exc), persona="admin", parent_callback=parent_callback)
 
 
+def plan_control_rows(ctx, plan_code) -> list[list]:
+    """The unified tariff controls for one plan: kind, audience, categories, panels.
+
+    ``plan_detail`` renders these as its own card, and the admin desk's plan card
+    appends them, so an operator who arrived from ``admin:plans`` sees exactly the
+    controls an operator who arrived from ``v52:plans`` sees. One implementation, so
+    the two surfaces cannot drift apart again.
+    """
+    _require_root(ctx)
+    catalog = _catalog()
+    with _db() as conn:
+        plan = catalog.require_plan(conn, plan_code)
+        code = str(plan["plan_code"])
+        linked = {str(link["category_key"])
+                  for link in catalog.plan_category_links(conn, code)}
+        categories = catalog.list_plan_categories(conn)
+        bindings = catalog.plan_panel_bindings(conn, code)
+        audience = catalog.plan_audience(conn, code)
+    kind = str(plan.get("plan_kind") or "fixed")
+    rows: list[list] = [[
+        button(_checkbox_label(catalog.PLAN_KIND_FA[option], option == kind),
+               _checkbox_callback("v52:pk:", code, option))
+        for option in catalog.PLAN_KINDS
+    ]]
+    rows.append([
+        button(_checkbox_label("👤 کاربران نهایی", audience["for_end_users"]),
+               _checkbox_callback("v52:pa:", code, "end_user")),
+        button(_checkbox_label("🧑‍💼 نمایندگان", audience["for_reps"]),
+               _checkbox_callback("v52:pa:", code, "rep")),
+    ])
+    for category in categories:
+        rows.append([button(
+            _checkbox_label(f"{category['emoji']} {category['title_fa']}",
+                            str(category["category_key"]) in linked),
+            _checkbox_callback("v52:pc:", code, str(category["category_key"])),
+        )])
+    rows.append([button("📂 مدیریت دسته‌بندی‌های تعرفه", "v52:plancats")])
+    for binding in bindings:
+        rows.append([button(
+            _checkbox_label(f"🖥 {binding['name']}", bool(int(binding["allowed"]))),
+            _checkbox_callback("v52:pp:", code, str(int(binding["panel_id"]))),
+        )])
+    rows.append([button("🖥 مدیریت پنل‌ها", "v52:panels")])
+    return rows
+
+
 def plan_detail(ctx, plan_code, *, parent_callback: str | None = None):
     """The plan card: prices, tariff kind, audience, categories and panels.
 
@@ -404,8 +454,6 @@ def plan_detail(ctx, plan_code, *, parent_callback: str | None = None):
             plan = catalog.require_plan(conn, plan_code)
             code = str(plan["plan_code"])
             links = catalog.plan_category_links(conn, code)
-            linked = {str(link["category_key"]) for link in links}
-            categories = catalog.list_plan_categories(conn)
             bindings = catalog.plan_panel_bindings(conn, code)
             audience = catalog.plan_audience(conn, code)
         kind = str(plan.get("plan_kind") or "fixed")
@@ -441,30 +489,7 @@ def plan_detail(ctx, plan_code, *, parent_callback: str | None = None):
                     else "⏸ غیرفعال‌سازی موقت تعرفه",
                     f"admin:set_plan_active:{code}:{0 if int(plan.get('is_active', 1) or 0) else 1}")],
         ]
-        rows.append([
-            button(_checkbox_label(catalog.PLAN_KIND_FA[option], option == kind),
-                   _checkbox_callback("v52:pk:", code, option))
-            for option in catalog.PLAN_KINDS
-        ])
-        rows.append([
-            button(_checkbox_label("👤 کاربران نهایی", audience["for_end_users"]),
-                   _checkbox_callback("v52:pa:", code, "end_user")),
-            button(_checkbox_label("🧑‍💼 نمایندگان", audience["for_reps"]),
-                   _checkbox_callback("v52:pa:", code, "rep")),
-        ])
-        for category in categories:
-            rows.append([button(
-                _checkbox_label(f"{category['emoji']} {category['title_fa']}",
-                                str(category["category_key"]) in linked),
-                _checkbox_callback("v52:pc:", code, str(category["category_key"])),
-            )])
-        rows.append([button("📂 مدیریت دسته‌بندی‌های تعرفه", "v52:plancats")])
-        for binding in bindings:
-            rows.append([button(
-                _checkbox_label(f"🖥 {binding['name']}", bool(int(binding["allowed"]))),
-                _checkbox_callback("v52:pp:", code, str(int(binding["panel_id"]))),
-            )])
-        rows.append([button("🖥 مدیریت پنل‌ها", "v52:panels")])
+        rows.extend(plan_control_rows(ctx, code))
         rows.append([button("🗑 حذف این تعرفه", f"admin:confirm_del_plan:{code}")])
         return render_page(
             f"🏷 کارت تعرفهٔ {plan['name']}", "\n".join(lines),
@@ -734,8 +759,11 @@ def coupons_page(ctx, *, parent_callback: str | None = None):
         for coupon in coupons:
             state = "🟢" if coupon["is_active"] else "🔴"
             expired = "⌛️ منقضی" if int(coupon["expires_at"]) <= now else ""
+            amount = (f"{coupon['discount_percent']}٪"
+                      if coupon.get("discount_percent")
+                      else f"{_money(coupon['discount_toman'])} تومان")
             lines.append(
-                f"{state} {coupon['code']} — تخفیف {_money(coupon['discount_toman'])} تومان | "
+                f"{state} {coupon['code']} — تخفیف {amount} | "
                 f"بودجه {_money(coupon['budget_toman'])} | "
                 f"استفاده {coupon['used_uses']}/{coupon['max_uses']} "
                 f"(در انتظار: {coupon['held_uses']}) {expired}"
@@ -781,21 +809,28 @@ def apply_coupon_new(ctx, value, *, parent_callback: str | None = None):
         if len(parts) < 5:
             raise ValueError(COUPON_NEW_FORMAT)
         code, discount, budget, uses, days = parts[:5]
+        raw_discount = str(discount).strip()
+        percent = raw_discount.endswith("%") or raw_discount.endswith("٪")
+        discount_value = _optional_int(raw_discount.rstrip("%٪").strip(), "مقدار تخفیف")
         promotions = _promotions()
         with _db() as conn:
             created = promotions.create_coupon(
                 conn, code=code,
-                discount_toman=_optional_int(discount, "مبلغ تخفیف"),
+                discount_toman=None if percent else discount_value,
                 budget_toman=_optional_int(budget, "سقف بودجه"),
                 max_uses=_optional_int(uses, "حداکثر تعداد استفاده"),
                 expires_at=int(time.time()) + max(_optional_int(days, "اعتبار") or 0, 1) * 86400,
+                discount_percent=discount_value if percent else 0,
             )
             conn.commit()
+        amount_line = (f"درصد تخفیف: {created['discount_percent']}٪\n"
+                       if created["discount_percent"]
+                       else f"مبلغ تخفیف: {_money(created['discount_toman'])} تومان\n")
         return render_page(
             "✅ کوپن ثبت شد",
             f"کد کوپن: {created['code']}\n"
-            f"مبلغ تخفیف: {_money(created['discount_toman'])} تومان\n"
-            f"سقف بودجه: {_money(created['budget_toman'])} تومان\n"
+            + amount_line
+            + f"سقف بودجه: {_money(created['budget_toman'])} تومان\n"
             f"حداکثر استفاده: {created['max_uses']}\n"
             f"وضعیت: 🟢 فعال",
             persona="admin", page_kind="result",
@@ -823,8 +858,11 @@ def begin_coupon_edit(ctx, code, *, parent_callback: str | None = None):
             parent_callback=parent_callback or "v52:coupons", now=int(time.time()))
         body = (
             f"کد کوپن: {current['code']}\n"
-            f"مبلغ تخفیف فعلی: {_money(current['discount_toman'])} تومان\n"
-            f"سقف بودجه فعلی: {_money(current['budget_toman'])} تومان\n"
+            f"تخفیف فعلی: "
+            + (f"{current['discount_percent']}٪\n"
+               if current.get("discount_percent")
+               else f"{_money(current['discount_toman'])} تومان\n")
+            + f"سقف بودجه فعلی: {_money(current['budget_toman'])} تومان\n"
             f"حداکثر استفاده: {current['max_uses']}\n"
             f"مبلغ استفاده‌شده: {_money(current['used_toman'])} تومان\n"
             f"وضعیت: {'🟢 فعال' if current['is_active'] else '🔴 غیرفعال'}\n\n"
@@ -1078,7 +1116,334 @@ def apply_refund_destination(ctx, payload, value, *, parent_callback: str | None
         return render_error(str(exc), persona="admin", parent_callback=parent_callback)
 
 
+# --------------------------------------------------------------------------- #
+# S59 — the three "add" forms as step-by-step wizards
+#
+# «افزودن دسته‌بندی», «افزودن کوپن» and the root bank card were one raw
+# pipe-separated line each: one misplaced «|» silently reordered every later field
+# and there was no way to see what was about to be written. They now run as
+# ``ui_v52`` wizards that end on a preview card. ``apply_plan_category_new`` and
+# ``apply_coupon_new`` still parse the old line and each flow carries a ``legacy``
+# parser, so an operator who memorised the format keeps it and the S57 tests keep
+# passing.
+# --------------------------------------------------------------------------- #
+
+PLAN_CATEGORY_WIZARD_KEY = "finance_new_plan_category"
+COUPON_WIZARD_KEY = "finance_new_coupon"
+BANK_CARD_WIZARD_KEY = "finance_new_bank_card"
+
+#: The emoji picker offered for a new tariff category.
+CATEGORY_EMOJI_CHOICES = (
+    ("🎮", "🎮"), ("💎", "💎"), ("🚀", "🚀"), ("🎬", "🎬"),
+    ("📶", "📶"), ("🛡", "🛡"), ("🌐", "🌐"), ("⏭ بدون نماد", ""),
+)
+
+#: The banks offered for a new card; the operator may still type any other name.
+BANK_CHOICES = (
+    ("🏦 سامان", "بانک سامان"), ("🏦 ملی", "بانک ملی"), ("🏦 ملت", "بانک ملت"),
+    ("🏦 پاسارگاد", "بانک پاسارگاد"), ("🏦 صادرات", "بانک صادرات"),
+    ("🏦 تجارت", "بانک تجارت"),
+)
+
+#: Step 1 of the coupon wizard: a fixed toman amount, or a percentage rate.
+COUPON_TYPE_CHOICES = (
+    ("💵 مبلغ ثابت (تومان)", "fixed"),
+    ("📊 درصدی (٪)", "percent"),
+)
+
+#: The same shapes ``pricing_service`` and ``promotion_service`` validate, so the
+#: wizard refuses a bad key before the operator reaches the confirmation card.
+_CATEGORY_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,29}$")
+_COUPON_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,23}$")
+
+
+def _wz_escape(value) -> str:
+    return html.escape(str(value if value is not None else ""), quote=False)
+
+
+def _wz_required_text(raw, label: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError(f"{label} نمی‌تواند خالی باشد.")
+    return text
+
+
+def _wz_category_key(raw) -> str:
+    key = str(raw or "").strip().lower()
+    if not _CATEGORY_KEY_RE.fullmatch(key):
+        raise ValueError(
+            "کد دسته‌بندی باید با یک حرف کوچک لاتین شروع شود و فقط حرف کوچک، "
+            "رقم و زیرخط بپذیرد (مثال: gaming)."
+        )
+    return key
+
+
+def _wz_coupon_code(raw) -> str:
+    code = str(raw or "").strip().upper()
+    if not _COUPON_CODE_RE.fullmatch(code):
+        raise ValueError(
+            "کد کوپن باید ۳ تا ۲۴ کاراکتر و شامل حرف لاتین، رقم، نقطه، "
+            "خط تیره یا زیرخط باشد."
+        )
+    return code
+
+
+def _wz_toman(raw, label: str, *, minimum: int = 1) -> int:
+    """Parse a toman amount, tolerating the separators an operator actually types."""
+    text = str(raw or "").strip()
+    for separator in (",", "،", " ", "\u200c"):
+        text = text.replace(separator, "")
+    text = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
+    if not text:
+        raise ValueError(f"{label} نمی‌تواند خالی باشد.")
+    try:
+        value = int(text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} باید یک عدد صحیح به تومان باشد.") from exc
+    if value < minimum:
+        raise ValueError(f"{label} باید حداقل {minimum} باشد.")
+    return value
+
+
+def _wz_coupon_value(raw) -> int:
+    """Parse the coupon's discount value from step 2.
+
+    The *kind* comes from step 1, so a trailing ``%`` is accepted and ignored rather
+    than treated as a contradiction: an operator who picked «درصدی» and then typed
+    ``20%`` means 20, and the commit validates the 1..100 range for that kind.
+    """
+    text = str(raw or "").strip()
+    if text.endswith("%") or text.endswith("٪"):
+        text = text[:-1].strip()
+    return _wz_toman(text, "مقدار تخفیف")
+
+
+def _wz_card_number(raw) -> str:
+    """Keep the digits only; a spaced or dashed card number is accepted."""
+    digits = "".join(ch for ch in str(raw or "").translate(
+        str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")) if ch.isdigit())
+    if not 12 <= len(digits) <= 19:
+        raise ValueError("شماره کارت باید بین ۱۲ تا ۱۹ رقم باشد.")
+    return digits
+
+
+def _generate_category_key(values=None) -> str:
+    """The engine calls ``generate(values)``, so the collected values are accepted."""
+    import uuid
+    return "cat_" + uuid.uuid4().hex[:6]
+
+
+def _generate_coupon_code(values=None) -> str:
+    """The engine calls ``generate(values)``, so the collected values are accepted."""
+    import uuid
+    return "OFF" + uuid.uuid4().hex[:8].upper()
+
+
+def _commit_new_plan_category(values, actor):
+    catalog = _catalog()
+    with _db() as conn:
+        created = catalog.create_plan_category(
+            conn, category_key=str(values["category_key"]),
+            title_fa=str(values["title_fa"]), emoji=str(values.get("emoji") or ""))
+        conn.commit()
+    return (f"دسته‌بندی {created['emoji']} {created['title_fa']} ثبت شد.\n"
+            f"کد دسته‌بندی: {created['category_key']}")
+
+
+def _legacy_new_plan_category(raw):
+    """Accept the pre-wizard ``key | title | emoji`` line at step 1."""
+    parts = _split(raw)
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    try:
+        return {"category_key": _wz_category_key(parts[0]), "title_fa": parts[1],
+                "emoji": parts[2] if len(parts) > 2 else ""}
+    except (TypeError, ValueError):
+        return None
+
+
+def _preview_new_coupon(values) -> str:
+    """The confirmation card for a new coupon, in the kind the operator chose."""
+    percent = str(values.get("discount_kind")) == "percent"
+    value = int(values.get("discount_value") or 0)
+    lines = [
+        f"• نوع تخفیف: <b>{'📊 درصدی' if percent else '💵 مبلغ ثابت'}</b>",
+        f"• مقدار تخفیف: <b>{value}{'٪' if percent else ' تومان'}</b>",
+        f"• سقف بودجه: <b>{_money(values.get('budget_toman'))} تومان</b>",
+        f"• کد کوپن: <code>{_wz_escape(values.get('code'))}</code>",
+        f"• حداکثر استفاده: <b>{int(values.get('max_uses') or 0)}</b> بار",
+        f"• اعتبار: <b>{int(values.get('days') or 0)} روز</b>",
+    ]
+    if percent:
+        if not 1 <= value <= 100:
+            lines.append("⚠️ درصد تخفیف باید بین ۱ و ۱۰۰ باشد و ثبت نمی‌شود.")
+    elif int(values.get("budget_toman") or 0) < value:
+        lines.append("⚠️ سقف بودجه کمتر از مبلغ تخفیف است و ثبت نمی‌شود.")
+    return "\n".join(lines)
+
+
+def _commit_new_coupon(values, actor):
+    import time
+    promotions = _promotions()
+    kind = str(values.get("discount_kind") or "fixed")
+    value = int(values["discount_value"])
+    if kind == "percent" and not 1 <= value <= 100:
+        raise ValueError("درصد تخفیف باید بین ۱ و ۱۰۰ باشد.")
+    days = int(values.get("days") or 0)
+    with _db() as conn:
+        created = promotions.create_coupon(
+            conn, code=str(values["code"]),
+            # A percentage coupon has no fixed amount, so its cap stays open and the
+            # budget is the only bound; a fixed coupon's discount is the amount.
+            discount_toman=None if kind == "percent" else value,
+            budget_toman=int(values["budget_toman"]),
+            max_uses=int(values["max_uses"]),
+            expires_at=int(time.time()) + max(days, 1) * 86400,
+            discount_percent=value if kind == "percent" else 0)
+        conn.commit()
+    amount_line = (f"درصد تخفیف: {created['discount_percent']}٪\n"
+                   if created["discount_percent"]
+                   else f"مبلغ تخفیف: {_money(created['discount_toman'])} تومان\n")
+    return (f"کوپن {created['code']} ثبت شد.\n"
+            + amount_line
+            + f"سقف بودجه: {_money(created['budget_toman'])} تومان\n"
+            f"حداکثر استفاده: {created['max_uses']}\n"
+            f"اعتبار: {days} روز\nوضعیت: 🟢 فعال")
+
+
+def _legacy_new_coupon(raw):
+    """Accept the pre-wizard ``code | discount | budget | uses | days`` line.
+
+    A ``%`` on the discount field makes it a percentage coupon, so the one-line form
+    keeps working for both kinds.
+    """
+    parts = _split(raw)
+    if len(parts) < 5 or not parts[0]:
+        return None
+    try:
+        raw_discount = str(parts[1]).strip()
+        percent = raw_discount.endswith("%") or raw_discount.endswith("٪")
+        return {"code": _wz_coupon_code(parts[0]),
+                "discount_kind": "percent" if percent else "fixed",
+                "discount_value": _wz_coupon_value(raw_discount),
+                "budget_toman": _wz_toman(parts[2], "سقف بودجه"),
+                "max_uses": _wz_toman(parts[3], "حداکثر تعداد استفاده"),
+                "days": _wz_toman(parts[4], "اعتبار")}
+    except (TypeError, ValueError):
+        return None
+
+
+def _commit_new_bank_card(values, actor):
+    import database
+    number = str(values["card_number"])
+    database.update_card_info(number, str(values["card_holder"]),
+                              str(values["bank_name"]))
+    return (f"کارت بانکی ثبت شد.\n"
+            f"شماره: {_mask_card(number)}\n"
+            f"دارنده: {values['card_holder']}\n"
+            f"بانک: {values['bank_name']}")
+
+
+def _register_finance_wizards() -> None:
+    """Publish the three add-flows; called once at import."""
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        PLAN_CATEGORY_WIZARD_KEY, "دسته‌بندی تعرفهٔ جدید",
+        intro="کد دسته‌بندی روی کارت تعرفه‌ها نمایش داده نمی‌شود و فقط کلید داخلی است.",
+        steps=(
+            ui_v52.WizardStep("emoji", "نماد دسته‌بندی",
+                              hint="یک نماد انتخاب کنید یا «بدون نماد» را بزنید.",
+                              choices=CATEGORY_EMOJI_CHOICES),
+            ui_v52.WizardStep("title_fa", "عنوان فارسی دسته‌بندی",
+                              parse=lambda raw: _wz_required_text(raw, "عنوان دسته‌بندی")),
+            ui_v52.WizardStep("category_key", "کد دسته‌بندی",
+                              hint="کد لاتین یکتا؛ می‌توانید خودکار بسازید.",
+                              parse=_wz_category_key, generate=_generate_category_key),
+        ),
+        preview=lambda v: "\n".join([
+            f"• نماد: <b>{_wz_escape(v.get('emoji') or '—')}</b>",
+            f"• عنوان: <b>{_wz_escape(v.get('title_fa'))}</b>",
+            f"• کد: <code>{_wz_escape(v.get('category_key'))}</code>",
+        ]),
+        commit=_commit_new_plan_category,
+        legacy=_legacy_new_plan_category,
+    ))
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        COUPON_WIZARD_KEY, "کوپن جدید",
+        intro="کوپن از بودجهٔ فروشنده پرداخت می‌شود و پس از پایان بودجه خودکار غیرفعال است.",
+        steps=(
+            ui_v52.WizardStep("discount_kind", "نوع تخفیف",
+                              hint="تخفیف می‌تواند مبلغ ثابت تومانی یا درصدی باشد.",
+                              choices=COUPON_TYPE_CHOICES),
+            ui_v52.WizardStep("discount_value", "مقدار تخفیف",
+                              hint="برای «مبلغ ثابت» عدد به تومان، و برای «درصدی» عددی بین ۱ تا ۱۰۰.",
+                              parse=_wz_coupon_value),
+            ui_v52.WizardStep("budget_toman", "سقف بودجهٔ کوپن (تومان)",
+                              hint="نمی‌تواند کمتر از مبلغ تخفیف باشد.",
+                              parse=lambda raw: _wz_toman(raw, "سقف بودجه")),
+            ui_v52.WizardStep("code", "کد کوپن",
+                              hint="کد لاتین یکتا؛ می‌توانید خودکار بسازید.",
+                              parse=_wz_coupon_code, generate=_generate_coupon_code),
+            ui_v52.WizardStep("max_uses", "حداکثر تعداد استفاده",
+                              parse=lambda raw: _wz_toman(raw, "حداکثر تعداد استفاده")),
+            ui_v52.WizardStep("days", "اعتبار کوپن (روز)",
+                              parse=lambda raw: _wz_toman(raw, "اعتبار")),
+        ),
+        preview=_preview_new_coupon,
+        commit=_commit_new_coupon,
+        legacy=_legacy_new_coupon,
+    ))
+
+    ui_v52.register_flow(ui_v52.WizardFlow(
+        BANK_CARD_WIZARD_KEY, "کارت بانکی مقصد",
+        intro="این کارت مقصد پرداخت کارت‌به‌کارت می‌شود؛ شمارهٔ کامل هرگز در فهرست‌ها نمایش داده نمی‌شود.",
+        steps=(
+            ui_v52.WizardStep("card_number", "شمارهٔ کارت",
+                              hint="۱۲ تا ۱۹ رقم؛ فاصله و خط تیره پذیرفته می‌شود.",
+                              parse=_wz_card_number),
+            ui_v52.WizardStep("card_holder", "نام دارندهٔ کارت",
+                              parse=lambda raw: _wz_required_text(raw, "نام دارندهٔ کارت")),
+            ui_v52.WizardStep("bank_name", "بانک",
+                              choices=BANK_CHOICES,
+                              parse=lambda raw: _wz_required_text(raw, "نام بانک")),
+        ),
+        preview=lambda v: "\n".join([
+            f"• شمارهٔ کارت: <b>{_wz_escape(_mask_card(v.get('card_number')))}</b>",
+            f"• دارنده: <b>{_wz_escape(v.get('card_holder'))}</b>",
+            f"• بانک: <b>{_wz_escape(v.get('bank_name'))}</b>",
+            "شمارهٔ کامل فقط در دستور پرداختِ پرداخت‌کننده نمایش داده می‌شود.",
+        ]),
+        commit=_commit_new_bank_card,
+    ))
+
+
+_register_finance_wizards()
+
+
+def start_finance_wizard(context, query, flow_key: str, *, parent_callback: str):
+    """Open one finance wizard on the live conversation store.
+
+    The draft FSM is cleared on purpose: the wizard supersedes the legacy text draft,
+    and leaving both armed would let ``_route_v52_fsm_text`` swallow the answer the
+    wizard is waiting for.
+    """
+    import v52_router
+    message = getattr(query, "message", None)
+    chat = getattr(message, "chat", None)
+    state = ui_v52.start_wizard(
+        context.user_data, flow_key, return_callback=parent_callback,
+        message_id=getattr(message, "message_id", None),
+        chat_id=getattr(chat, "id", None))
+    try:
+        v52_router.DEFAULT_FSM.clear(context)
+    except Exception:
+        pass
+    return state
+
+
 __all__ = [
+    "BANK_CARD_WIZARD_KEY", "BANK_CHOICES", "CATEGORY_EMOJI_CHOICES",
+    "COUPON_WIZARD_KEY", "PLAN_CATEGORY_WIZARD_KEY", "start_finance_wizard",
     "CHECKBOX_OFF", "CHECKBOX_ON", "COUPON_EDIT_FORMAT", "COUPON_NEW_FORMAT",
     "PLAN_CATEGORY_EDIT_FORMAT", "PLAN_CATEGORY_NEW_FORMAT", "REFUND_DESTINATION_FORMAT",
     "REFUNDABLE_ORDER_STATES", "apply_coupon_edit", "apply_coupon_new",

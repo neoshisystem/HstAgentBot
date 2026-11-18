@@ -7,12 +7,21 @@ two explicit shapes and never guesses between them silently.
 * ``line``  — one item per non-empty line (the historic behaviour).
 * ``block`` — a standalone separator line (``---`` or ``###``) ends an item, so
   every block between separators is stored as ONE multi-line item.
-* ``auto``  — ``block`` when a separator line is present, else ``line``.
+* ``auto``  — ``block`` when a separator line is present; otherwise ``block`` when
+  the message looks like ONE labelled credential card, else ``line``.
+
+The last rule is the S60 fix. A real account card is routinely pasted without any
+separator — ``نام کاربری: x`` / ``رمز عبور: y`` / ``کلید: z`` — and splitting that on
+newlines produced three broken items instead of one usable card. A bare list of codes
+must keep splitting, so the trigger is a *labelled* field or an emoji-prefixed line,
+never merely "there are several lines".
 
 A separator line carries nothing but the marker, so a password that happens to
 contain ``---`` inside a line is never mistaken for a boundary.
 """
 from __future__ import annotations
+
+import re
 
 MAX_BATCH_ITEMS = 100
 MAX_ITEM_BYTES = 8192
@@ -26,6 +35,60 @@ class InventoryParseError(ValueError):
 
 def _is_separator(line: str) -> bool:
     return line.strip() in BLOCK_SEPARATORS
+
+
+#: A Persian field name that labels the line it starts. Persian labels are
+#: unambiguous, so one may stand alone on its line (the value follows below).
+_FA_LABEL = (
+    r"نام\s*کاربری|نام\s*کاربر|یوزر\s*نیم|یوزرنیم|یوزر|کاربری|"
+    r"رمز\s*عبور|رمز\s*ورود|رمزعبور|رمز|پسورد|پاسورد|گذرواژه|"
+    r"کلید|لایسنس|لیسانس|توکن|کد|"
+    r"توضیحات|نکات|راهنما|راه\s*اندازی|"
+    r"ایمیل|لینک|آدرس|سرور|پورت|حجم|انقضا|تاریخ|اعتبار"
+)
+
+#: An English field name. These are short and collide with real product codes
+#: (``KEY-AAAA``), so an English label only counts when it is followed by an
+#: explicit separator: ``key: x``, ``key=x``, ``key - x``.
+_EN_LABEL = (
+    r"username|user\s*name|user|login|email|mail|"
+    r"password|passwd|pass|pwd|"
+    r"key|licen[cs]e|token|secret|uuid|"
+    r"note|notes|guide|hint|url|link|host|port|server|"
+    r"sub|subscription|config|remark"
+)
+
+#: A hyphen is a valid separator after a Persian label (``رمز عبور - x``) but never
+#: after an English one: ``KEY-AAAA`` is a product code, not a labelled field.
+_SEPARATOR_FA = r"[:：=\-–—]"
+_SEPARATOR_EN = r"[:：=]"
+
+#: ``label: value`` in either language.
+_LABELLED_FIELD = re.compile(
+    rf"^\s*(?:(?:{_FA_LABEL})\s*{_SEPARATOR_FA}|(?:{_EN_LABEL})\s*{_SEPARATOR_EN})\s*\S",
+    re.IGNORECASE)
+#: A Persian label alone on its line; the value is on the following line.
+_BARE_FA_LABEL = re.compile(rf"^\s*(?:{_FA_LABEL})\s*$")
+#: A line the operator labelled with an emoji.
+_EMOJI_LINE = re.compile(
+    r"^\s*[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2190-\u21FF]")
+
+
+def looks_like_credential_card(text: str) -> bool:
+    """True when a separator-free multi-line message is ONE labelled credential card.
+
+    A bare list of codes must keep splitting into one item per line, so the trigger is
+    a *labelled* field (``رمز عبور: x``, ``key=x``, a lone ``توضیحات`` line) or an
+    emoji-prefixed line — never merely "the message has several lines". That is why
+    ``resolve_mode("a\nb")`` stays ``line``.
+    """
+    lines = [line for line in str(text or "").splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    return any(
+        _LABELLED_FIELD.match(line) or _BARE_FA_LABEL.match(line) or _EMOJI_LINE.match(line)
+        for line in lines
+    )
 
 
 def has_separator(text: str) -> bool:
@@ -65,7 +128,10 @@ def resolve_mode(text: str, mode: str = "auto") -> str:
         )
     if selected != "auto":
         return selected
-    return "block" if has_separator(text) else "line"
+    if has_separator(text):
+        return "block"
+    # S60 — one labelled credential card, pasted without separators, is one item.
+    return "block" if looks_like_credential_card(text) else "line"
 
 
 def parse_batch(text: str, *, mode: str = "auto") -> list[str]:
@@ -112,6 +178,7 @@ __all__ = [
     "PARSE_MODES",
     "describe_batch",
     "has_separator",
+    "looks_like_credential_card",
     "parse_batch",
     "resolve_mode",
     "split_blocks",

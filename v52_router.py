@@ -37,6 +37,10 @@ TEXT_STATES: frozenset[str] = frozenset({
     "tier_plan_price", "refund_destination",
     "coupon_new", "coupon_edit",
     "panel_advanced",
+    # S60: the private-DM answer that carries a dedicated bot's token. Without it the
+    # "send me the token" form was a dead end — the state was never settable, so the
+    # operator's token fell through to the ordinary text handlers.
+    "bot_register_token",
 })
 
 #: Draft states that also accept a photo attachment.
@@ -113,6 +117,16 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:panelsetinbound:([1-9][0-9]{0,17}):([1-9][0-9]{0,17})$"), "set_panel_inbound", "root", lambda m: {"panel_id": int(m[1]), "inbound_id": int(m[2])}),
     (re.compile(r"^v52:bots$"), "list_bots", "root", lambda m: {}),
     (re.compile(r"^v52:bot:(primary|rep)$"), "begin_register_bot", "root", lambda m: {"kind": m[1]}),
+    # S60: the bot-management surface. ``v52:bots`` lists every registered bot and
+    # each row opens a detail card whose buttons land here. The patterns cannot
+    # shadow ``^v52:bot:(<id>)$`` above because none of them is all-digits after
+    # ``v52:bot:``.
+    (re.compile(r"^v52:bot:view:([1-9][0-9]{0,17})$"), "bot_view", "root", lambda m: {"bot_id": int(m[1])}),
+    (re.compile(r"^v52:bot:enable:([1-9][0-9]{0,17})$"), "bot_enable", "root DM", lambda m: {"bot_id": int(m[1])}),
+    (re.compile(r"^v52:bot:disable:([1-9][0-9]{0,17})$"), "bot_disable", "root DM", lambda m: {"bot_id": int(m[1])}),
+    (re.compile(r"^v52:bot:reassign:([1-9][0-9]{0,17})$"), "bot_reassign_pick", "root DM", lambda m: {"bot_id": int(m[1])}),
+    (re.compile(r"^v52:bot:reassign:([1-9][0-9]{0,17}):(root|[1-9][0-9]{0,17})$"), "bot_reassign", "root DM", lambda m: {"bot_id": int(m[1]), "new_rep": m[2]}),
+    (re.compile(r"^v52:bot:del:([1-9][0-9]{0,17})$"), "bot_delete", "root DM", lambda m: {"bot_id": int(m[1])}),
     (re.compile(r"^v52:domains$"), "list_domains", "root", lambda m: {}),
     # v5.2 domain-management surface: list -> detail -> DNS/SSL, lifecycle, delete,
     # and the four-step register wizard (hostname text, then role/panel/primary).
@@ -130,6 +144,7 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:domaindel:([1-9][0-9]{0,17})$"), "preview_domain_delete", "owner/root", lambda m: {"domain_id": int(m[1])}),
     (re.compile(r"^v52:domaindelok:([1-9][0-9]{0,17})$"), "confirm_domain_delete", "owner/root", lambda m: {"domain_id": int(m[1])}),
     (re.compile(r"^v52:cards$"), "list_cards", "root", lambda m: {}),
+    (re.compile(r"^v52:card:new$"), "begin_bank_card_new", "root DM", lambda m: {}),
     (re.compile(r"^v52:plans$"), "plan_hub", "root", lambda m: {}),
     (re.compile(r"^v52:finance$"), "show_finance", "root", lambda m: {}),
     (re.compile(r"^v52:orders$"), "list_orders", "actor", lambda m: {}),
@@ -161,6 +176,10 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:shop:wiz:skip:([a-z_]+)$"), "product_wizard_choice", "root", lambda m: {"field": "skip", "value": ""}),
     (re.compile(r"^v52:shop:product:([1-9][0-9]{0,17})$"), "admin_product_detail", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:stock:([1-9][0-9]{0,17})$"), "begin_product_stock", "root", lambda m: {"product_id": int(m[1])}),
+    # S60 — the explicit split modes and the structured-item wizard. The bare route
+    # above now renders the chooser, so these three carry the operator's decision.
+    (re.compile(r"^v52:shop:stock:(line|block):([1-9][0-9]{0,17})$"), "begin_product_stock_mode", "root", lambda m: {"mode": m[1], "product_id": int(m[2])}),
+    (re.compile(r"^v52:shop:stock:wiz:([1-9][0-9]{0,17})$"), "begin_structured_item", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:edit:([1-9][0-9]{0,17})$"), "begin_product_edit", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:toggle:([1-9][0-9]{0,17})$"), "toggle_product", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:price:([1-9][0-9]{0,17})$"), "begin_product_price", "root", lambda m: {"product_id": int(m[1])}),

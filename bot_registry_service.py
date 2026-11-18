@@ -282,8 +282,275 @@ def disable_bot(conn: sqlite3.Connection, *, actor_tg_id: int, bot_id: int,
         raise BotRegistryError("disable confirmation is invalid, stale or expired") from exc
 
 
+def _assert_slot_free(conn: sqlite3.Connection, bot_id: int, rep_id: Any,
+                      is_primary: bool) -> None:
+    """Refuse a transition the unique indexes would reject after the operator confirms.
+
+    ``ux_primary_bot`` covers every ``is_primary=1`` row regardless of status, while
+    ``ux_active_rep_bot`` only covers ``status='active'``. Checking here turns a raw
+    ``IntegrityError`` into an operator-readable reason *before* the confirmation is
+    consumed, so a refused enable does not burn the one-time nonce.
+    """
+    if is_primary:
+        clash = conn.execute(
+            "SELECT bot_id FROM bot_registry WHERE is_primary=1 AND bot_id<>?",
+            (int(bot_id),),
+        ).fetchone()
+        if clash is not None:
+            raise BotRegistryConflict("another primary bot is already registered")
+    elif rep_id is not None:
+        clash = conn.execute(
+            "SELECT bot_id FROM bot_registry WHERE rep_id=? AND status='active' AND bot_id<>?",
+            (int(rep_id), int(bot_id)),
+        ).fetchone()
+        if clash is not None:
+            raise BotRegistryConflict(
+                "this representative already has an active bot; disable or reassign it first")
+
+
+def prepare_bot_enable(conn: sqlite3.Connection, *, actor_tg_id: int, bot_id: int,
+                       now: int, ttl_seconds: int = 300) -> dict[str, Any]:
+    """Preview re-activating a disabled bot.
+
+    ``disable_bot`` had no counterpart: once a bot was disabled the only path back to
+    ``active`` was ``activate_bot``, which accepts a ``pending`` row — so a disabled
+    bot was bricked permanently. This restores the missing half of the lifecycle.
+    """
+    actor, selected, now = _root(actor_tg_id), _positive(bot_id, "bot_id"), _now(now)
+    try:
+        with _atomic(conn):
+            row = conn.execute(
+                "SELECT status,revision,rep_id,is_primary,username FROM bot_registry "
+                "WHERE bot_id=?", (selected,),
+            ).fetchone()
+            if row is None:
+                raise BotRegistryError("bot registration does not exist")
+            if str(row["status"]) != "disabled":
+                raise BotRegistryConflict("only a disabled bot can be enabled")
+            revision = int(row["revision"])
+            _assert_slot_free(conn, selected, row["rep_id"], bool(row["is_primary"]))
+            confirmation = create_confirmation(
+                conn, actor_tg_id=actor, bot_id=selected, action="bot.enable",
+                target_type="bot_registry", target_id=selected, expected_revision=revision,
+                payload={"bot_id": selected, "rep_id": row["rep_id"],
+                         "is_primary": bool(row["is_primary"]),
+                         "username": row["username"], "revision": revision},
+                now=now, ttl_seconds=ttl_seconds,
+            )
+    except ConfirmationError as exc:
+        raise BotRegistryError("enable preview could not be created") from exc
+    return {"bot_id": selected, "status": "disabled", "revision": revision,
+            "rep_id": row["rep_id"], "is_primary": bool(row["is_primary"]),
+            "username": row["username"], "confirmation": confirmation}
+
+
+def enable_bot(conn: sqlite3.Connection, *, actor_tg_id: int, bot_id: int,
+               nonce: str, now: int) -> dict[str, Any]:
+    """Re-activate a disabled bot exactly once; the counterpart of ``disable_bot``."""
+    actor, selected, now = _root(actor_tg_id), _positive(bot_id, "bot_id"), _now(now)
+    try:
+        with _atomic(conn):
+            row = conn.execute(
+                "SELECT status,revision FROM bot_registry WHERE bot_id=?", (selected,)
+            ).fetchone()
+            if row is None:
+                raise BotRegistryError("bot registration does not exist")
+            status, revision = str(row["status"]), int(row["revision"])
+            if status == "disabled":
+                expected = revision
+            elif status == "active" and revision > 1:
+                expected = revision - 1
+            else:
+                raise BotRegistryConflict("only a disabled bot can be enabled")
+            consumed = consume_confirmation(
+                conn, nonce=nonce, actor_tg_id=actor, bot_id=selected,
+                action="bot.enable", target_type="bot_registry", target_id=selected,
+                expected_revision=expected, now=now,
+            )
+            if status == "active":
+                return {"bot_id": selected, "status": "active", "revision": revision,
+                        "replayed": bool(consumed["replayed"])}
+            conn.execute(
+                "UPDATE bot_registry SET status='active',verified_at=?,revision=revision+1 "
+                "WHERE bot_id=? AND status='disabled'", (now, selected),
+            )
+            return {"bot_id": selected, "status": "active", "revision": revision + 1,
+                    "replayed": False}
+    except sqlite3.IntegrityError:
+        raise BotRegistryConflict(
+            "primary slot or active representative uniqueness was violated") from None
+    except ConfirmationError as exc:
+        raise BotRegistryError("enable confirmation is invalid, stale or expired") from exc
+
+
+def prepare_bot_reassign(conn: sqlite3.Connection, *, actor_tg_id: int, bot_id: int,
+                         new_rep_id: int | None, now: int,
+                         ttl_seconds: int = 300) -> dict[str, Any]:
+    """Preview moving a bot to another representative, or confiscating it to root.
+
+    ``new_rep_id=None`` confiscates the bot to root: the offending representative
+    loses the bot without the owner having to destroy its registration.
+    """
+    actor, selected, now = _root(actor_tg_id), _positive(bot_id, "bot_id"), _now(now)
+    target = None if new_rep_id is None else _positive(new_rep_id, "new_rep_id")
+    try:
+        with _atomic(conn):
+            row = conn.execute(
+                "SELECT status,revision,rep_id,is_primary FROM bot_registry WHERE bot_id=?",
+                (selected,),
+            ).fetchone()
+            if row is None:
+                raise BotRegistryError("bot registration does not exist")
+            if bool(row["is_primary"]):
+                raise BotRegistryConflict("the primary bot cannot be reassigned")
+            if target is not None:
+                if conn.execute(
+                    "SELECT 1 FROM representatives WHERE id=? AND is_active=1 "
+                    "AND deleted_at IS NULL", (target,),
+                ).fetchone() is None:
+                    raise BotRegistryConflict("representative is inactive or unavailable")
+                _assert_slot_free(conn, selected, target, False)
+            revision = int(row["revision"])
+            confirmation = create_confirmation(
+                conn, actor_tg_id=actor, bot_id=selected, action="bot.reassign",
+                target_type="bot_registry", target_id=selected, expected_revision=revision,
+                payload={"bot_id": selected, "rep_id": row["rep_id"],
+                         "new_rep_id": target, "revision": revision},
+                now=now, ttl_seconds=ttl_seconds,
+            )
+    except ConfirmationError as exc:
+        raise BotRegistryError("reassign preview could not be created") from exc
+    return {"bot_id": selected, "status": str(row["status"]), "revision": revision,
+            "rep_id": row["rep_id"], "new_rep_id": target,
+            "confirmation": confirmation}
+
+
+def reassign_bot(conn: sqlite3.Connection, *, actor_tg_id: int, bot_id: int,
+                 new_rep_id: int | None, nonce: str, now: int) -> dict[str, Any]:
+    """Move a bot to another representative, or confiscate it to root (``None``)."""
+    actor, selected, now = _root(actor_tg_id), _positive(bot_id, "bot_id"), _now(now)
+    target = None if new_rep_id is None else _positive(new_rep_id, "new_rep_id")
+    try:
+        with _atomic(conn):
+            row = conn.execute(
+                "SELECT status,revision,rep_id,is_primary FROM bot_registry WHERE bot_id=?",
+                (selected,),
+            ).fetchone()
+            if row is None:
+                raise BotRegistryError("bot registration does not exist")
+            if bool(row["is_primary"]):
+                raise BotRegistryConflict("the primary bot cannot be reassigned")
+            revision = int(row["revision"])
+            consumed = consume_confirmation(
+                conn, nonce=nonce, actor_tg_id=actor, bot_id=selected,
+                action="bot.reassign", target_type="bot_registry", target_id=selected,
+                expected_revision=revision, now=now,
+            )
+            if row["rep_id"] == target:
+                return {"bot_id": selected, "rep_id": target, "revision": revision,
+                        "replayed": bool(consumed["replayed"])}
+            conn.execute(
+                "UPDATE bot_registry SET rep_id=?,revision=revision+1 WHERE bot_id=?",
+                (target, selected),
+            )
+            return {"bot_id": selected, "rep_id": target, "revision": revision + 1,
+                    "replayed": False}
+    except sqlite3.IntegrityError:
+        raise BotRegistryConflict(
+            "this representative already has an active bot; disable it first") from None
+    except ConfirmationError as exc:
+        raise BotRegistryError("reassign confirmation is invalid, stale or expired") from exc
+
+
+def prepare_bot_delete(conn: sqlite3.Connection, *, actor_tg_id: int, bot_id: int,
+                       now: int, ttl_seconds: int = 300) -> dict[str, Any]:
+    """Preview a hard delete, so an irreversible removal is always confirmed first."""
+    actor, selected, now = _root(actor_tg_id), _positive(bot_id, "bot_id"), _now(now)
+    try:
+        with _atomic(conn):
+            row = conn.execute(
+                "SELECT status,revision,rep_id,is_primary FROM bot_registry WHERE bot_id=?",
+                (selected,),
+            ).fetchone()
+            if row is None:
+                raise BotRegistryError("bot registration does not exist")
+            if bool(row["is_primary"]):
+                raise BotRegistryConflict("the primary bot cannot be deleted")
+            if str(row["status"]) == "active":
+                raise BotRegistryConflict("an active bot must be disabled before deletion")
+            revision = int(row["revision"])
+            confirmation = create_confirmation(
+                conn, actor_tg_id=actor, bot_id=selected, action="bot.delete",
+                target_type="bot_registry", target_id=selected, expected_revision=revision,
+                payload={"bot_id": selected, "rep_id": row["rep_id"],
+                         "revision": revision},
+                now=now, ttl_seconds=ttl_seconds,
+            )
+    except ConfirmationError as exc:
+        raise BotRegistryError("delete preview could not be created") from exc
+    return {"bot_id": selected, "status": str(row["status"]), "revision": revision,
+            "confirmation": confirmation}
+
+
+def delete_bot(conn: sqlite3.Connection, *, actor_tg_id: int, bot_id: int,
+               now: int, nonce: str | None = None) -> dict[str, Any]:
+    """Remove a bot from the registry when nothing operational depends on it.
+
+    ``PRAGMA foreign_keys`` is ON, so a bot that ever served a customer, order, ticket
+    or good cannot be deleted. That refusal is reported as a readable conflict rather
+    than a raw ``IntegrityError``, and the operator is told to disable it instead.
+
+    When ``nonce`` is supplied the one-shot confirmation is consumed in the same
+    transaction as the delete, so a replayed press cannot delete a second time; the
+    UI always passes it.
+    """
+    actor, selected, now = _root(actor_tg_id), _positive(bot_id, "bot_id"), _now(now)
+    try:
+        with _atomic(conn):
+            row = conn.execute(
+                "SELECT status,revision,is_primary FROM bot_registry WHERE bot_id=?",
+                (selected,),
+            ).fetchone()
+            if row is None:
+                raise BotRegistryError("bot registration does not exist")
+            if str(row["status"]) == "active":
+                raise BotRegistryConflict("an active bot must be disabled before deletion")
+            if bool(row["is_primary"]):
+                raise BotRegistryConflict("the primary bot cannot be deleted")
+            revision = int(row["revision"])
+            if nonce is not None:
+                consume_confirmation(
+                    conn, nonce=nonce, actor_tg_id=actor, bot_id=selected,
+                    action="bot.delete", target_type="bot_registry", target_id=selected,
+                    expected_revision=revision, now=now,
+                )
+            conn.execute("DELETE FROM bot_registry WHERE bot_id=?", (selected,))
+            return {"bot_id": selected, "status": "deleted", "revision": revision}
+    except sqlite3.IntegrityError:
+        raise BotRegistryConflict(
+            "this bot has operational history; disable it instead of deleting it") from None
+    except ConfirmationError as exc:
+        raise BotRegistryError("delete confirmation is invalid, stale or expired") from exc
+
+
+def disable_bots_for_rep(conn: sqlite3.Connection, *, rep_id: int, now: int) -> int:
+    """Disable every active dedicated bot of one representative.
+
+    The same statement ``database._disable_rep_bots`` runs inside the suspension
+    transaction; this entry point serves callers that already hold a connection.
+    """
+    selected, now = _positive(rep_id, "rep_id"), _now(now)
+    with _atomic(conn):
+        cur = conn.execute(
+            "UPDATE bot_registry SET status='disabled', revision=revision+1 "
+            "WHERE rep_id=? AND status='active'", (selected,))
+        return cur.rowcount or 0
+
+
 __all__ = [
     "BotRegistryError", "BotRegistryPermissionError", "BotVerificationError",
     "BotRegistryConflict", "verify_bot_registration", "activate_bot",
-    "prepare_bot_disable", "disable_bot",
+    "prepare_bot_disable", "disable_bot", "prepare_bot_enable", "enable_bot",
+    "prepare_bot_reassign", "reassign_bot", "prepare_bot_delete", "delete_bot",
+    "disable_bots_for_rep",
 ]

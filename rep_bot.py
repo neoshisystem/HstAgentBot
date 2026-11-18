@@ -1240,7 +1240,8 @@ def _load_confirmation(nonce: str):
     with database.get_db() as conn:
         return conn.execute(
             "SELECT nonce,actor_tg_id,bot_id,action,target_type,target_id,expected_revision,"
-            "expires_at,consumed_at,operation_id FROM action_confirmations WHERE nonce=?",
+            "expires_at,consumed_at,operation_id,payload_json "
+            "FROM action_confirmations WHERE nonce=?",
             (str(nonce),)).fetchone()
 
 
@@ -1270,23 +1271,116 @@ def _v52_confirmation_page(ctx, persona: str, nonce: str):
     )
 
 
+#: Confirmation actions that mutate ``bot_registry``. Each maps to the service
+#: function that both consumes the nonce and performs the transition, so the two can
+#: never drift apart and a replayed press cannot apply the change twice.
+_BOT_LIFECYCLE_ACTIONS = {
+    "bot.activate": "activate_bot",
+    "bot.disable": "disable_bot",
+    "bot.enable": "enable_bot",
+    "bot.reassign": "reassign_bot",
+}
+
+
+def _v52_arm_bot_token_state(ctx, *, rep_id, is_primary) -> None:
+    """Arm the private-DM state that accepts the bot token.
+
+    ``begin_register_bot`` renders the "send me the token" form; the operator's next
+    private message is then routed to ``bot_register_token``. Without this the form was
+    a dead end: the state was never set, so the token answer fell through to the
+    ordinary text handlers and the registration could never be completed.
+    """
+    v52_router.DEFAULT_FSM.set(
+        ctx, "bot_register_token",
+        payload={"rep_id": None if rep_id is None else int(rep_id),
+                 "is_primary": bool(is_primary)},
+        parent_callback="v52:bots", now=int(time.time()))
+
+
+def _v52_bot_actor(ctx) -> int:
+    """The acting operator, used as the audit actor of a bot transition."""
+    for key in ("actor_tg_id", "telegram_id"):
+        value = ctx.get(key) if hasattr(ctx, "get") else None
+        if value:
+            return int(value)
+    return int(ADMIN_TELEGRAM_ID)
+
+
+def _v52_load_bot(bot_id: int):
+    """One ``bot_registry`` row joined with its owner, or ``None`` when unknown."""
+    with database.get_db() as conn:
+        row = conn.execute(
+            "SELECT b.bot_id,b.rep_id,b.is_primary,b.username,b.status,b.revision,"
+            "       r.name AS rep_name FROM bot_registry b "
+            "LEFT JOIN representatives r ON r.id=b.rep_id WHERE b.bot_id=?",
+            (int(bot_id),)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _v52_prepare_bot_action(ctx, name: str, bot_id: int, new_rep_id=None):
+    """Run the matching ``prepare_*`` preview: a nonce is created, nothing changes."""
+    import bot_registry_service
+    actor, now = _v52_bot_actor(ctx), int(time.time())
+    with database.get_db() as conn:
+        if name == "bot_enable":
+            return bot_registry_service.prepare_bot_enable(
+                conn, actor_tg_id=actor, bot_id=int(bot_id), now=now)
+        if name == "bot_disable":
+            return bot_registry_service.prepare_bot_disable(
+                conn, actor_tg_id=actor, bot_id=int(bot_id), now=now)
+        if name == "bot_delete":
+            return bot_registry_service.prepare_bot_delete(
+                conn, actor_tg_id=actor, bot_id=int(bot_id), now=now)
+        if name == "bot_reassign":
+            return bot_registry_service.prepare_bot_reassign(
+                conn, actor_tg_id=actor, bot_id=int(bot_id), new_rep_id=new_rep_id,
+                now=now)
+    raise ValueError("unknown bot action")
+
+
+def _v52_apply_bot_action(conn, action: str, row, nonce: str, now: int):
+    """Perform the approved bot transition; the service consumes the nonce inside it."""
+    import bot_registry_service
+    actor_id, bot_id = int(row["actor_tg_id"]), int(row["target_id"])
+    if str(action) == "bot.reassign":
+        payload = json.loads(str(row["payload_json"] or "{}") or "{}")
+        target = payload.get("new_rep_id")
+        return bot_registry_service.reassign_bot(
+            conn, actor_tg_id=actor_id, bot_id=bot_id, nonce=str(nonce),
+            new_rep_id=None if target is None else int(target), now=now)
+    return getattr(bot_registry_service, _BOT_LIFECYCLE_ACTIONS[str(action)])(
+        conn, actor_tg_id=actor_id, bot_id=bot_id, nonce=str(nonce), now=now)
+
+
 def _v52_consume_confirmation(ctx, persona: str, nonce: str):
-    """CAS-consume a confirmation and report the bound operation id."""
+    """CAS-consume a confirmation and run the transition it is bound to.
+
+    The bot-lifecycle actions are performed here rather than merely recorded: the
+    service consumes the nonce in the same transaction as the mutation, so the
+    operator's approval and the change are one atomic step. Every other action keeps
+    the previous behaviour and reports the bound operation id.
+    """
     import confirmation_service
     from ui_v52 import render_page, render_error
     row = _load_confirmation(nonce)
     if row is None:
         return render_error("این درخواست تأیید وجود ندارد یا منقضی شده است.", persona=persona,
                             parent_callback="v52:home:" + persona)
+    action = str(row["action"])
+    now = int(time.time())
+    applied, result = None, None
     try:
         with database.get_db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                result = confirmation_service.consume_confirmation(
-                    conn, nonce=str(nonce), actor_tg_id=int(row["actor_tg_id"]),
-                    bot_id=int(row["bot_id"]), action=str(row["action"]),
-                    target_type=str(row["target_type"]), target_id=str(row["target_id"]),
-                    expected_revision=int(row["expected_revision"]), now=int(time.time()))
+                if action in _BOT_LIFECYCLE_ACTIONS:
+                    applied = _v52_apply_bot_action(conn, action, row, str(nonce), now)
+                else:
+                    result = confirmation_service.consume_confirmation(
+                        conn, nonce=str(nonce), actor_tg_id=int(row["actor_tg_id"]),
+                        bot_id=int(row["bot_id"]), action=action,
+                        target_type=str(row["target_type"]), target_id=str(row["target_id"]),
+                        expected_revision=int(row["expected_revision"]), now=now)
                 conn.commit()
             except Exception:
                 if conn.in_transaction:
@@ -1295,6 +1389,9 @@ def _v52_consume_confirmation(ctx, persona: str, nonce: str):
     except Exception as exc:
         return render_error(f"تأیید انجام نشد: {exc}", persona=persona,
                             parent_callback="v52:home:" + persona)
+    if applied is not None:
+        import bot_admin_ui
+        return bot_admin_ui.build_bot_action_result(ctx, applied, action=action)
     notice = "این تأیید قبلاً مصرف شده بود." if result.get("replayed") else "تأیید ثبت شد."
     return render_page(
         "نتیجهٔ تأیید",
@@ -1492,7 +1589,7 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 result = await config_delivery_ui.deliver_config_qr(
                     ctx, int(match.group(1)), int(match.group(2)),
                     adapter_factory=admin_panel._get_admin_panel_adapter_factory(context), message=query.message)
-                await query.answer("QR کانفیگ ارسال شد." if result.state == "ok" else "شماره کانفیگ معتبر نیست.")
+                await query.answer("QR کانفیگ ارسال شد." if result.status == "ok" else "شماره کانفیگ معتبر نیست.")
                 return True
             match = re.fullmatch(r"v52:allcfg:([1-9][0-9]{0,17})", data)
             if match:
@@ -1531,6 +1628,16 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
             elif data == "v52:cards":
                 import finance_admin_ui
                 page = finance_admin_ui.edit_bank_card(ctx)
+            elif data == "v52:card:new":
+                # S59 — the root card is collected by a wizard and confirmed on a
+                # preview card, instead of one raw pipe-separated line.
+                import finance_admin_ui
+                from ui_v52 import wizard_render
+                _wz_state = finance_admin_ui.start_finance_wizard(
+                    context, query, finance_admin_ui.BANK_CARD_WIZARD_KEY,
+                    parent_callback="v52:cards")
+                await wizard_render(update, context, _wz_state)
+                return True
             else:
                 match = re.fullmatch(r"v52:card:([1-9][0-9]{0,17})", data)
                 if match:
@@ -2183,6 +2290,7 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 if params.get("kind") == "primary":
                     page = bot_admin_ui.begin_register_bot(
                         ctx, rep_id=None, is_primary=True, chat_type=ctx.get("chat_type"))
+                    _v52_arm_bot_token_state(ctx, rep_id=None, is_primary=True)
                 elif params.get("kind") == "rep":
                     from ui_v52 import render_page, button
                     reps = database.get_all_active_reps()
@@ -2195,6 +2303,56 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                     )
                 else:
                     page = bot_admin_ui.begin_register_bot(ctx, params["rep_id"], chat_type=ctx.get("chat_type"))
+                    _v52_arm_bot_token_state(ctx, rep_id=int(params["rep_id"]),
+                                             is_primary=False)
+            elif name == "list_bots":
+                import bot_admin_ui
+                page = bot_admin_ui.build_bots_page(
+                    ctx, database.list_registered_bots(),
+                    reps=database.get_all_active_reps())
+            elif name == "bot_view":
+                import bot_admin_ui
+                bot = _v52_load_bot(int(params["bot_id"]))
+                page = (bot_admin_ui.build_bot_detail_page(ctx, bot) if bot is not None
+                        else ui_v52.render_error("این بات در فهرست ثبت نشده است.",
+                                                 persona="admin", parent_callback="v52:bots"))
+            elif name in ("bot_enable", "bot_disable", "bot_delete"):
+                import bot_admin_ui
+                bot_id = int(params["bot_id"])
+                bot = _v52_load_bot(bot_id)
+                if bot is None:
+                    page = ui_v52.render_error("این بات در فهرست ثبت نشده است.",
+                                               persona="admin", parent_callback="v52:bots")
+                else:
+                    action = {"bot_enable": "bot.enable", "bot_disable": "bot.disable",
+                              "bot_delete": "bot.delete"}[name]
+                    prepared = _v52_prepare_bot_action(ctx, name, bot_id)
+                    page = bot_admin_ui.build_bot_action_preview(
+                        ctx, bot, prepared, action=action,
+                        parent_callback="v52:bot:view:" + str(bot_id))
+            elif name == "bot_reassign_pick":
+                import bot_admin_ui
+                bot = _v52_load_bot(int(params["bot_id"]))
+                page = (bot_admin_ui.build_bot_reassign_picker(
+                            ctx, bot, database.get_all_active_reps())
+                        if bot is not None
+                        else ui_v52.render_error("این بات در فهرست ثبت نشده است.",
+                                                 persona="admin", parent_callback="v52:bots"))
+            elif name == "bot_reassign":
+                import bot_admin_ui
+                bot_id = int(params["bot_id"])
+                raw = str(params.get("new_rep") or "root")
+                bot = _v52_load_bot(bot_id)
+                if bot is None:
+                    page = ui_v52.render_error("این بات در فهرست ثبت نشده است.",
+                                               persona="admin", parent_callback="v52:bots")
+                else:
+                    prepared = _v52_prepare_bot_action(
+                        ctx, "bot_reassign", bot_id,
+                        new_rep_id=None if raw == "root" else int(raw))
+                    page = bot_admin_ui.build_bot_action_preview(
+                        ctx, bot, prepared, action="bot.reassign",
+                        parent_callback="v52:bot:view:" + str(bot_id))
             elif name == "show_sub_reps":
                 import rep_admin_ui
                 page = rep_admin_ui.show_sub_reps(ctx, int(params["rep_id"]), persona=persona)
@@ -2293,6 +2451,22 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 from ui_v52 import render_page
                 text, rows = goods_ui.begin_stock_import(ctx, int(params["product_id"]))
                 page = render_page("📦 ورود موجودی", text, persona="admin", rows=rows)
+            elif name == "begin_product_stock_mode":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.begin_stock_import_mode(
+                    ctx, int(params["product_id"]), str(params["mode"]))
+                page = render_page("📦 ورود موجودی", text, persona="admin", rows=rows)
+            elif name == "begin_structured_item":
+                # S60 — the guided builder for a multi-line credential card. It is a
+                # ``ui_v52`` wizard, so it renders into its own message and commits
+                # through the flow's own confirmation card.
+                import inventory_admin_ui
+                from ui_v52 import wizard_render
+                _wz_state = inventory_admin_ui.begin_structured_item(
+                    context, query, int(params["product_id"]))
+                await wizard_render(update, context, _wz_state)
+                return True
             elif name == "begin_product_edit":
                 import goods_ui
                 from ui_v52 import render_page
@@ -2446,8 +2620,30 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 import finance_admin_ui
                 page = finance_admin_ui.plan_categories_page(ctx)
             elif name == "begin_plan_category_new":
+                # S59 — the pipe-separated single line is replaced by a wizard that ends
+                # on a preview card. ``begin_plan_category_new`` stays available for the
+                # legacy text path and the S57 tests.
                 import finance_admin_ui
-                page = finance_admin_ui.begin_plan_category_new(ctx)
+                from ui_v52 import wizard_render
+                _wz_state = finance_admin_ui.start_finance_wizard(
+                    context, query, finance_admin_ui.PLAN_CATEGORY_WIZARD_KEY,
+                    parent_callback="v52:plancats")
+                await wizard_render(update, context, _wz_state)
+                return True
+            elif name == "list_cards":
+                # S59 registered ``v52:cards`` in the router but never added the
+                # branch, so the button dead-ended in the W18 bridge error page.
+                import finance_admin_ui
+                page = finance_admin_ui.edit_bank_card(ctx, parent_callback="v52:finance")
+            elif name == "begin_bank_card_new":
+                # Same gap: ``v52:card:new`` resolved to a handler that did not exist.
+                import finance_admin_ui
+                from ui_v52 import wizard_render
+                _wz_state = finance_admin_ui.start_finance_wizard(
+                    context, query, finance_admin_ui.BANK_CARD_WIZARD_KEY,
+                    parent_callback="v52:cards")
+                await wizard_render(update, context, _wz_state)
+                return True
             elif name == "begin_plan_category_edit":
                 import finance_admin_ui
                 page = finance_admin_ui.begin_plan_category_edit(ctx, str(params["category_key"]))
@@ -2486,8 +2682,14 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 import finance_admin_ui
                 page = finance_admin_ui.coupons_page(ctx)
             elif name == "begin_coupon_new":
+                # S59 — same treatment as the plan-category form above.
                 import finance_admin_ui
-                page = finance_admin_ui.begin_coupon_new(ctx)
+                from ui_v52 import wizard_render
+                _wz_state = finance_admin_ui.start_finance_wizard(
+                    context, query, finance_admin_ui.COUPON_WIZARD_KEY,
+                    parent_callback="v52:coupons")
+                await wizard_render(update, context, _wz_state)
+                return True
             elif name == "begin_coupon_edit":
                 import finance_admin_ui
                 page = finance_admin_ui.begin_coupon_edit(ctx, str(params["code"]))
@@ -2619,6 +2821,40 @@ async def _route_v52_fsm_text(update, context):
         if route.name in {"panel_connection_name", "panel_connection_url", "panel_connection_token"}:
             if persona != "admin" or not ctx.get("is_root") or chat.type != "private":
                 raise PermissionError("تنظیم اتصال پنل فقط در پیوی root مجاز است.")
+        if route.name == "bot_register_token":
+            import bot_admin_ui, bot_registry_service
+            if persona != "admin" or not ctx.get("is_root") or chat.type != "private":
+                raise PermissionError("ثبت بات فقط در پیوی root مجاز است.")
+            is_primary = bool(payload.get("is_primary"))
+            rep_id = payload.get("rep_id")
+            rep_id = None if rep_id is None else int(rep_id)
+            actor_id = int(user.id)
+
+            async def _verify(*, bot_id, token, is_primary, rep_id):
+                """Run the real getMe outside the transaction, as the service requires."""
+                from telegram import Bot as _TelegramBot
+
+                async def _get_me(value):
+                    return await _TelegramBot(token=value).get_me()
+
+                with database.get_db() as conn:
+                    return await bot_registry_service.verify_bot_registration(
+                        conn, actor_tg_id=actor_id, bot_id=int(bot_id), token=token,
+                        get_me=_get_me, now=int(time.time()),
+                        rep_id=None if rep_id is None else int(rep_id),
+                        is_primary=bool(is_primary))
+
+            page = await bot_admin_ui.begin_registration_from_text(
+                ctx, text_value, verify=_verify, rep_id=rep_id, is_primary=is_primary,
+                chat_type=chat.type, parent_callback="v52:bots")
+            # The answer carried a live token; it must not linger in the chat history.
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.reply_text(page.text, reply_markup=page.reply_markup,
+                                     parse_mode="HTML")
+            return True
         if route.name == "panel_connection_name":
             import panel_admin_ui
             pid = int(payload["panel_id"])
@@ -2782,9 +3018,12 @@ async def _route_v52_fsm_text(update, context):
         if route.name == "inventory_digital_batch":
             import inventory_admin_ui
             # The raw text goes to the parser rather than a pre-split list, so the
-            # --- / ### separators can group multi-line items into one record.
+            # --- / ### separators can group multi-line items into one record. The
+            # mode the operator picked in the chooser is honoured; ``auto`` is the
+            # fallback for the bare route.
             page = inventory_admin_ui.begin_digital_import(
                 ctx, int(payload.get("product_id", 0)), text_value,
+                mode=str(payload.get("mode") or "auto"),
                 parent_callback="v52:shop")
             await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
             return True
@@ -3979,17 +4218,25 @@ async def _handle_registration_admin(update, context, *, scope: str, action: str
             "referral_requires_approval", "0")).strip().lower() in {"1", "true", "yes", "on", "enabled"}
         return mode, requires, pending
 
+    # ``message_edit.render_page`` keeps this correct on every source message: a
+    # receipt-style photo message cannot be edited as text, and pressing the same
+    # button twice is a normal action whose «Message is not modified» is benign.
+    # A raw ``edit_message_text`` turned both into «❌ خطای غیرمنتظره رخ داد».
     async def _render_settings():
+        import message_edit
         mode, requires, pending = _read_policy()
         text, markup = registration_ui.build_registration_settings_page(
             mode=mode, requires_approval=requires, pending=pending, scope=scope)
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        await message_edit.render_page(
+            query, text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
     async def _render_queue():
+        import message_edit
         with database.get_db() as conn:
             pending = registration_service.list_pending(conn, bot_id=bot_id, rep_id=rep_id)
         text, markup = registration_ui.build_pending_registrations_page(pending, scope=scope)
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        await message_edit.render_page(
+            query, text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
     if action == "reg_settings":
         await _render_settings()

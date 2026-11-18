@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import sqlite3
 import asyncio
@@ -907,6 +908,26 @@ def _table_present(conn, name: str) -> bool:
     ).fetchone() is not None
 
 
+def _ensure_column(conn, table: str, column: str, ddl: str) -> bool:
+    """Add ``column`` to ``table`` when it is missing; return ``True`` when added.
+
+    The migration count is frozen at 18, so a column that arrives after that freeze
+    is added here instead of in a migration file. The ``PRAGMA`` lookup makes a
+    second call a no-op and leaves an existing operator value untouched. A table
+    that does not exist in this (minimal) database is skipped rather than created:
+    the caller's own DDL owns that. The caller owns the commit.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(table)):
+        raise ValueError(f"unsafe table name: {table!r}")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(column)):
+        raise ValueError(f"unsafe column name: {column!r}")
+    columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    if not columns or column in columns:
+        return False
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    return True
+
+
 def ensure_plan_catalog_schema(conn) -> None:
     """Create the plan-category catalogue and the four v5.2 plan columns.
 
@@ -929,6 +950,10 @@ def ensure_plan_catalog_schema(conn) -> None:
         if "for_reps" not in columns:
             conn.execute(
                 "ALTER TABLE pricing_plans ADD COLUMN for_reps INTEGER NOT NULL DEFAULT 1")
+    # A percentage coupon stores its rate here and keeps ``discount_toman`` as the
+    # cap, so the table's ``CHECK(discount_toman>0)`` still holds and no rebuild (or
+    # 19th migration) is needed. ``0`` means "this is a fixed-amount coupon".
+    _ensure_column(conn, "coupons", "discount_percent", "INTEGER NOT NULL DEFAULT 0")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS plan_categories ("
         " category_key TEXT PRIMARY KEY,"
@@ -6080,6 +6105,47 @@ def toggle_rep_active(rep_id: int) -> int:
         conn.commit()
         return new_val
 
+def list_registered_bots() -> list:
+    """Every registered bot with its owner and status, primary first.
+
+    ``bot_registry`` is created by migration 006, so a minimal test database that
+    never ran the migrations simply has no bots to list.
+    """
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            return [dict(row) for row in cur.execute(
+                "SELECT b.bot_id, b.rep_id, b.is_primary, b.username, b.status, "
+                "       b.verified_at, b.revision, r.name AS rep_name, r.rep_code "
+                "FROM bot_registry b LEFT JOIN representatives r ON r.id = b.rep_id "
+                "ORDER BY b.is_primary DESC, b.bot_id"
+            ).fetchall()]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _disable_rep_bots(cur, rep_id: int) -> int:
+    """Stop every active dedicated bot of a representative that just lost access.
+
+    A suspended or archived representative must not keep selling through a bot that
+    is still ``active``: the bot would keep taking orders and issuing configs for a
+    representative the owner has already cut off. The status flip happens in the
+    same transaction as the suspension, so no window is left open.
+
+    Returns the number of bots disabled. The table is absent in minimal test
+    databases, so a missing ``bot_registry`` is not an error.
+    """
+    try:
+        cur.execute(
+            "UPDATE bot_registry SET status='disabled', revision=revision+1 "
+            "WHERE rep_id=? AND status='active'",
+            (int(rep_id),),
+        )
+        return cur.rowcount or 0
+    except sqlite3.OperationalError:
+        return 0
+
+
 def set_rep_active_status(
     rep_id: int, is_active: bool, actor_id: int = 0, actor_name: str = "Admin"
 ) -> int:
@@ -6094,9 +6160,15 @@ def set_rep_active_status(
         )
         if cur.rowcount != 1:
             raise ValueError("Representative not found")
+        if not value:
+            # Kill-switch: a suspended representative's bot stops accepting sales now.
+            disabled_bots = _disable_rep_bots(cur, int(rep_id))
+        else:
+            disabled_bots = 0
         _insert_audit(
             cur, int(rep_id), "", "", "set_rep_active_status", int(actor_id),
-            str(actor_name or "Admin"), {"is_active": bool(value)}, "success"
+            str(actor_name or "Admin"),
+            {"is_active": bool(value), "bots_disabled": disabled_bots}, "success"
         )
         return value
 
@@ -6111,7 +6183,11 @@ def delete_rep(rep_id: int) -> bool:
             "UPDATE representatives SET is_active = 0 WHERE id = ?",
             (rep_id,)
         )
-        return cur.rowcount == 1
+        changed = cur.rowcount == 1
+        if changed:
+            # Kill-switch: an archived representative must not keep an active bot.
+            _disable_rep_bots(cur, int(rep_id))
+        return changed
 def update_rep_full(rep_id: int, name: str, rep_code: str, telegram_id: int, group_id: int, topic_id: int, scope_filter: str):
     with get_db() as conn:
         cur = conn.cursor()

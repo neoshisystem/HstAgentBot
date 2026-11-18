@@ -65,6 +65,11 @@ def setup_user_role(monkeypatch):
     monkeypatch.setattr(user_portal.database, "is_user_blocked", lambda _uid: False)
     monkeypatch.setattr(user_portal.database, "get_user_role", lambda *a, **k: ("end_user", None))
     monkeypatch.setattr(user_portal.database, "get_user_owned_account", lambda *_: owned_account())
+    # These tests pin the LEGACY reset flow. ``database.init_db`` seeds
+    # ``v52_ui_enabled='1'``, so the v5.2 gate would intercept the callback and the
+    # legacy behaviour under test would never run. The one test that wants the gate
+    # on re-patches it to True after this call, so its intent still wins.
+    monkeypatch.setattr(user_portal, "_v52_ui_enabled", lambda: False)
 
 
 def test_user_reset_partial_result_persists_new_sub_id_and_releases_lock(monkeypatch):
@@ -178,6 +183,15 @@ def patch_rep_card_preflight(monkeypatch):
     }
     monkeypatch.setattr(rep_bot.database, "get_user_role", lambda *a, **k: ("rep", rep))
     monkeypatch.setattr(rep_bot.database, "is_user_blocked", lambda _uid: False)
+    # Same reason as ``setup_user_role``: the rep card tests exercise the legacy reset
+    # path, which the v5.2 gate (seeded on by ``init_db``) would otherwise intercept.
+    # Only ``v52_ui_enabled`` is overridden; every other setting read is untouched.
+    _real_get_setting = rep_bot.database.get_setting
+    monkeypatch.setattr(
+        rep_bot.database, "get_setting",
+        lambda key, *a, **k: ("0" if key == "v52_ui_enabled"
+                              else _real_get_setting(key, *a, **k)),
+    )
     monkeypatch.setattr(rep_bot.database, "is_account_in_rep_scope", lambda *_: account)
     monkeypatch.setattr(rep_bot.database, "get_user_first_connect_mode", lambda _uid: False)
     monkeypatch.setattr(
