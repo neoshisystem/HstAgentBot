@@ -28,6 +28,7 @@ import pytest
 from migrations_runner import apply_migrations
 
 import admin_panel
+import config
 import database
 import domain_service
 import finance_admin_ui
@@ -81,6 +82,11 @@ def _ecosystem_db(monkeypatch, tmp_path, *, filename):
         "BACKUP_ENCRYPTION_KEY",
         base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("="),
     )
+    # CI has no ``.env``, so the configured root is 0 there and every root-only page
+    # would refuse a synthetic actor. Pin the identity instead of inheriting the
+    # deployment's — the same value the fixture's context uses.
+    monkeypatch.setattr(config, "ADMIN_TELEGRAM_ID", ROOT_TG_ID, raising=False)
+    monkeypatch.setattr(database, "ADMIN_TELEGRAM_ID", ROOT_TG_ID, raising=False)
     with helpers.make_db(database, monkeypatch, tmp_path, filename=filename):
         with database.get_db() as conn:
             ensure_usage_guide = getattr(database, "ensure_product_usage_guide_column", None)
