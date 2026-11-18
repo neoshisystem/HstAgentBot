@@ -7,6 +7,12 @@ until now nothing in the product could create, edit or retire a row. This module
 is that missing half: a thin, testable page layer over the writers in
 :mod:`tier_service`.
 
+It also owns the tier-specific plan price matrix: the tier's flat discount is one
+percentage for every plan, while a negotiated wholesale rate is a fixed number for
+one plan, so ``tier_plan_prices`` is edited here and resolved through
+:func:`pricing_service.resolve_tier_plan_price` — the same resolver the buyer's
+menu and the checkout guard use.
+
 Every title, row label and hint on these pages is Persian. A raw column name
 (``discount_bps``, ``min_monthly_sales_toman``, …) is never shown to the operator;
 the technical code is only ever echoed inside a code span where it is the actual
@@ -15,9 +21,29 @@ identifier being edited.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from html import escape as _html_escape
 from typing import Any
 
 from ui_v52 import button, render_error, render_page
+
+
+def _code(value: Any) -> str:
+    """Render one identifier as an escaped code span."""
+    return f"<code>{_html_escape(str(value), quote=True)}</code>"
+
+
+def _html_from_template(text: Any) -> str:
+    """Escape a service message, then restore only the ``<code>`` spans it owns.
+
+    ``render_page`` escapes a plain ``body``, so a ``<code>`` tag written into it
+    reached the operator as the literal text ``&lt;code&gt;gold&lt;/code&gt;``. Passing
+    the message as ``body_html`` after this transformation keeps every dynamic
+    value escaped — a service exception can never inject markup — while the code
+    spans the page intended to show are rendered as code.
+    """
+    escaped = _html_escape(str(text), quote=True)
+    return escaped.replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
+
 
 #: The ladder is expressed in basis points so a 2.5% discount is exact. The
 #: operator types a percentage and the service converts it, which keeps the
@@ -113,7 +139,7 @@ def _tier_lines(rows: list[dict[str, Any]]) -> str:
         lines.append(f"▫️ سطوح {service.ACTOR_TYPE_FA.get(actor_type, actor_type)}:")
         for row in group:
             lines.append(
-                f"   • {row['title_fa']} — کد <code>{row['tier_code']}</code> · "
+                f"   • {row['title_fa']} — کد {_code(row['tier_code'])} · "
                 f"رتبه {row['rank']} · تخفیف {_percent(row['discount_bps'])} · "
                 f"کش‌بک {_percent(row['cashback_bps'])} · "
                 f"سهمیه تست روزانه {row['daily_test_quota']}"
@@ -140,11 +166,12 @@ def list_tiers(ctx: Any, *, parent_callback: str | None = "v52:home:admin"):
             ])
         buttons.append([button("بازگشت به میز مدیر کل", "v52:home:admin")])
         return render_page(
-            "🎖 سطوح کاربری و قیمت‌گذاری (Tiers)", _tier_lines(rows),
+            "🎖 سطوح کاربری و قیمت‌گذاری (Tiers)", body_html=_tier_lines(rows),
             persona="admin", rows=buttons, parent_callback=parent_callback,
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
 
 
 def begin_tier_new(ctx: Any, *, parent_callback: str | None = "v52:tiers"):
@@ -159,12 +186,14 @@ def begin_tier_new(ctx: Any, *, parent_callback: str | None = "v52:tiers"):
             ctx, "tier_new", payload={}, parent_callback=parent_callback,
             now=int(time.time()))
         return render_page(
-            "➕ سطح جدید", NEW_FORMAT, persona="admin", page_kind="form",
+            "➕ سطح جدید", body_html=_html_from_template(NEW_FORMAT),
+            persona="admin", page_kind="form",
             rows=[[button("بازگشت به فهرست سطوح", parent_callback or "v52:tiers")]],
             parent_callback=parent_callback,
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
 
 
 def apply_tier_new(ctx: Any, value: Any, *, parent_callback: str | None = "v52:tiers"):
@@ -194,21 +223,24 @@ def apply_tier_new(ctx: Any, value: Any, *, parent_callback: str | None = "v52:t
                 min_monthly_sales_toman=min_sales or 0,
             )
             conn.commit()
-        return render_page(
-            "✅ سطح جدید ثبت شد",
-            f"{created['title_fa']} — کد <code>{created['tier_code']}</code>\n"
+        body = (
+            f"{created['title_fa']} — کد {_code(created['tier_code'])}\n"
             f"نقش هدف: {service.ACTOR_TYPE_FA.get(created['actor_type'], created['actor_type'])}\n"
             f"رتبه: {created['rank']}\n"
             f"تخفیف تعرفه‌ها: {_percent(created['discount_bps'])}\n"
             f"کش‌بک: {_percent(created['cashback_bps'])}\n"
             f"سهمیه تست روزانه: {created['daily_test_quota']}\n\n"
-            "از این پس می‌توانید این سطح را به کاربران یا نمایندگان اختصاص دهید.",
+            "از این پس می‌توانید این سطح را به کاربران یا نمایندگان اختصاص دهید."
+        )
+        return render_page(
+            "✅ سطح جدید ثبت شد", body_html=_html_from_template(body),
             persona="admin", page_kind="result",
             rows=[[button("بازگشت به فهرست سطوح", parent_callback or "v52:tiers")]],
             parent_callback=parent_callback,
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
 
 
 def begin_tier_edit(ctx: Any, actor_type: str, code: str, *,
@@ -232,7 +264,7 @@ def begin_tier_edit(ctx: Any, actor_type: str, code: str, *,
             parent_callback=parent_callback, now=int(time.time()))
         body = (
             f"ویرایش سطح {current['title_fa']}\n"
-            f"کد: <code>{current['tier_code']}</code>\n"
+            f"کد: {_code(current['tier_code'])}\n"
             f"نقش هدف: {service.ACTOR_TYPE_FA.get(current['actor_type'], current['actor_type'])}\n"
             f"رتبه فعلی: {current['rank']}\n"
             f"تخفیف فعلی: {_percent(current['discount_bps'])}\n"
@@ -244,12 +276,16 @@ def begin_tier_edit(ctx: Any, actor_type: str, code: str, *,
             + EDIT_FORMAT
         )
         return render_page(
-            "✏️ ویرایش سطح", body, persona="admin", page_kind="form",
-            rows=[[button("بازگشت به فهرست سطوح", parent_callback or "v52:tiers")]],
+            "✏️ ویرایش سطح", body_html=_html_from_template(body),
+            persona="admin", page_kind="form",
+            rows=[[button("🏷 تعیین قیمت اختصاصی تعرفه‌ها برای این سطح",
+                          f"v52:tierprices:{current['actor_type']}:{current['tier_code']}")],
+                  [button("بازگشت به فهرست سطوح", parent_callback or "v52:tiers")]],
             parent_callback=parent_callback,
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
 
 
 def apply_tier_edit(ctx: Any, payload: Mapping[str, Any], value: Any, *,
@@ -284,22 +320,25 @@ def apply_tier_edit(ctx: Any, payload: Mapping[str, Any], value: Any, *,
         with _db() as conn:
             updated = service.update_tier(conn, actor_type, code, **fields)
             conn.commit()
-        return render_page(
-            "✅ سطح به‌روز شد",
-            f"{updated['title_fa']} — کد <code>{updated['tier_code']}</code>\n"
+        body = (
+            f"{updated['title_fa']} — کد {_code(updated['tier_code'])}\n"
             f"رتبه: {updated['rank']}\n"
             f"تخفیف تعرفه‌ها: {_percent(updated['discount_bps'])}\n"
             f"کش‌بک: {_percent(updated['cashback_bps'])}\n"
             f"سهمیه تست روزانه: {updated['daily_test_quota']}\n"
             f"سقف اعتبار پیش‌فرض: {updated['default_credit_limit']:,} تومان\n"
             f"حداقل فروش ماهانه: {updated['min_monthly_sales_toman']:,} تومان\n\n"
-            "تخفیف جدید از همین لحظه روی قیمت‌گذاری اعمال می‌شود.",
+            "تخفیف جدید از همین لحظه روی قیمت‌گذاری اعمال می‌شود."
+        )
+        return render_page(
+            "✅ سطح به‌روز شد", body_html=_html_from_template(body),
             persona="admin", page_kind="result",
             rows=[[button("بازگشت به فهرست سطوح", parent_callback or "v52:tiers")]],
             parent_callback=parent_callback,
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
 
 
 def delete_tier(ctx: Any, actor_type: str, code: str, *,
@@ -310,25 +349,200 @@ def delete_tier(ctx: Any, actor_type: str, code: str, *,
         with _db() as conn:
             result = _service().delete_tier(conn, actor_type, code)
             conn.commit()
+        body = (
+            f"سطح {_code(result['tier_code'])} برای نقش "
+            f"{_service().ACTOR_TYPE_FA.get(result['actor_type'], result['actor_type'])} حذف شد."
+        )
         return render_page(
-            "🗑 سطح حذف شد",
-            f"سطح <code>{result['tier_code']}</code> برای نقش "
-            f"{_service().ACTOR_TYPE_FA.get(result['actor_type'], result['actor_type'])} حذف شد.",
+            "🗑 سطح حذف شد", body_html=_html_from_template(body),
             persona="admin", page_kind="result",
             rows=[[button("بازگشت به فهرست سطوح", parent_callback or "v52:tiers")]],
             parent_callback=parent_callback,
         )
     except (TypeError, ValueError, PermissionError) as exc:
-        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
+
+
+# --------------------------------------------------------------------------- #
+# Tier-specific plan price matrix
+#
+# The tier's flat discount is one percentage for every plan. A negotiated rate is
+# not a percentage, so this page lists every plan with its base price, the price
+# the tier's discount produces and the effective price the checkout will charge —
+# all three resolved by :func:`pricing_service.resolve_tier_plan_price`, the same
+# resolver the buyer's menu and the intent guard use.
+# --------------------------------------------------------------------------- #
+
+TIER_PRICE_FORMAT = (
+    "قیمت اختصاصی این تعرفه برای این سطح را به تومان ارسال کنید.\n"
+    "مثال:\n"
+    "380000\n\n"
+    "• عدد صفر یعنی این تعرفه برای این سطح رایگان محاسبه شود.\n"
+    "• برای بازگرداندن تعرفه به تخفیف درصدی، از دکمهٔ «حذف قیمت اختصاصی» استفاده کنید."
+)
+
+
+def tier_price_matrix(ctx: Any, actor_type: str, code: str, *,
+                      parent_callback: str | None = "v52:tiers"):
+    """Every plan with this tier's base, discounted and effective price."""
+    try:
+        _require_root(ctx)
+        service = _service()
+        with _db() as conn:
+            tier = service.get_tier(conn, actor_type, code)
+            if tier is None:
+                raise ValueError("سطح موردنظر یافت نشد.")
+            matrix = service.tier_price_matrix(conn, tier["actor_type"], tier["tier_code"])
+            custom = {row["plan_code"]: row["custom_price_toman"]
+                      for row in service.list_tier_plan_prices(
+                          conn, tier["actor_type"], tier["tier_code"])}
+        lines = [
+            f"سطح: {tier['title_fa']} · نقش "
+            f"{service.ACTOR_TYPE_FA.get(tier['actor_type'], tier['actor_type'])}",
+            f"کد سطح: {_code(tier['tier_code'])}",
+            f"تخفیف پیش‌فرض این سطح: {_percent(tier['discount_bps'])}",
+            f"تعداد قیمت‌های اختصاصی ثبت‌شده: {len(custom)}",
+            "",
+            "قیمت اختصاصی بر تخفیف درصدی اولویت دارد. اگر برای تعرفه‌ای قیمت اختصاصی ثبت "
+            "نشود، همان تخفیف درصدی سطح روی قیمت پایه اعمال می‌شود. اعداد این صفحه همان "
+            "اعدادی است که خریدار در منو می‌بیند و کیف پولش از آن کسر می‌شود.",
+            "",
+        ]
+        rows = []
+        for row in matrix:
+            marker = "🏷" if row["is_custom_price"] else "•"
+            lines.append(
+                f"{marker} {row['plan_name']} — پایه {row['base_price']:,} ت | "
+                f"قیمت مؤثر این سطح {row['effective_price']:,} ت"
+                + ("" if not row["is_custom_price"]
+                   else f" (اختصاصی: {row['custom_price_toman']:,} ت)")
+            )
+            row_buttons = [button(
+                f"🏷 {row['plan_name']} · {row['effective_price']:,} ت"[:60],
+                f"v52:tierprice:{tier['actor_type']}:{tier['tier_code']}:{row['plan_code']}")]
+            if row["is_custom_price"]:
+                row_buttons.append(button(
+                    "🗑 حذف قیمت اختصاصی",
+                    f"v52:tierpriceclear:{tier['actor_type']}:{tier['tier_code']}:{row['plan_code']}"))
+            rows.append(row_buttons)
+        rows.append([button("✏️ ویرایش مشخصات سطح",
+                            f"v52:tier:edit:{tier['actor_type']}:{tier['tier_code']}")])
+        rows.append([button("بازگشت به فهرست سطوح", parent_callback or "v52:tiers")])
+        return render_page(
+            "🏷 قیمت اختصاصی تعرفه‌ها برای این سطح",
+            body_html=_html_from_template("\n".join(lines)),
+            persona="admin", rows=rows, parent_callback=parent_callback,
+        )
+    except (TypeError, ValueError, PermissionError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
+
+
+def begin_tier_plan_price(ctx: Any, actor_type: str, code: str, plan_code: str, *,
+                          parent_callback: str | None = "v52:tiers"):
+    """Arm the text input for one tier's fixed price on one plan."""
+    try:
+        _require_root(ctx)
+        if not _private(ctx):
+            raise PermissionError("تعیین قیمت اختصاصی فقط در پیوی مدیریت انجام می‌شود.")
+        import pricing_service
+        service = _service()
+        with _db() as conn:
+            tier = service.get_tier(conn, actor_type, code)
+            if tier is None:
+                raise ValueError("سطح موردنظر یافت نشد.")
+            resolved = pricing_service.resolve_tier_plan_price(
+                conn, role_scope=tier["actor_type"], tier_code=tier["tier_code"],
+                plan_code=plan_code)
+        import time
+        import v52_router
+        matrix_callback = f"v52:tierprices:{tier['actor_type']}:{tier['tier_code']}"
+        v52_router.DEFAULT_FSM.set(
+            ctx, "tier_plan_price",
+            payload={"actor_type": tier["actor_type"], "tier_code": tier["tier_code"],
+                     "plan_code": resolved["plan_code"]},
+            parent_callback=matrix_callback, now=int(time.time()))
+        body = (
+            f"سطح: {tier['title_fa']}\n"
+            f"تعرفه: {resolved['plan_name']}\n"
+            f"قیمت پایه: {resolved['base_price']:,} تومان\n"
+            f"قیمت مؤثر فعلی این سطح: {resolved['effective_price']:,} تومان\n"
+            + (f"قیمت اختصاصی فعلی: {resolved['custom_price_toman']:,} تومان\n"
+               if resolved["is_custom_price"] else
+               f"قیمت اختصاصی فعلی: ثبت نشده (تخفیف {_percent(resolved['discount_bps'])} اعمال می‌شود)\n")
+            + "\n" + TIER_PRICE_FORMAT
+        )
+        return render_page(
+            "🏷 تعیین قیمت اختصاصی تعرفه", body_html=_html_from_template(body),
+            persona="admin", page_kind="form",
+            rows=[[button("بازگشت به ماتریس قیمت", matrix_callback)]],
+            parent_callback=matrix_callback,
+        )
+    except (TypeError, ValueError, PermissionError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
+
+
+def apply_tier_plan_price(ctx: Any, payload: Mapping[str, Any], value: Any, *,
+                          parent_callback: str | None = "v52:tiers"):
+    """Persist one tier's fixed price for one plan."""
+    try:
+        _require_root(ctx)
+        service = _service()
+        actor_type = str((payload or {}).get("actor_type") or "").strip()
+        code = str((payload or {}).get("tier_code") or "").strip()
+        plan_code = str((payload or {}).get("plan_code") or "").strip()
+        price = service.parse_price_toman(value)
+        with _db() as conn:
+            result = service.set_tier_plan_price(
+                conn, actor_type, code, plan_code, price)
+            conn.commit()
+        matrix_callback = f"v52:tierprices:{result['actor_type']}:{result['tier_code']}"
+        body = (
+            f"تعرفه {_code(result['plan_code'])} برای سطح "
+            f"{_code(result['tier_code'])} با قیمت "
+            f"{result['custom_price_toman']:,} تومان ثبت شد.\n\n"
+            "این مبلغ از همین لحظه در پورتال کاربری و میزکار نمایندگی همان سطح اعمال می‌شود."
+        )
+        return render_page(
+            "✅ قیمت اختصاصی ثبت شد", body_html=_html_from_template(body),
+            persona="admin", page_kind="result",
+            rows=[[button("بازگشت به ماتریس قیمت", matrix_callback)]],
+            parent_callback=parent_callback,
+        )
+    except (TypeError, ValueError, PermissionError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
+
+
+def clear_tier_plan_price(ctx: Any, actor_type: str, code: str, plan_code: str, *,
+                          parent_callback: str | None = "v52:tiers"):
+    """Remove one tier's fixed price and return the plan to the discount ladder."""
+    try:
+        _require_root(ctx)
+        service = _service()
+        with _db() as conn:
+            service.clear_tier_plan_price(conn, actor_type, code, plan_code)
+            conn.commit()
+        return tier_price_matrix(ctx, actor_type, code, parent_callback=parent_callback)
+    except (TypeError, ValueError, PermissionError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback,
+                            body_html=_html_from_template(exc))
 
 
 __all__ = [
     "EDIT_FORMAT",
     "NEW_FORMAT",
+    "TIER_PRICE_FORMAT",
     "apply_tier_edit",
     "apply_tier_new",
+    "apply_tier_plan_price",
     "begin_tier_edit",
     "begin_tier_new",
+    "begin_tier_plan_price",
+    "clear_tier_plan_price",
     "delete_tier",
     "list_tiers",
+    "tier_price_matrix",
 ]

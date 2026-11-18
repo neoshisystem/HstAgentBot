@@ -317,3 +317,160 @@ def post_cashback(
     except Exception:
         _finish(conn, started, error=True)
         raise
+
+
+# --------------------------------------------------------------------------- #
+# Coupon catalogue administration
+#
+# ``hold_coupon``/``finalize_coupon`` spend a coupon; nothing could create, edit or
+# retire one, so the catalogue was whatever a migration left behind. These writers
+# are the missing half. Every reader resolves the coupon at call time, so an edit
+# here takes effect on the next order.
+# --------------------------------------------------------------------------- #
+
+COUPON_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$")
+MAX_COUPON_DISCOUNT_TOMAN = 10 ** 12
+MAX_COUPON_BUDGET_TOMAN = 10 ** 15
+MAX_COUPON_USES = 1_000_000
+MAX_COUPON_DAYS = 3650
+
+
+def _clean_coupon_code(value: Any) -> str:
+    code = str(value or "").strip().upper()
+    if not COUPON_CODE_RE.fullmatch(code):
+        raise PromotionError(
+            "کد کوپن باید ۳ تا ۳۲ نویسه و فقط شامل حروف لاتین، رقم، نقطه، خط تیره و زیرخط باشد."
+        )
+    return code
+
+
+def _clean_amount(value: Any, field_fa: str, maximum: int, *, minimum: int = 0) -> int:
+    if isinstance(value, bool):
+        raise PromotionError(f"{field_fa} باید یک عدد صحیح باشد.")
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise PromotionError(f"{field_fa} باید یک عدد صحیح باشد.") from exc
+    if number < minimum or number > maximum:
+        raise PromotionError(f"{field_fa} باید بین {minimum} و {maximum} باشد.")
+    return number
+
+
+def coupon_row(conn: sqlite3.Connection, code: Any) -> dict | None:
+    """One coupon row, or ``None``."""
+    row = conn.execute(
+        "SELECT code,issuer_key,discount_toman,budget_toman,used_toman,max_uses,"
+        "expires_at,is_active FROM coupons WHERE code=?",
+        (_clean_coupon_code(code),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "code": str(row[0]), "issuer_key": str(row[1]),
+        "discount_toman": int(row[2]), "budget_toman": int(row[3]),
+        "used_toman": int(row[4]), "max_uses": int(row[5]),
+        "expires_at": int(row[6]), "is_active": bool(row[7]),
+    }
+
+
+def list_coupons(conn: sqlite3.Connection) -> list[dict]:
+    """Every coupon with its live hold/use counters."""
+    rows = conn.execute(
+        "SELECT c.code,c.issuer_key,c.discount_toman,c.budget_toman,c.used_toman,"
+        "c.max_uses,c.expires_at,c.is_active,"
+        "(SELECT COUNT(*) FROM coupon_uses u WHERE u.code=c.code AND u.state='held') AS held_uses,"
+        "(SELECT COUNT(*) FROM coupon_uses u WHERE u.code=c.code AND u.state='used') AS used_uses "
+        "FROM coupons c ORDER BY c.is_active DESC,c.code"
+    ).fetchall()
+    return [
+        {
+            "code": str(row[0]), "issuer_key": str(row[1]),
+            "discount_toman": int(row[2]), "budget_toman": int(row[3]),
+            "used_toman": int(row[4]), "max_uses": int(row[5]),
+            "expires_at": int(row[6]), "is_active": bool(row[7]),
+            "held_uses": int(row[8]), "used_uses": int(row[9]),
+        }
+        for row in rows
+    ]
+
+
+def create_coupon(
+    conn: sqlite3.Connection, *, code: Any, discount_toman: Any, budget_toman: Any,
+    max_uses: Any, expires_at: Any, issuer_key: str = "root",
+) -> dict:
+    """Create one issuer-funded coupon; the code is unique and upper-case."""
+    selected = _clean_coupon_code(code)
+    if coupon_row(conn, selected) is not None:
+        raise PromotionError(f"کوپن «{selected}» از قبل وجود دارد.")
+    discount = _clean_amount(discount_toman, "مبلغ تخفیف", MAX_COUPON_DISCOUNT_TOMAN, minimum=1)
+    budget = _clean_amount(budget_toman, "سقف بودجه", MAX_COUPON_BUDGET_TOMAN, minimum=discount)
+    uses = _clean_amount(max_uses, "حداکثر تعداد استفاده", MAX_COUPON_USES, minimum=1)
+    expires = _clean_amount(expires_at, "زمان انقضا", 2 ** 53)
+    conn.execute(
+        "INSERT INTO coupons(code,issuer_key,discount_toman,budget_toman,used_toman,"
+        "max_uses,expires_at,is_active) VALUES(?,?,?,?,0,?,?,1)",
+        (selected, str(issuer_key or "root"), discount, budget, uses, expires),
+    )
+    return coupon_row(conn, selected)
+
+
+def update_coupon(conn: sqlite3.Connection, code: Any, **fields) -> dict:
+    """Edit one coupon in place; only the supplied fields change."""
+    selected = _clean_coupon_code(code)
+    if coupon_row(conn, selected) is None:
+        raise PromotionError(f"کوپن «{selected}» یافت نشد.")
+    assignments: list[str] = []
+    params: list[Any] = []
+    if fields.get("discount_toman") is not None:
+        assignments.append("discount_toman=?")
+        params.append(_clean_amount(fields["discount_toman"], "مبلغ تخفیف",
+                                    MAX_COUPON_DISCOUNT_TOMAN, minimum=1))
+    if fields.get("budget_toman") is not None:
+        assignments.append("budget_toman=?")
+        params.append(_clean_amount(fields["budget_toman"], "سقف بودجه",
+                                    MAX_COUPON_BUDGET_TOMAN, minimum=0))
+    if fields.get("max_uses") is not None:
+        assignments.append("max_uses=?")
+        params.append(_clean_amount(fields["max_uses"], "حداکثر تعداد استفاده",
+                                    MAX_COUPON_USES, minimum=1))
+    if fields.get("expires_at") is not None:
+        assignments.append("expires_at=?")
+        params.append(_clean_amount(fields["expires_at"], "زمان انقضا", 2 ** 53))
+    if fields.get("is_active") is not None:
+        assignments.append("is_active=?")
+        params.append(1 if fields["is_active"] else 0)
+    unknown = sorted(set(fields) - {"discount_toman", "budget_toman", "max_uses",
+                                    "expires_at", "is_active"})
+    if unknown:
+        raise PromotionError("فیلد ناشناخته: " + ", ".join(unknown))
+    if not assignments:
+        return coupon_row(conn, selected)
+    params.append(selected)
+    conn.execute(
+        "UPDATE coupons SET " + ",".join(assignments) + " WHERE code=?", params)
+    return coupon_row(conn, selected)
+
+
+def set_coupon_active(conn: sqlite3.Connection, code: Any, active: Any) -> dict:
+    """Enable or retire one coupon without deleting its spend history."""
+    return update_coupon(conn, code, is_active=bool(active))
+
+
+def delete_coupon(conn: sqlite3.Connection, code: Any) -> dict:
+    """Delete a coupon only while no order holds or has used it.
+
+    Removing a coupon that ``coupon_uses`` still references would either break the
+    foreign key or orphan a discount an order is relying on, so the guard turns
+    that into an explicit refusal instead of a silent data loss.
+    """
+    selected = _clean_coupon_code(code)
+    if coupon_row(conn, selected) is None:
+        raise PromotionError(f"کوپن «{selected}» یافت نشد.")
+    used = int(conn.execute(
+        "SELECT COUNT(*) FROM coupon_uses WHERE code=?", (selected,)).fetchone()[0])
+    if used:
+        raise PromotionError(
+            f"این کوپن در {used} سفارش استفاده یا رزرو شده است؛ به‌جای حذف آن را غیرفعال کنید."
+        )
+    conn.execute("DELETE FROM coupons WHERE code=?", (selected,))
+    return {"code": selected, "deleted": True}

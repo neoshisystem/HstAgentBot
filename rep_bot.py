@@ -1530,21 +1530,11 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         row = conn.execute("SELECT * FROM bank_cards WHERE id=?", (int(match.group(1)),)).fetchone()
                     page = finance_admin_ui.edit_bank_card(ctx, None if row is None else dict(row))
                 elif data == "v52:plans":
-                    from ui_v52 import render_page, button
-                    plans = database.get_pricing_plans(active_only=True)
-                    if not plans:
-                        page = render_page("تعرفه‌ها", "هیچ تعرفهٔ فعالی ثبت نشده است.",
-                                           persona="admin", parent_callback="v52:home:admin")
-                    else:
-                        rows = [[button(
-                            f"{item.get('name') or item['plan_code']} · "
-                            f"{float(item.get('gb') or 0):g}GB/{int(item.get('days') or 0)}d",
-                            f"v52:plan:{item['plan_code']}")] for item in plans]
-                        page = render_page(
-                            "تعرفه‌ها",
-                            f"تعداد تعرفه‌های فعال: {len(plans)}\n"
-                            "برای ویرایش، تعرفهٔ موردنظر را انتخاب کنید.",
-                            persona="admin", rows=rows)
+                    # Both ``v52:plans`` and ``admin:plans`` render this one hub, so
+                    # an operator can no longer edit half a tariff from one menu and
+                    # the other half from another.
+                    import finance_admin_ui
+                    page = finance_admin_ui.tariff_hub(ctx, parent_callback="v52:home:admin")
                 else:
                     match = re.fullmatch(r"v52:settle:([1-9][0-9]{0,17})", data)
                     if match:
@@ -1581,6 +1571,7 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                             f"نشانی: {url}\nاعتبارنامه: {'ثبت شده (محرمانه)' if has_secret else 'ثبت نشده'}")
                     page = render_page("جزئیات پنل", body, persona="admin", rows=[
                         [button("ویرایش اتصال", f"v52:panelconfig:{panel_id}")],
+                        [button("⚙️ تنظیمات پیشرفته پنل (ظرفیت، نام‌گذاری، تست، افزودنی)", f"v52:paneladv:{panel_id}")],
                         [button("🧪 آزمایش اتصال", f"v52:paneltest:{panel_id}")],
                         [button("⚡ تست اتصال و فعال‌سازی خودکار", f"v52:panelauto:{panel_id}")],
                         [button("🧩 انتخاب Inbound پیش‌فرض ساخت اکانت", f"v52:panelinbound:{panel_id}")],
@@ -2394,8 +2385,83 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 page = _v52_consume_confirmation(ctx, persona, str(params["nonce"]))
             elif name == "cancel_confirmation":
                 page = _v52_cancel_confirmation(ctx, persona, str(params["nonce"]))
-            elif name == "edit_plan":
-                page = _v52_edit_plan(ctx, persona, str(params["plan_code"]), confirm_all=False)
+            elif name == "plan_hub":
+                import finance_admin_ui
+                page = finance_admin_ui.tariff_hub(ctx)
+            elif name == "plan_detail":
+                import finance_admin_ui
+                page = finance_admin_ui.plan_detail(ctx, str(params["plan_code"]))
+            elif name == "plan_categories":
+                import finance_admin_ui
+                page = finance_admin_ui.plan_categories_page(ctx)
+            elif name == "begin_plan_category_new":
+                import finance_admin_ui
+                page = finance_admin_ui.begin_plan_category_new(ctx)
+            elif name == "begin_plan_category_edit":
+                import finance_admin_ui
+                page = finance_admin_ui.begin_plan_category_edit(ctx, str(params["category_key"]))
+            elif name == "delete_plan_category":
+                import finance_admin_ui
+                page = finance_admin_ui.delete_plan_category(ctx, str(params["category_key"]))
+            elif name == "toggle_plan_category":
+                import finance_admin_ui
+                page = finance_admin_ui.toggle_plan_category(
+                    ctx, str(params["plan_code"]), str(params["category_key"]))
+            elif name == "toggle_plan_panel":
+                import finance_admin_ui
+                page = finance_admin_ui.toggle_plan_panel(
+                    ctx, str(params["plan_code"]), int(params["panel_id"]))
+            elif name == "toggle_plan_audience":
+                import finance_admin_ui
+                page = finance_admin_ui.toggle_plan_audience(
+                    ctx, str(params["plan_code"]), str(params["audience"]))
+            elif name == "set_plan_kind":
+                import finance_admin_ui
+                page = finance_admin_ui.apply_plan_kind(
+                    ctx, str(params["plan_code"]), str(params["kind"]))
+            elif name == "tier_price_matrix":
+                import tier_admin_ui
+                page = tier_admin_ui.tier_price_matrix(
+                    ctx, str(params["actor_type"]), str(params["code"]))
+            elif name == "begin_tier_plan_price":
+                import tier_admin_ui
+                page = tier_admin_ui.begin_tier_plan_price(
+                    ctx, str(params["actor_type"]), str(params["code"]), str(params["plan_code"]))
+            elif name == "clear_tier_plan_price":
+                import tier_admin_ui
+                page = tier_admin_ui.clear_tier_plan_price(
+                    ctx, str(params["actor_type"]), str(params["code"]), str(params["plan_code"]))
+            elif name == "list_coupons":
+                import finance_admin_ui
+                page = finance_admin_ui.coupons_page(ctx)
+            elif name == "begin_coupon_new":
+                import finance_admin_ui
+                page = finance_admin_ui.begin_coupon_new(ctx)
+            elif name == "begin_coupon_edit":
+                import finance_admin_ui
+                page = finance_admin_ui.begin_coupon_edit(ctx, str(params["code"]))
+            elif name == "toggle_coupon":
+                import finance_admin_ui
+                page = finance_admin_ui.toggle_coupon(ctx, str(params["code"]))
+            elif name == "delete_coupon":
+                import finance_admin_ui
+                page = finance_admin_ui.delete_coupon(ctx, str(params["code"]))
+            elif name == "list_refunds":
+                import finance_admin_ui
+                page = finance_admin_ui.refunds_page(ctx)
+            elif name == "preview_order_refund":
+                import finance_admin_ui
+                page = finance_admin_ui.preview_order_refund(ctx, str(params["order_id"]))
+            elif name == "begin_refund_destination":
+                import finance_admin_ui
+                page = finance_admin_ui.begin_refund_destination(ctx, str(params["order_id"]))
+            elif name == "panel_advanced":
+                import panel_admin_ui
+                page = panel_admin_ui.panel_advanced_settings(ctx, int(params["panel_id"]))
+            elif name == "begin_panel_advanced":
+                import panel_admin_ui
+                page = panel_admin_ui.begin_panel_advanced(
+                    ctx, int(params["panel_id"]), str(params["field"]))
             elif name == "edit_plan_all_explicit":
                 page = _v52_edit_plan(ctx, persona, str(params["plan_code"]), confirm_all=True)
             elif name == "switch_persona":
@@ -2724,6 +2790,55 @@ async def _route_v52_fsm_text(update, context):
             page = tier_admin_ui.apply_tier_edit(
                 ctx, payload, text_value,
                 parent_callback=str(route.params.get("parent_callback") or "v52:tiers"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "tier_plan_price":
+            import tier_admin_ui
+            page = tier_admin_ui.apply_tier_plan_price(
+                ctx, payload, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:tiers"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "plan_category_new":
+            import finance_admin_ui
+            page = finance_admin_ui.apply_plan_category_new(
+                ctx, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:plancats"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "plan_category_edit":
+            import finance_admin_ui
+            page = finance_admin_ui.apply_plan_category_edit(
+                ctx, payload, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:plancats"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "coupon_new":
+            import finance_admin_ui
+            page = finance_admin_ui.apply_coupon_new(
+                ctx, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:coupons"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "coupon_edit":
+            import finance_admin_ui
+            page = finance_admin_ui.apply_coupon_edit(
+                ctx, payload, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:coupons"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "refund_destination":
+            import finance_admin_ui
+            page = finance_admin_ui.apply_refund_destination(
+                ctx, payload, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:refunds"))
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "panel_advanced":
+            import panel_admin_ui
+            page = panel_admin_ui.apply_panel_advanced(
+                ctx, payload, text_value,
+                parent_callback=str(route.params.get("parent_callback") or "v52:panels"))
             await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
             return True
         await message.reply_text(
@@ -6376,7 +6491,7 @@ async def _watchdog_cycle(application: Application, *, now: int | None = None) -
     trigger_gb = database.get_setting("reserve_trigger_gb", default=0.15, cast_type=float)
     pending = database.get_all_pending_reservations()
     result = {"read": 0, "triggered": 0, "activated": 0, "maintenance_skipped": 0,
-              "unknown": 0, "failed": 0}
+              "unknown": 0, "failed": 0, "expiry_warnings": 0}
     period = str(timestamp // 300)
 
     for reservation in pending:
@@ -6502,7 +6617,49 @@ async def _watchdog_cycle(application: Application, *, now: int | None = None) -
             result["unknown"] += 1
         else:
             result["failed"] += 1
+
+    # Expiring services receive one early warning per Tehran day. The claim lives in
+    # ``scheduled_jobs`` (kind ``expiry_warning``), so a restart cannot repeat a
+    # warning and a missed cycle is not lost. A delivery failure is logged and never
+    # retried against the same claim, because a duplicate warning is worse than a
+    # missing one for a customer who has already been told.
+    try:
+        with database.get_db() as conn:
+            warnings = scheduler_service.due_expiry_warnings(conn, now=timestamp)
+        result["expiry_warnings"] = len(warnings)
+        for warning in warnings:
+            await _notify_expiry_warning(application, warning)
+    except Exception:
+        logger.exception("Watchdog expiry-warning sweep failed")
     return result
+
+
+async def _notify_expiry_warning(application: Application, warning: dict) -> None:
+    """Deliver one early expiry warning to the service owner and to the admin log."""
+    days_left = int(warning.get("days_left") or 0)
+    when = "امروز" if days_left <= 0 else f"تا {days_left} روز دیگر"
+    label = warning.get("account_code") or warning.get("email") or warning.get("account_id")
+    body = (
+        f"⏳ **هشدار نزدیک شدن پایان اعتبار سرویس:**\n\n"
+        f"• کد سرویس: {label}\n"
+        f"• اعتبار: {when}\n\n"
+        "برای جلوگیری از قطعی سرویس، از منوی «📱 سرویس‌های من» آن را تمدید کنید."
+    )
+    owner = warning.get("owner_tg_id")
+    if owner:
+        try:
+            await application.bot.send_message(
+                chat_id=int(owner), text=body, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            logger.exception(
+                "Expiry warning delivery failed for account %s", warning.get("account_id"))
+    try:
+        await asyncio.to_thread(
+            send_admin_log,
+            f"⏳ هشدار انقضای سرویس {label} ارسال شد (تا {days_left} روز).")
+    except Exception:
+        logger.exception("Expiry warning admin log failed for account %s",
+                         warning.get("account_id"))
 
 
 async def watchdog_worker(application: Application):

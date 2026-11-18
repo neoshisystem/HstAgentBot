@@ -360,6 +360,11 @@ def activate_domain(
         ).rowcount
         if changed != 1:
             raise DomainError("domain state changed during activation")
+        # The panel this domain was registered for now serves its subscription
+        # links from this host; writing it here is what makes the domain live.
+        linked_panel = _row_value(row, "panel_id")
+        if linked_panel is not None:
+            sync_panel_sub_base_url(conn, int(linked_panel))
         return DomainResult(int(row["domain_id"]), int(row["rep_id"]), str(row["hostname"]),
                             str(row["challenge"]), "active", row["verified_at"], timestamp)
 
@@ -382,6 +387,10 @@ def disable_domain(
         )
         conn.execute("UPDATE sub_domains SET status='disabled' WHERE domain_id=? AND status='active'",
                      (int(domain_id),))
+        linked_panel = _row_value(row, "panel_id")
+        if linked_panel is not None:
+            _release_panel_host(conn, int(linked_panel), str(row["hostname"]))
+            sync_panel_sub_base_url(conn, int(linked_panel))
         return DomainResult(int(row["domain_id"]), int(row["rep_id"]), str(row["hostname"]),
                             str(row["challenge"]), "disabled", row["verified_at"], row["tls_checked_at"])
 
@@ -420,6 +429,11 @@ def set_domain_status(
         ).rowcount
         if changed != 1:
             raise DomainError("domain state changed during update")
+        linked_panel = _row_value(row, "panel_id")
+        if linked_panel is not None:
+            if target != "active":
+                _release_panel_host(conn, int(linked_panel), str(row["hostname"]))
+            sync_panel_sub_base_url(conn, int(linked_panel))
         return DomainResult(int(row["domain_id"]), int(row["rep_id"]), str(row["hostname"]),
                             str(row["challenge"]), target, row["verified_at"], row["tls_checked_at"])
 
@@ -450,8 +464,139 @@ def delete_domain(
         ).rowcount
         if changed != 1:
             raise DomainError("domain state changed during deletion")
+        linked_panel = _row_value(row, "panel_id")
+        if linked_panel is not None:
+            _release_panel_host(conn, int(linked_panel), str(row["hostname"]))
+            sync_panel_sub_base_url(conn, int(linked_panel))
         return DomainResult(int(row["domain_id"]), int(row["rep_id"]), str(row["hostname"]),
                             str(row["challenge"]), "deleted", row["verified_at"], row["tls_checked_at"])
+
+
+# --------------------------------------------------------------------------- #
+# Domain -> panel subscription link
+#
+# ``sub_manager`` builds a subscription URL from ``panels.sub_base_url``, but
+# nothing connected a verified subscription domain to that column: an operator who
+# registered and activated a domain for a panel still had to type the same host
+# into the panel's own field, and the two could drift apart. The resolver below is
+# the single place that decides which host a panel's subscription links use, and
+# the sync writes that decision back into the column ``sub_manager`` already reads.
+# --------------------------------------------------------------------------- #
+
+def panel_subscription_base(
+    conn: sqlite3.Connection, panel_id: Any, *, panel_row: Any = None,
+) -> str:
+    """The subscription base URL for one panel.
+
+    Resolution order, highest priority first:
+
+    1. the panel's active primary ``subscription`` domain;
+    2. any other active ``subscription`` domain bound to the same panel;
+    3. ``panels.sub_base_url`` as the operator typed it;
+    4. ``config.SUB_DOMAIN`` as the installation-wide fallback.
+
+    An empty string means no host is configured anywhere, which the callers render
+    as «دامنهٔ اشتراک تنظیم نشده» rather than as a broken link.
+    """
+    if isinstance(panel_id, bool):
+        raise DomainError("panel_id must be a positive integer")
+    try:
+        selected = int(panel_id)
+    except (TypeError, ValueError) as exc:
+        raise DomainError("panel_id must be a positive integer") from exc
+    if selected <= 0:
+        raise DomainError("panel_id must be a positive integer")
+    if _table_exists(conn, "sub_domains"):
+        row = conn.execute(
+            "SELECT hostname FROM sub_domains "
+            "WHERE panel_id=? AND status='active' AND role='subscription' "
+            "ORDER BY is_primary DESC, domain_id LIMIT 1",
+            (selected,),
+        ).fetchone()
+        if row is not None:
+            host = str(row[0] or "").strip()
+            if host:
+                return f"https://{host}"
+    panel = panel_row
+    if panel is None:
+        panel = conn.execute(
+            "SELECT sub_base_url FROM panels WHERE id=?", (selected,)).fetchone()
+    if panel is not None:
+        stored = str(
+            panel["sub_base_url"] if hasattr(panel, "keys") else panel[0] or ""
+        ).strip()
+        if stored:
+            return stored
+    import config
+    fallback = str(getattr(config, "SUB_DOMAIN", "") or "").strip()
+    if not fallback:
+        return ""
+    port = int(getattr(config, "SUB_PORT", 443) or 443)
+    port_part = "" if port == 443 else f":{port}"
+    return f"https://{fallback}{port_part}"
+
+
+def sync_panel_sub_base_url(conn: sqlite3.Connection, panel_id: Any) -> str:
+    """Write the resolved subscription base back into ``panels.sub_base_url``.
+
+    Returns the value now stored. A panel whose resolved base already matches is
+    left untouched, so an unrelated domain edit never bumps the panel revision.
+    """
+    if isinstance(panel_id, bool):
+        raise DomainError("panel_id must be a positive integer")
+    try:
+        selected = int(panel_id)
+    except (TypeError, ValueError) as exc:
+        raise DomainError("panel_id must be a positive integer") from exc
+    if selected <= 0:
+        raise DomainError("panel_id must be a positive integer")
+    row = conn.execute(
+        "SELECT sub_base_url FROM panels WHERE id=?", (selected,)).fetchone()
+    if row is None:
+        return ""
+    resolved = panel_subscription_base(conn, selected, panel_row=row)
+    if str(row[0] or "").strip() == resolved:
+        return resolved
+    conn.execute(
+        "UPDATE panels SET sub_base_url=?, revision=revision+1 WHERE id=?",
+        (resolved, selected),
+    )
+    return resolved
+
+
+def _row_value(row: Any, key: str, default=None):
+    """Read one column from a ``sqlite3.Row`` even when the column is absent."""
+    try:
+        keys = row.keys()
+    except AttributeError:
+        return default
+    return row[key] if key in keys else default
+
+
+def _release_panel_host(conn: sqlite3.Connection, panel_id: Any, hostname: str) -> None:
+    """Clear a panel column that still points at a domain which is no longer active.
+
+    Without this, disabling or deleting the only active subscription domain would
+    leave the panel's own column holding that same host, and the resolver's
+    «operator typed it» fallback would keep handing out a link to a host the
+    operator just retired.
+    """
+    if panel_id is None:
+        return
+    try:
+        selected = int(panel_id)
+    except (TypeError, ValueError):
+        return
+    row = conn.execute(
+        "SELECT sub_base_url FROM panels WHERE id=?", (selected,)).fetchone()
+    if row is None:
+        return
+    current = str(row[0] or "").strip().rstrip("/").lower()
+    if current and current == f"https://{str(hostname).strip()}".rstrip("/").lower():
+        conn.execute(
+            "UPDATE panels SET sub_base_url='', revision=revision+1 WHERE id=?",
+            (selected,),
+        )
 
 
 def resolve_profile_host(
@@ -489,7 +634,49 @@ def active_domain_rep(conn: sqlite3.Connection, host: str) -> int | None:
     return int(row["rep_id"]) if row else None
 
 
+def set_primary_domain(
+    conn: sqlite3.Connection, actor_tg_id: int, domain_id: int,
+) -> DomainResult:
+    """Promote one live domain to its representative's primary host.
+
+    ``register_domain`` could set ``is_primary`` only at creation time, so an
+    operator who later wanted a different host to front the panel had to delete and
+    re-register it. The promotion demotes the previous primary in the same
+    transaction — the partial unique index ``ux_primary_rep_domain`` would otherwise
+    reject the write — and then re-syncs the linked panel's subscription base.
+    """
+    ensure_domain_columns(conn)
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM sub_domains WHERE domain_id=?", (int(domain_id),)
+        ).fetchone()
+        if row is None:
+            raise DomainError("domain does not exist")
+        if str(row["status"]) != "active":
+            raise DomainError("only an active domain can become the primary host")
+        _require_owner(conn, actor_tg_id, int(row["rep_id"]))
+        if int(_row_value(row, "is_primary", 0) or 0) == 1:
+            return DomainResult(int(row["domain_id"]), int(row["rep_id"]),
+                                str(row["hostname"]), str(row["challenge"]), "active",
+                                row["verified_at"], row["tls_checked_at"])
+        conn.execute(
+            "UPDATE sub_domains SET is_primary=0 WHERE rep_id=? AND is_primary=1",
+            (int(row["rep_id"]),),
+        )
+        conn.execute(
+            "UPDATE sub_domains SET is_primary=1 WHERE domain_id=?", (int(domain_id),))
+        linked_panel = _row_value(row, "panel_id")
+        if linked_panel is not None:
+            sync_panel_sub_base_url(conn, int(linked_panel))
+        return DomainResult(int(row["domain_id"]), int(row["rep_id"]),
+                            str(row["hostname"]), str(row["challenge"]), "active",
+                            row["verified_at"], row["tls_checked_at"])
+
+
 __all__ = ["DomainError", "DomainPermissionError", "DomainProofError", "DomainResult",
            "normalize_hostname", "ensure_domain_columns", "register_domain", "verify_domain",
            "activate_domain", "disable_domain", "set_domain_status", "delete_domain",
+           "set_primary_domain", "panel_subscription_base", "sync_panel_sub_base_url",
            "resolve_profile_host", "active_domain_rep"]

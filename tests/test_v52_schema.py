@@ -12,6 +12,9 @@ from migrations_runner import apply_migrations
 
 
 def _helpers(root, tmp_path, monkeypatch):
+    # These tests exercise migrations explicitly against a legacy schema. Keep
+    # init_db() from consuming them first when the caller's shell enables them.
+    monkeypatch.delenv("V52_MIGRATIONS_ENABLED", raising=False)
     spec = importlib.util.spec_from_file_location(
         "_hstagentbot_v52_schema_helpers", Path(__file__).with_name("v52_helpers.py")
     )
@@ -367,7 +370,11 @@ def test_migration_004_plans(tmp_path, monkeypatch):
         assert apply_migrations(conn,migration_dir,now=1794203600)==["004_plans"]
         assert [r[1] for r in conn.execute("PRAGMA table_info(pricing_plans)")] == [
             "plan_code","name","gb","days","rep_price","user_price","is_quick","sort_order",
-            "is_active","panel_scope","sale_status","first_purchase_only","revision"
+            "is_active",
+            # ``init_db`` extends ``pricing_plans`` with the v5.2 catalogue columns
+            # before any migration runs, because the migration count is frozen at 18.
+            "category_key","plan_kind","for_end_users","for_reps",
+            "panel_scope","sale_status","first_purchase_only","revision"
         ]
         plans_after=conn.execute(
             "SELECT plan_code,name,gb,days,rep_price,user_price,is_quick,sort_order,is_active,"
@@ -394,9 +401,12 @@ def test_migration_004_plans(tmp_path, monkeypatch):
             conn.execute("INSERT INTO plan_panels(plan_code,panel_id,allowed) VALUES ('W02-PLAN-A',71,2)")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("INSERT INTO plan_panels(plan_code,panel_id,allowed) VALUES ('W02-PLAN-A',999,1)")
+        # ``init_db`` now seeds ``rep/silver`` as part of the staging tier ladder, so
+        # this row uses its own code: the assertion is that a valid row is accepted,
+        # not that the seeded catalogue is empty.
         conn.execute(
             "INSERT INTO tier_policies(actor_type,tier_code,title_fa,rank,discount_bps,cashback_bps) "
-            "VALUES ('rep','silver','silver',2,1250,250)"
+            "VALUES ('rep','w02-silver','silver',2,1250,250)"
         )
         for actor_type in ("admin","representative"):
             with pytest.raises(sqlite3.IntegrityError):

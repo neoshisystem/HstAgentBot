@@ -551,7 +551,128 @@ def delete_tier(conn, actor_type: Any, tier_code: Any) -> dict[str, Any]:
         )
     conn.execute(
         "DELETE FROM tier_policies WHERE actor_type=? AND tier_code=?", (actor, code))
+    conn.execute(
+        "DELETE FROM tier_plan_prices WHERE role_scope=? AND tier_key=?", (actor, code))
     return {"actor_type": actor, "tier_code": code, "deleted": True}
+
+
+# --------------------------------------------------------------------------- #
+# Tier-specific plan price matrix
+#
+# ``tier_policies.discount_bps`` is one flat percentage for every plan. A
+# negotiated wholesale rate is not a percentage — it is "this plan costs exactly
+# X for this tier" — so ``tier_plan_prices`` holds those fixed prices, keyed by
+# ``(tier_key, role_scope, plan_code)``. The matrix below is what the tier detail
+# page renders, and it resolves every number through
+# :func:`pricing_service.resolve_tier_plan_price` so the page can never disagree
+# with the price the checkout actually charges.
+# --------------------------------------------------------------------------- #
+
+MAX_PLAN_PRICE_TOMAN = 10 ** 12
+
+
+def parse_price_toman(value: Any, label: str = "قیمت اختصاصی") -> int:
+    """Validate one operator-typed toman amount, with a Persian message."""
+    if isinstance(value, bool):
+        raise TierServiceError(f"{label} باید یک عدد صحیح نامنفی باشد.")
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise TierServiceError(f"{label} باید یک عدد صحیح نامنفی باشد.") from exc
+    if number < 0:
+        raise TierServiceError(f"{label} نمی‌تواند منفی باشد.")
+    if number > MAX_PLAN_PRICE_TOMAN:
+        raise TierServiceError(f"{label} بیش از حد بزرگ است.")
+    return number
+
+
+def _require_tier(conn, actor_type: Any, tier_code: Any) -> tuple[str, str]:
+    actor = _clean_actor_type(actor_type)
+    code = _clean_tier_code(tier_code)
+    if get_tier(conn, actor, code) is None:
+        raise TierServiceError(f"سطح «{code}» برای این نقش یافت نشد.")
+    return actor, code
+
+
+def get_tier_plan_price(conn, actor_type: Any, tier_code: Any, plan_code: Any):
+    """The tier's fixed price for one plan, or ``None`` when it has none."""
+    actor, code = _require_tier(conn, actor_type, tier_code)
+    row = conn.execute(
+        "SELECT custom_price_toman FROM tier_plan_prices "
+        "WHERE tier_key=? AND role_scope=? AND plan_code=?",
+        (code, actor, str(plan_code or "").strip()),
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
+def list_tier_plan_prices(conn, actor_type: Any, tier_code: Any) -> list[dict[str, Any]]:
+    """Every fixed tier price stored for this tier."""
+    actor, code = _require_tier(conn, actor_type, tier_code)
+    rows = conn.execute(
+        "SELECT plan_code,custom_price_toman,updated_at FROM tier_plan_prices "
+        "WHERE tier_key=? AND role_scope=? ORDER BY plan_code",
+        (code, actor),
+    ).fetchall()
+    return [{"plan_code": str(row[0]), "custom_price_toman": int(row[1]),
+             "updated_at": int(row[2] or 0)} for row in rows]
+
+
+def tier_price_matrix(conn, actor_type: Any, tier_code: Any) -> list[dict[str, Any]]:
+    """Every plan with this tier's base, discount-derived and effective price.
+
+    The rows come from :func:`pricing_service.resolve_tier_plan_price`, which is
+    the same resolver the checkout uses, so what the operator reads here is exactly
+    what the tier will be charged.
+    """
+    import pricing_service
+    actor, code = _require_tier(conn, actor_type, tier_code)
+    plans = conn.execute(
+        "SELECT plan_code FROM pricing_plans ORDER BY sort_order,plan_code").fetchall()
+    matrix: list[dict[str, Any]] = []
+    for row in plans:
+        resolved = pricing_service.resolve_tier_plan_price(
+            conn, role_scope=actor, tier_code=code, plan_code=str(row[0]))
+        matrix.append(resolved)
+    return matrix
+
+
+def set_tier_plan_price(
+    conn, actor_type: Any, tier_code: Any, plan_code: Any, custom_price_toman: Any,
+    *, now: int | None = None,
+) -> dict[str, Any]:
+    """Store one fixed tier price for one plan, replacing any previous value."""
+    actor, code = _require_tier(conn, actor_type, tier_code)
+    plan = str(plan_code or "").strip()
+    if not plan:
+        raise TierServiceError("کد تعرفه نمی‌تواند خالی باشد.")
+    if conn.execute(
+        "SELECT 1 FROM pricing_plans WHERE plan_code=?", (plan,)
+    ).fetchone() is None:
+        raise TierServiceError("تعرفهٔ موردنظر یافت نشد.")
+    price = parse_price_toman(custom_price_toman)
+    conn.execute(
+        "INSERT INTO tier_plan_prices(tier_key,role_scope,plan_code,custom_price_toman,"
+        "updated_at) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(tier_key,role_scope,plan_code) DO UPDATE SET "
+        "custom_price_toman=excluded.custom_price_toman,updated_at=excluded.updated_at",
+        (code, actor, plan, price, _timestamp(now)),
+    )
+    return {"actor_type": actor, "tier_code": code, "plan_code": plan,
+            "custom_price_toman": price}
+
+
+def clear_tier_plan_price(
+    conn, actor_type: Any, tier_code: Any, plan_code: Any,
+) -> dict[str, Any]:
+    """Remove one fixed tier price, returning the plan to the discount ladder."""
+    actor, code = _require_tier(conn, actor_type, tier_code)
+    plan = str(plan_code or "").strip()
+    cursor = conn.execute(
+        "DELETE FROM tier_plan_prices WHERE tier_key=? AND role_scope=? AND plan_code=?",
+        (code, actor, plan),
+    )
+    return {"actor_type": actor, "tier_code": code, "plan_code": plan,
+            "cleared": cursor.rowcount == 1}
 
 
 __all__ = [
@@ -560,21 +681,28 @@ __all__ = [
     "BPS_PER_PERCENT",
     "DailyTestQuotaExceeded",
     "MAX_BPS",
+    "MAX_PLAN_PRICE_TOMAN",
     "MAX_TIER_TITLE",
     "TEHRAN",
     "TIER_CODE_RE",
     "TierPolicyConflict",
     "TierPolicyUnavailable",
     "TierServiceError",
+    "clear_tier_plan_price",
     "create_tier",
     "delete_tier",
     "finish_test_quota",
     "get_tier",
+    "get_tier_plan_price",
     "is_first_purchase",
+    "list_tier_plan_prices",
     "list_tiers",
     "parse_int",
     "parse_percent_bps",
+    "parse_price_toman",
     "reserve_test_quota",
+    "set_tier_plan_price",
+    "tier_price_matrix",
     "tier_usage",
     "update_tier",
 ]

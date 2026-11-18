@@ -18,6 +18,30 @@ _ID = re.compile(r"^[1-9][0-9]{0,17}$")
 _SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
 _NONCE = re.compile(r"^[A-Za-z0-9_-]{16,40}$")
 
+#: Draft states that accept a plain text answer. The registry lives in one place
+#: because ``DraftFSM.set`` and ``DraftFSM.consume`` must agree exactly: a state
+#: accepted by one and not the other silently swallows the operator's answer.
+TEXT_STATES: frozenset[str] = frozenset({
+    "goods_manual_secret", "support_ticket_body", "support_reply",
+    "panel_connection_url", "panel_connection_token",
+    "inventory_manual_batch", "inventory_digital_batch",
+    "ownership_transfer", "goods_product_draft",
+    "goods_product_price", "goods_product_guide",
+    "panel_connection_name",
+    "ticket_status_new", "ticket_status_edit",
+    "tier_new", "tier_edit",
+    "domain_hostname",
+    # S57: plan-category administration, the tier price matrix, coupons and the
+    # admin-initiated refund destination.
+    "plan_category_new", "plan_category_edit",
+    "tier_plan_price", "refund_destination",
+    "coupon_new", "coupon_edit",
+    "panel_advanced",
+})
+
+#: Draft states that also accept a photo attachment.
+PHOTO_STATES: frozenset[str] = frozenset({"support_ticket_body", "support_reply"})
+
 
 @dataclass(frozen=True)
 class Route:
@@ -81,6 +105,10 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:panelcred:([1-9][0-9]{0,17})$"), "begin_panel_credential", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:panelnew:(test|confirm)$"), "confirm_panel_draft", "root", lambda m: {"step": m[1]}),
     (re.compile(r"^v52:panelpolicy:([1-9][0-9]{0,17})$"), "preview_panel_policy", "root", lambda m: {"panel_id": int(m[1])}),
+    # S57 advanced panel settings: capacity, naming, subscription host, test
+    # account and add-on prices, all of which already exist as ``panels`` columns.
+    (re.compile(r"^v52:paneladv:([1-9][0-9]{0,17})$"), "panel_advanced", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:paneladvset:([1-9][0-9]{0,17}):(capacity|naming|suburl|test|addons)$"), "begin_panel_advanced", "root DM", lambda m: {"panel_id": int(m[1]), "field": m[2]}),
     (re.compile(r"^v52:panelinbound:([1-9][0-9]{0,17})$"), "choose_panel_inbound", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:panelsetinbound:([1-9][0-9]{0,17}):([1-9][0-9]{0,17})$"), "set_panel_inbound", "root", lambda m: {"panel_id": int(m[1]), "inbound_id": int(m[2])}),
     (re.compile(r"^v52:bots$"), "list_bots", "root", lambda m: {}),
@@ -102,7 +130,7 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:domaindel:([1-9][0-9]{0,17})$"), "preview_domain_delete", "owner/root", lambda m: {"domain_id": int(m[1])}),
     (re.compile(r"^v52:domaindelok:([1-9][0-9]{0,17})$"), "confirm_domain_delete", "owner/root", lambda m: {"domain_id": int(m[1])}),
     (re.compile(r"^v52:cards$"), "list_cards", "root", lambda m: {}),
-    (re.compile(r"^v52:plans$"), "list_plans", "root", lambda m: {}),
+    (re.compile(r"^v52:plans$"), "plan_hub", "root", lambda m: {}),
     (re.compile(r"^v52:finance$"), "show_finance", "root", lambda m: {}),
     (re.compile(r"^v52:orders$"), "list_orders", "actor", lambda m: {}),
     (re.compile(r"^v52:account:([1-9][0-9]{0,17})$"), "open_account_profiles", "view_config", lambda m: {"account_id": int(m[1])}),
@@ -112,7 +140,7 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:life-confirm:([1-9][0-9]{0,17}):(active|sold_out|hidden|drain|maintenance)$"), "confirm_lifecycle", "root", lambda m: {"panel_id": int(m[1]), "lifecycle": m[2]}),
     (re.compile(r"^v52:buy:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "preview_buy", "seller route", lambda m: {"plan_code": m[1]}),
     (re.compile(r"^v52:plan:([A-Za-z0-9][A-Za-z0-9._-]{0,47}):all_explicit$"), "edit_plan_all_explicit", "root", lambda m: {"plan_code": m[1]}),
-    (re.compile(r"^v52:plan:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "edit_plan", "root", lambda m: {"plan_code": m[1]}),
+    (re.compile(r"^v52:plan:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "plan_detail", "root", lambda m: {"plan_code": m[1]}),
     (re.compile(r"^v52:persona:(admin|rep|user)$"), "switch_persona", "actor", lambda m: {"persona": m[1]}),
     (re.compile(r"^v52:renew:([1-9][0-9]{0,17}):([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "preview_renew", "manager/owner/seller/root", lambda m: {"account_id": int(m[1]), "plan_code": m[2]}),
     (re.compile(r"^v52:addon:([1-9][0-9]{0,17}):(gib|day)$"), "begin_addon", "owner/seller/root", lambda m: {"account_id": int(m[1]), "addon_type": m[2]}),
@@ -147,6 +175,32 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:tier:new$"), "begin_tier_new", "root DM", lambda m: {}),
     (re.compile(r"^v52:tier:edit:(rep|end_user):([a-z][a-z0-9_]{1,29})$"), "begin_tier_edit", "root DM", lambda m: {"actor_type": m[1], "code": m[2]}),
     (re.compile(r"^v52:tier:del:(rep|end_user):([a-z][a-z0-9_]{1,29})$"), "delete_tier", "root", lambda m: {"actor_type": m[1], "code": m[2]}),
+    # --- S57: unified tariff & category centre ------------------------------ #
+    # ``v52:plans`` and ``admin:plans`` both render the same hub; the plan card
+    # carries the multi-select checkboxes for categories, panels, audience and
+    # tariff kind. ``v52:plan:<code>`` is repointed from the old preview to that
+    # card, and the explicit all-panels confirmation keeps its own route.
+    (re.compile(r"^v52:plancats$"), "plan_categories", "root", lambda m: {}),
+    (re.compile(r"^v52:plancatnew$"), "begin_plan_category_new", "root DM", lambda m: {}),
+    (re.compile(r"^v52:plancatedit:([a-z][a-z0-9_]{1,29})$"), "begin_plan_category_edit", "root DM", lambda m: {"category_key": m[1]}),
+    (re.compile(r"^v52:plancatdel:([a-z][a-z0-9_]{1,29})$"), "delete_plan_category", "root", lambda m: {"category_key": m[1]}),
+    (re.compile(r"^v52:pc:([A-Za-z0-9][A-Za-z0-9._-]{0,47}):([a-z][a-z0-9_]{1,29})$"), "toggle_plan_category", "root", lambda m: {"plan_code": m[1], "category_key": m[2]}),
+    (re.compile(r"^v52:pp:([A-Za-z0-9][A-Za-z0-9._-]{0,47}):([1-9][0-9]{0,17})$"), "toggle_plan_panel", "root", lambda m: {"plan_code": m[1], "panel_id": int(m[2])}),
+    (re.compile(r"^v52:pa:([A-Za-z0-9][A-Za-z0-9._-]{0,47}):(end_user|rep)$"), "toggle_plan_audience", "root", lambda m: {"plan_code": m[1], "audience": m[2]}),
+    (re.compile(r"^v52:pk:([A-Za-z0-9][A-Za-z0-9._-]{0,47}):(fixed|unlimited|custom)$"), "set_plan_kind", "root", lambda m: {"plan_code": m[1], "kind": m[2]}),
+    # --- S57: tier-specific plan price matrix ------------------------------- #
+    (re.compile(r"^v52:tierprices:(rep|end_user):([a-z][a-z0-9_]{1,29})$"), "tier_price_matrix", "root", lambda m: {"actor_type": m[1], "code": m[2]}),
+    (re.compile(r"^v52:tierprice:(rep|end_user):([a-z][a-z0-9_]{1,29}):([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "begin_tier_plan_price", "root DM", lambda m: {"actor_type": m[1], "code": m[2], "plan_code": m[3]}),
+    (re.compile(r"^v52:tierpriceclear:(rep|end_user):([a-z][a-z0-9_]{1,29}):([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "clear_tier_plan_price", "root", lambda m: {"actor_type": m[1], "code": m[2], "plan_code": m[3]}),
+    # --- S57: coupons and admin refunds ------------------------------------- #
+    (re.compile(r"^v52:coupons$"), "list_coupons", "root", lambda m: {}),
+    (re.compile(r"^v52:couponnew$"), "begin_coupon_new", "root DM", lambda m: {}),
+    (re.compile(r"^v52:couponedit:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "begin_coupon_edit", "root DM", lambda m: {"code": m[1]}),
+    (re.compile(r"^v52:coupontoggle:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "toggle_coupon", "root", lambda m: {"code": m[1]}),
+    (re.compile(r"^v52:coupondel:([A-Za-z0-9][A-Za-z0-9._-]{0,47})$"), "delete_coupon", "root", lambda m: {"code": m[1]}),
+    (re.compile(r"^v52:refunds$"), "list_refunds", "root", lambda m: {}),
+    (re.compile(r"^v52:refundorder:([A-Za-z0-9._:-]{1,36})$"), "preview_order_refund", "root", lambda m: {"order_id": m[1]}),
+    (re.compile(r"^v52:refundstart:([A-Za-z0-9._:-]{1,36})$"), "begin_refund_destination", "root DM", lambda m: {"order_id": m[1]}),
     (re.compile(r"^v52:tickets:(open|answered|closed|all)$"), "list_tickets", "actor", lambda m: {"group": m[1]}),
     (re.compile(r"^v52:newticket$"), "begin_new_ticket", "actor", lambda m: {}),
     (re.compile(r"^v52:support:([0-9]{1,18})$"), "begin_ticket", "view authorized", lambda m: {"account_id": int(m[1])}),
@@ -222,15 +276,7 @@ class DraftFSM:
             parent_callback: str | None = None, now: int) -> FSMEntry:
         bot_id, tg_id, chat_id = _identity(context)
         selected = str(state or "")
-        if selected not in {"goods_manual_secret", "support_ticket_body", "support_reply",
-                            "panel_connection_url", "panel_connection_token",
-                            "inventory_manual_batch", "inventory_digital_batch",
-                            "ownership_transfer", "goods_product_draft",
-                            "goods_product_price", "goods_product_guide",
-                            "panel_connection_name",
-                            "ticket_status_new", "ticket_status_edit",
-                            "tier_new", "tier_edit",
-                            "domain_hostname"}:
+        if selected not in TEXT_STATES:
             raise ValueError("unknown v5.2 FSM state")
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:
             raise ValueError("now must be non-negative epoch seconds")
@@ -253,16 +299,7 @@ class DraftFSM:
         entry = self.peek(context, now=now)
         if entry is None:
             return None
-        accepted = {"text": {"goods_manual_secret", "support_ticket_body", "support_reply",
-                             "panel_connection_url", "panel_connection_token",
-                             "inventory_manual_batch", "inventory_digital_batch",
-                             "ownership_transfer", "goods_product_draft",
-                             "goods_product_price", "goods_product_guide",
-                             "panel_connection_name",
-                             "ticket_status_new", "ticket_status_edit",
-                             "tier_new", "tier_edit",
-                             "domain_hostname"},
-                    "photo": {"support_ticket_body", "support_reply"}}
+        accepted = {"text": TEXT_STATES, "photo": PHOTO_STATES}
         if event not in accepted or entry.state not in accepted[event]:
             return None
         self._entries.pop((entry.bot_id, entry.telegram_id, entry.chat_id), None)
@@ -297,4 +334,5 @@ def route_photo(context: Any, file_id: str, *, now: int, fsm: DraftFSM = DEFAULT
                                            "parent_callback": entry.parent_callback}, "fsm")
 
 
-__all__ = ["Route", "FSMEntry", "DraftFSM", "DEFAULT_FSM", "route_callback", "route_text", "route_photo"]
+__all__ = ["Route", "FSMEntry", "DraftFSM", "DEFAULT_FSM", "PHOTO_STATES",
+           "TEXT_STATES", "route_callback", "route_text", "route_photo"]

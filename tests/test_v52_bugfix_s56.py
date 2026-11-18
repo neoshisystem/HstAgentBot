@@ -499,12 +499,19 @@ def _seed_pricing(conn, *, rep_tier="normal", user_tier="normal"):
         "VALUES('root',7,'credit',?)", (NOW,))
     conn.execute(
         "INSERT INTO bot_users(telegram_id,role,tier) VALUES(555,'end_user',?)", (user_tier,))
+    # ``init_db`` now seeds the staging tier ladder, so these two rows already
+    # exist. The upsert keeps the fixture's intent — a 0% ``normal`` tier on both
+    # sides — while staying idempotent against the seeded baseline.
     conn.execute(
         "INSERT INTO tier_policies(actor_type,tier_code,title_fa,rank,discount_bps) "
-        "VALUES('rep','normal','عادی',0,0)")
+        "VALUES('rep','normal','عادی',0,0) "
+        "ON CONFLICT(actor_type,tier_code) DO UPDATE SET "
+        "title_fa=excluded.title_fa,rank=excluded.rank,discount_bps=excluded.discount_bps")
     conn.execute(
         "INSERT INTO tier_policies(actor_type,tier_code,title_fa,rank,discount_bps) "
-        "VALUES('end_user','normal','عادی',0,0)")
+        "VALUES('end_user','normal','عادی',0,0) "
+        "ON CONFLICT(actor_type,tier_code) DO UPDATE SET "
+        "title_fa=excluded.title_fa,rank=excluded.rank,discount_bps=excluded.discount_bps")
     conn.commit()
 
 
@@ -769,7 +776,9 @@ def test_a_promoted_rep_has_a_resolvable_price_chain(monkeypatch, tmp_path):
                 "VALUES('p1','پلن آزمایشی',10,30,100000,150000,1)")
             conn.execute(
                 "INSERT INTO tier_policies(actor_type,tier_code,title_fa,rank,discount_bps) "
-                "VALUES('rep','normal','عادی',0,0)")
+                "VALUES('rep','normal','عادی',0,0) "
+                "ON CONFLICT(actor_type,tier_code) DO UPDATE SET "
+                "title_fa=excluded.title_fa,rank=excluded.rank,discount_bps=excluded.discount_bps")
             conn.commit()
             priced = pricing_service.price_chain(
                 conn, plan_code="p1", seller_key="rep:3", buyer_rep_id=int(rep["id"]), now=NOW)

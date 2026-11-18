@@ -11,6 +11,7 @@ Provides a 100% inline keyboard-driven interface for End-Users:
 import logging
 import asyncio
 import os
+import sqlite3
 import sys
 import time
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -175,7 +176,7 @@ def build_user_portal_keyboard(base_role: str | None = None) -> InlineKeyboardMa
     if _v52_ui_enabled():
         rows = [
             [InlineKeyboardButton("📱 سرویس‌های من", callback_data="user:services"),
-             InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
+             InlineKeyboardButton("🛍 فروشگاه محصولات دیجیتال", callback_data="v52:shop")],
             [InlineKeyboardButton("👤 پروفایل‌های اشتراک", callback_data="v52:profiles"),
              InlineKeyboardButton("💳 کیف پول", callback_data="user:wallet")],
             [InlineKeyboardButton("🎫 تیکت‌های من", callback_data="v52:tickets"),
@@ -594,30 +595,66 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
 
     # 3. Buy Service (Self-Service)
     elif action == "buy_service":
-        plans = database.get_pricing_plans(active_only=True)
+        import pricing_service
+        show_all = len(parts) > 2 and parts[2] == "all"
         wallet_bal = database.get_user_wallet_balance(user.id)
+        # Every price shown here is the actor's own effective tier price, computed by
+        # the same resolver the intent guard re-checks at confirmation time, so a VIP
+        # user sees and pays the VIP rate instead of the untiered list price. The plan
+        # list itself still comes from this module's own accessor, and a database
+        # without the v5.2 catalogue degrades to one flat, list-priced group.
+        plans = database.get_pricing_plans(active_only=True)
+        priced = {}
+        try:
+            with database.get_db() as conn:
+                groups = pricing_service.group_plans_by_category(conn, plans)
+                for group in groups:
+                    for plan in group["plans"]:
+                        priced[plan["plan_code"]] = pricing_service.resolve_effective_plan_price(
+                            plan["plan_code"], user_id=user.id, conn=conn)
+        except (pricing_service.PricingError, sqlite3.OperationalError):
+            groups = [{"category": None, "plans": plans}]
+            priced = {}
         lines = [
             "🛒 **خرید سرویس اینترنت آزاد:**\n",
             f"• موجودی کیف پول شما: **{wallet_bal:,} تومان**\n",
-            "یکی از بسته‌های زیر را جهت فعال‌سازی آنی انتخاب نمایید:\n"
         ]
+        if show_all or len(groups) <= 1:
+            lines.append("یکی از بسته‌های زیر را جهت فعال‌سازی آنی انتخاب نمایید:\n")
+            ordered_groups = [{"category": None, "plans": [p for g in groups for p in g["plans"]]}]
+        else:
+            lines.append("بسته‌ها بر اساس دسته‌بندی نمایش داده شده‌اند؛ "
+                         "برای دیدن همه بسته‌ها یک‌جا، از دکمهٔ «📦 همه بسته‌ها» استفاده کنید.\n")
+            ordered_groups = groups
         extra_btns = []
-        row = []
-        for p in plans:
-            intent_id = database.create_user_action_intent(
-                user_id=user.id, action_type="buy",
-                plan_code=p["plan_code"], plan_name=p["name"],
-                gb=p["gb"], days=p["days"], amount=p["user_price"],
-            )
-            row.append(InlineKeyboardButton(
-                f"{p['name']} ({p['user_price']:,} ت)",
-                callback_data=f"user:confirm_buy:{intent_id}"
-            ))
-            if len(row) == 2:
+        for group in ordered_groups:
+            category = group["category"]
+            if category is not None:
+                lines.append(f"{category['emoji']} **{category['title_fa']}**")
+            row = []
+            for plan in group["plans"]:
+                resolved = priced.get(plan["plan_code"])
+                amount = int(resolved["effective_price"]) if resolved else int(
+                    plan.get("user_price") or 0)
+                intent_id = database.create_user_action_intent(
+                    user_id=user.id, action_type="buy",
+                    plan_code=plan["plan_code"], plan_name=plan["name"],
+                    gb=plan["gb"], days=plan["days"],
+                    amount=amount,
+                )
+                label = f"{plan['name']} ({amount:,} ت)"
+                if resolved and resolved["effective_price"] != resolved["base_price"]:
+                    label = f"✨ {plan['name']} ({amount:,} ت)"
+                row.append(InlineKeyboardButton(
+                    label, callback_data=f"user:confirm_buy:{intent_id}"))
+                if len(row) == 2:
+                    extra_btns.append(row)
+                    row = []
+            if row:
                 extra_btns.append(row)
-                row = []
-        if row:
-            extra_btns.append(row)
+        if len(groups) > 1 and not show_all:
+            extra_btns.append([InlineKeyboardButton(
+                "📦 همه بسته‌ها", callback_data="user:buy_service:all")])
 
         keyboard = build_back_to_user_keyboard(extra_btns)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
@@ -1078,12 +1115,24 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
 
     # 6. Pricing Plans for Users
     elif action == "pricing":
-        plans = database.get_pricing_plans(active_only=True)
+        import pricing_service
+        with database.get_db() as conn:
+            plans = pricing_service.plan_catalog(conn, audience="end_user")
+            priced = {plan["plan_code"]: pricing_service.resolve_effective_plan_price(
+                plan["plan_code"], user_id=user.id, conn=conn) for plan in plans}
         lines = ["📋 **لیست تعرفه‌های اینترنت پرسرعت:**\n"]
         for p in plans:
+            resolved = priced[p["plan_code"]]
+            price_line = f"قیمت: **{resolved['effective_price']:,} تومان**"
+            if resolved["effective_price"] != resolved["base_price"]:
+                price_line += (
+                    f" (قیمت پایه {resolved['base_price']:,} ت — "
+                    f"تخفیف سطح شما: {resolved['discount_percent']:g}%)"
+                    if not resolved["is_custom_price"] else
+                    f" (قیمت اختصاصی سطح شما؛ قیمت پایه {resolved['base_price']:,} ت)")
             lines.append(
                 f"• **{p['name']}**:\n"
-                f"   حجم: `{int(p['gb'])} گیگابایت` | مدت: `{int(p['days'])} روز` | قیمت: **{p['user_price']:,} تومان**\n"
+                f"   حجم: `{int(p['gb'])} گیگابایت` | مدت: `{int(p['days'])} روز` | {price_line}\n"
             )
         keyboard = build_back_to_user_keyboard([
             [InlineKeyboardButton("🛒 خرید سرویس", callback_data="user:buy_service")]
@@ -1097,8 +1146,12 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
             await query.answer("⛔️ سرویس متصل به نماینده فقط برای مشاهده و دریافت اطلاعات است؛ تمدید باید از مسیر نماینده انجام شود.", show_alert=True)
             return
         acc_code = owned_account["account_code"]
-        plans = database.get_pricing_plans(active_only=True)
+        import pricing_service
         wallet_bal = database.get_user_wallet_balance(user.id)
+        with database.get_db() as conn:
+            plans = pricing_service.plan_catalog(conn, audience="end_user")
+            priced = {plan["plan_code"]: pricing_service.resolve_effective_plan_price(
+                plan["plan_code"], user_id=user.id, conn=conn) for plan in plans}
         lines = [
             f"⚡️ **تمدید سرویس {acc_code} با کیف پول:**\n",
             f"• موجودی کیف پول: **{wallet_bal:,} تومان**\n",
@@ -1107,6 +1160,7 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
         extra_btns = []
         row = []
         for p in plans:
+            resolved = priced[p["plan_code"]]
             intent_id = database.create_user_action_intent(
                 user_id=user.id,
                 action_type="renew",
@@ -1114,12 +1168,15 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
                 plan_name=p["name"],
                 gb=p["gb"],
                 days=p["days"],
-                amount=p["user_price"],
+                amount=resolved["effective_price"],
                 account_code=owned_account["account_code"],
                 account_email=owned_account["email"],
             )
+            label = f"{p['name']} ({resolved['effective_price']:,} ت)"
+            if resolved["effective_price"] != resolved["base_price"]:
+                label = f"✨ {p['name']} ({resolved['effective_price']:,} ت)"
             row.append(InlineKeyboardButton(
-                f"{p['name']} ({p['user_price']:,} ت)",
+                label,
                 callback_data=f"user:do_renew:{intent_id}"
             ))
             if len(row) == 2:

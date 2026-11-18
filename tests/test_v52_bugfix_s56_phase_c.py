@@ -106,17 +106,20 @@ def test_the_super_admin_menu_carries_no_technical_english_label(monkeypatch):
 
 
 def test_the_two_plan_buttons_are_unambiguous(monkeypatch):
+    """S57 merged the two tariff menus: one entry, one name, both routes alive."""
     monkeypatch.setattr(admin_panel, "_v52_admin_enabled", lambda: True)
     rows = admin_panel.build_admin_main_keyboard().inline_keyboard
     by_callback = {button.callback_data: button.text for row in rows for button in row}
-    assert by_callback["v52:plans"] == "🏷 ماتریس تعرفه و پنل‌ها"
-    assert by_callback["admin:plans"] == "⚙️ مدیریت بسته‌ها و قیمت پایه"
+    assert by_callback["v52:plans"] == "🏷 مدیریت تعرفه‌ها، دسته‌بندی‌ها و پنل‌ها"
+    # The duplicate entry point is gone from the v5.2 menu, so the operator can no
+    # longer reach two differently-rendered tariff pages.
+    assert "admin:plans" not in by_callback
     # The legacy keyboard must name the same surface the same way.
     monkeypatch.setattr(admin_panel, "_v52_admin_enabled", lambda: False)
     legacy = {button.callback_data: button.text
               for row in admin_panel.build_admin_main_keyboard().inline_keyboard
               for button in row}
-    assert legacy["admin:plans"] == "⚙️ مدیریت بسته‌ها و قیمت پایه"
+    assert legacy["admin:plans"] == "🏷 مدیریت تعرفه‌ها، دسته‌بندی‌ها و پنل‌ها"
 
 
 def test_every_settings_category_page_hides_the_raw_english_key(monkeypatch, tmp_path):

@@ -115,6 +115,73 @@ def claim_period_job(
             "lease_until": current + lease}
 
 
+EXPIRY_WARNING_DAYS = 3
+EXPIRY_WARNING_KIND = "expiry_warning"
+
+#: The two columns a warning needs. ``accounts.enable`` is the panel-side flag and
+#: ``expiry_time`` is the panel-side expiry, both mirrored locally on every sync.
+_EXPIRY_WARNING_SQL = (
+    "SELECT a.id, a.account_code, a.email, a.expiry_time, a.owner_tg_id, a.rep_id, "
+    "COALESCE(r.telegram_id, 0) AS rep_tg_id "
+    "FROM accounts a LEFT JOIN representatives r ON r.id = a.rep_id "
+    "WHERE a.deleted_at IS NULL AND a.enable = 1 "
+    "AND a.expiry_time IS NOT NULL AND a.expiry_time > ? AND a.expiry_time <= ? "
+    "ORDER BY a.expiry_time, a.id LIMIT ?"
+)
+
+
+def due_expiry_warnings(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    within_seconds: int | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Accounts entering their expiry window, each claimed once per Tehran day.
+
+    The claim reuses ``scheduled_jobs`` (kind ``expiry_warning``, target the account
+    id, period the Tehran date) instead of a new warning table: the same durable,
+    single-claim semantics the reservation watchdog already relies on apply, so a
+    restart cannot send the same warning twice and a missed cycle is not lost.
+
+    A warning is a notification, never a mutation, so nothing here touches a panel.
+    The caller owns delivery and must treat a send failure as a lost notification
+    rather than as a reason to retry the claim.
+    """
+    timestamp = _epoch(now, "now")
+    window = EXPIRY_WARNING_DAYS * 86400 if within_seconds is None else _positive(
+        within_seconds, "within_seconds")
+    horizon = timestamp + window
+    size = _positive(limit, "limit")
+    if size > 500:
+        raise SchedulerError("limit cannot exceed 500")
+    period, _start, _end = tehran_period(timestamp)
+    rows = conn.execute(_EXPIRY_WARNING_SQL, (timestamp, horizon, size)).fetchall()
+    claimed: list[dict[str, Any]] = []
+    for row in rows:
+        account_id = int(row["id"])
+        claim = claim_period_job(
+            conn, kind=EXPIRY_WARNING_KIND, target=str(account_id),
+            period=period, due_at=timestamp, now=timestamp,
+        )
+        if claim is None:
+            continue
+        expiry = int(row["expiry_time"])
+        claimed.append({
+            "account_id": account_id,
+            "account_code": str(row["account_code"] or ""),
+            "email": str(row["email"] or ""),
+            "expiry_time": expiry,
+            "owner_tg_id": None if row["owner_tg_id"] is None else int(row["owner_tg_id"]),
+            "rep_id": None if row["rep_id"] is None else int(row["rep_id"]),
+            "rep_tg_id": int(row["rep_tg_id"] or 0),
+            "days_left": max(0, (expiry - timestamp) // 86400),
+            "job_key": claim["job_key"],
+            "tehran_date": period,
+        })
+    return claimed
+
+
 def run_due_jobs(
     conn: sqlite3.Connection,
     jobs: Iterable[Mapping[str, Any]],
@@ -169,6 +236,7 @@ def run_due_jobs(
 
 
 __all__ = [
-    "SchedulerError", "WATCHDOG_INTERVAL_SECONDS", "tehran_day_range",
-    "tehran_period", "claim_period_job", "run_due_jobs",
+    "EXPIRY_WARNING_DAYS", "EXPIRY_WARNING_KIND", "SchedulerError",
+    "WATCHDOG_INTERVAL_SECONDS", "claim_period_job", "due_expiry_warnings",
+    "run_due_jobs", "tehran_day_range", "tehran_period",
 ]

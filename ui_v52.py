@@ -91,9 +91,15 @@ def render_error(
     root: bool = False,
     parent_callback: str | None = None,
     rows: Iterable[Sequence[InlineKeyboardButton]] = (),
+    body_html: str | None = None,
 ) -> RenderedPage:
-    """An error is still a navigable page; it never traps the actor in a popup."""
-    return render_page("خطا", message, persona=persona, root=root,
+    """An error is still a navigable page; it never traps the actor in a popup.
+
+    ``body_html`` exists for the same reason it does on :func:`render_page`: a
+    validation message that quotes the identifier being edited needs a code span,
+    and a caller that passes pre-escaped HTML must be able to say so.
+    """
+    return render_page("خطا", message, body_html=body_html, persona=persona, root=root,
                        page_kind="error", parent_callback=parent_callback, rows=rows)
 
 

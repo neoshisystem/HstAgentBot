@@ -4,6 +4,7 @@ import sqlite3
 import asyncio
 import inspect
 import hmac
+import logging
 from concurrent.futures import ThreadPoolExecutor
 import json
 import secrets
@@ -11,6 +12,8 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+
+logger = logging.getLogger("Database")
 
 from config import (
     DB_PATH,
@@ -38,6 +41,88 @@ DEFAULT_PLANS = [
     ("100gb_90d", "۱۰۰ گیگ ۳ ماهه", 100.0, 90, 290000, 480000, 0, 8),
     ("150gb_90d", "۱۵۰ گیگ ۳ ماهه", 150.0, 90, 410000, 680000, 0, 9),
 ]
+
+# --------------------------------------------------------------------------- #
+# v5.2 plan catalogue: categories, audience and tariff kind
+#
+# ``pricing_plans`` gained ``category_key``/``plan_kind``/``for_end_users``/
+# ``for_reps`` after the migration count was frozen at 18, so the columns and the
+# two catalogue tables are created lazily and idempotently by
+# :func:`ensure_plan_catalog_schema` — exactly the way
+# ``ensure_ticket_statuses_table`` and ``ensure_product_usage_guide_column``
+# already extend the schema. No nineteenth migration file exists.
+#
+# The ``plan_kind`` registry itself lives in :mod:`pricing_service`, which owns
+# every pricing rule; keeping one copy means the validator and the menu can never
+# disagree about which kinds exist.
+# --------------------------------------------------------------------------- #
+
+#: ``(category_key, emoji, Persian title, sort order)`` for the seeded catalogue.
+DEFAULT_PLAN_CATEGORIES: tuple[tuple[str, str, str, int], ...] = (
+    ("economic", "🚀", "سرویس‌های اقتصادی (Economic)", 1),
+    ("vip", "💎", "سرویس‌های ویژه (VIP)", 2),
+    ("gaming", "🎮", "سرویس‌های گیمینگ و پینگ پایین", 3),
+    ("high_volume", "♾", "سرویس‌های حجم/زمان بالا", 4),
+)
+
+#: The seeded category each ``DEFAULT_PLANS`` code is linked to.
+DEFAULT_PLAN_CATEGORY_OF: dict[str, str] = {
+    "10gb_30d": "economic", "20gb_30d": "economic", "30gb_30d": "economic",
+    "40gb_30d": "vip", "50gb_60d": "vip", "60gb_60d": "vip",
+    "80gb_60d": "high_volume", "100gb_90d": "high_volume", "150gb_90d": "high_volume",
+}
+
+#: ``(actor_type, tier_code, title_fa, rank, discount_bps)`` for the seeded ladder.
+#: ``end_user``/``rep`` both start at ``normal`` (0%); the paid rungs exist so the
+#: staging deployment can exercise a real tier discount end to end.
+DEFAULT_TIER_LADDER: tuple[tuple[str, str, str, int, int], ...] = (
+    ("end_user", "normal", "عادی", 0, 0),
+    ("end_user", "vip", "کاربر ویژه VIP", 3, 1500),
+    ("rep", "normal", "نماینده عادی", 0, 0),
+    ("rep", "silver", "نماینده نقره‌ای", 1, 1000),
+    ("rep", "gold", "نماینده طلایی", 2, 2000),
+)
+
+#: ``(tier_key, role_scope, plan_code, custom_price_toman)`` sample overrides.
+DEFAULT_TIER_PLAN_PRICES: tuple[tuple[str, str, str, int], ...] = (
+    ("vip", "end_user", "20gb_30d", 380000),
+    ("gold", "rep", "20gb_30d", 250000),
+)
+
+#: ``(product_code, category title, title, description, delivery_type, rep, user,
+#: usage guide, inventory items)`` used only when the store has no product at all.
+DEFAULT_STORE_SAMPLES: tuple[tuple[str, str, str, str, str, int, int, str, tuple[str, ...]], ...] = (
+    (
+        "sample-crunchyroll-1m", "سرویس‌های اشتراکی",
+        "اکانت اشتراکی کرانچیرول ۱ ماهه",
+        "اکانت قانونی کرانچیرول با پروفایل اختصاصی؛ مناسب تماشای انیمه بدون تبلیغ.",
+        "auto_inventory", 180000, 260000,
+        "۱) پس از خرید، نام کاربری و رمز از همین ربات برای شما ارسال می‌شود.\n"
+        "۲) وارد crunchyroll.com شوید و با اطلاعات ارسالی وارد حساب شوید.\n"
+        "۳) پروفایل اختصاصی خود را انتخاب کنید و رمز پروفایل را تغییر دهید.\n"
+        "۴) از تغییر رمز کل حساب خودداری کنید؛ در این صورت گارانتی باطل می‌شود.",
+        (
+            "user: crunchy_sample_01@example.com\npass: CrSample-01\nprofile: Profile 1",
+            "user: crunchy_sample_02@example.com\npass: CrSample-02\nprofile: Profile 2",
+            "user: crunchy_sample_03@example.com\npass: CrSample-03\nprofile: Profile 3",
+        ),
+    ),
+    (
+        "sample-win11-pro", "لایسنس نرم‌افزار",
+        "لایسنس ویندوز ۱۱ اورجینال",
+        "کلید فعال‌سازی رتایل ویندوز ۱۱ پرو، قابل استفاده روی یک سیستم.",
+        "auto_inventory", 900000, 1250000,
+        "۱) کلید ارسال‌شده را کپی کنید.\n"
+        "۲) Settings → System → Activation → Change product key را باز کنید.\n"
+        "۳) کلید را وارد کرده و Activate را بزنید.\n"
+        "۴) در صورت خطای «کلید قبلاً استفاده شده»، با پشتیبانی تیکت بزنید.",
+        (
+            "key: W269N-WFGWX-YVC9B-4J6C9-T83GX",
+            "key: MHWJQ-NM8P2-4F2XK-9W4CV-7QY6B",
+            "key: NPPR9-FWDCX-D2C8J-H872K-2YT43",
+        ),
+    ),
+)
 
 DEFAULT_SETTINGS = [
     ("rollover_max_gb", "2.0", "سقف رول‌اوور حجم (GB)", "سقف حجم مجاز باقیمانده برای تمدید مستقیم تجمیعی به گیگابایت"),
@@ -797,7 +882,299 @@ def init_db():
         import inventory_import_service
         inventory_import_service.ensure_staging_table(conn)
         ensure_product_usage_guide_column(conn)
+        # Plan catalogue, tier price matrix and the staging sample ecosystem. All
+        # three are idempotent, so a restart repairs a partially provisioned
+        # database without ever rewriting an operator's own rows.
+        ensure_plan_catalog_schema(conn)
+        ensure_tier_plan_prices_table(conn)
+        _seed_default_sample_ecosystem(conn)
         conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# v5.2 plan catalogue, tier price matrix and staging sample ecosystem
+# --------------------------------------------------------------------------- #
+
+def _table_present(conn, name: str) -> bool:
+    """True when ``name`` exists; used to stay safe on a legacy or partial schema."""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (str(name),)
+    ).fetchone() is not None
+
+
+def ensure_plan_catalog_schema(conn) -> None:
+    """Create the plan-category catalogue and the four v5.2 plan columns.
+
+    ``pricing_plans`` is created by ``init_db`` and migration 004; the category,
+    kind and audience columns arrived after the migration count was frozen at 18.
+    Every statement here is guarded, so a second call is a no-op and an existing
+    operator value is never overwritten. The caller owns the commit.
+    """
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(pricing_plans)")}
+    if columns:
+        if "category_key" not in columns:
+            conn.execute(
+                "ALTER TABLE pricing_plans ADD COLUMN category_key TEXT NOT NULL DEFAULT ''")
+        if "plan_kind" not in columns:
+            conn.execute(
+                "ALTER TABLE pricing_plans ADD COLUMN plan_kind TEXT NOT NULL DEFAULT 'fixed'")
+        if "for_end_users" not in columns:
+            conn.execute(
+                "ALTER TABLE pricing_plans ADD COLUMN for_end_users INTEGER NOT NULL DEFAULT 1")
+        if "for_reps" not in columns:
+            conn.execute(
+                "ALTER TABLE pricing_plans ADD COLUMN for_reps INTEGER NOT NULL DEFAULT 1")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS plan_categories ("
+        " category_key TEXT PRIMARY KEY,"
+        " title_fa TEXT NOT NULL,"
+        " emoji TEXT NOT NULL DEFAULT '',"
+        " sort_order INTEGER NOT NULL DEFAULT 0,"
+        " is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN(0,1)))"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS plan_category_links ("
+        " plan_code TEXT NOT NULL REFERENCES pricing_plans(plan_code),"
+        " category_key TEXT NOT NULL REFERENCES plan_categories(category_key),"
+        " is_primary INTEGER NOT NULL DEFAULT 0 CHECK(is_primary IN(0,1)),"
+        " PRIMARY KEY(plan_code, category_key))"
+    )
+
+
+def ensure_tier_plan_prices_table(conn) -> None:
+    """Create the tier-specific plan price matrix.
+
+    A tier's flat ``discount_bps`` cannot express "this plan costs exactly X for
+    this tier", which is what a negotiated wholesale rate actually is. The matrix
+    is keyed by ``(tier_key, role_scope, plan_code)`` so the same tier code can
+    hold a different rate for representatives and end users. The caller owns the
+    commit.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tier_plan_prices ("
+        " tier_key TEXT NOT NULL,"
+        " role_scope TEXT NOT NULL CHECK(role_scope IN('rep','end_user')),"
+        " plan_code TEXT NOT NULL REFERENCES pricing_plans(plan_code),"
+        " custom_price_toman INTEGER NOT NULL CHECK(custom_price_toman>=0),"
+        " updated_at INTEGER NOT NULL DEFAULT 0,"
+        " PRIMARY KEY(tier_key, role_scope, plan_code))"
+    )
+
+
+def _seed_default_sample_ecosystem(conn) -> dict:
+    """Seed the staging ecosystem once, without ever clobbering operator data.
+
+    This installation is an active staging deployment where the super admin
+    exercises all four hierarchy levels (super admin, master rep, sub-rep, end
+    user). An empty catalogue makes the store, the tariff matrix and the tier
+    ladder untestable, so a realistic sample is created — but only where nothing
+    exists yet. Every statement is an ``INSERT ... ON CONFLICT DO NOTHING`` or is
+    guarded by a ``COUNT(*)``, so a restart never rewrites an operator's edit and
+    a restored backup is never re-seeded.
+    """
+    seeded = {"plan_categories": 0, "plan_links": 0, "plan_panels": 0,
+              "tiers": 0, "tier_plan_prices": 0, "store_products": 0,
+              "store_inventory": 0, "coupons": 0}
+    now = int(time.time())
+    from crypto_store import encrypt_secret
+
+    # 1. Plan categories and the link between each default plan and its category.
+    for category_key, emoji, title_fa, sort_order in DEFAULT_PLAN_CATEGORIES:
+        cursor = conn.execute(
+            "INSERT INTO plan_categories(category_key,title_fa,emoji,sort_order,is_active) "
+            "VALUES(?,?,?,?,1) ON CONFLICT(category_key) DO NOTHING",
+            (category_key, title_fa, emoji, int(sort_order)),
+        )
+        seeded["plan_categories"] += max(cursor.rowcount, 0)
+    for plan_code, category_key in DEFAULT_PLAN_CATEGORY_OF.items():
+        if not _table_present(conn, "pricing_plans"):
+            break
+        linked = conn.execute(
+            "SELECT 1 FROM plan_category_links WHERE plan_code=?", (plan_code,)
+        ).fetchone()
+        if linked is not None:
+            continue
+        exists = conn.execute(
+            "SELECT 1 FROM pricing_plans WHERE plan_code=?", (plan_code,)
+        ).fetchone()
+        if exists is None:
+            continue
+        conn.execute(
+            "INSERT INTO plan_category_links(plan_code,category_key,is_primary) "
+            "VALUES(?,?,1) ON CONFLICT(plan_code,category_key) DO NOTHING",
+            (plan_code, category_key),
+        )
+        conn.execute(
+            "UPDATE pricing_plans SET category_key=? WHERE plan_code=? AND (category_key IS NULL OR category_key='')",
+            (category_key, plan_code),
+        )
+        seeded["plan_links"] += 1
+
+    # 2. Default plan -> default panel binding.
+    #
+    # ``bootstrap_v52_installation`` writes one ``plan_panels`` row per plan for
+    # the default panel through ``fill_required``, which supplies ``0`` for the
+    # NOT NULL integer ``allowed`` column. The result is an explicit *denial* of
+    # every plan on the only active panel, so ``eligibility_service`` refuses every
+    # sale and ``panel_provisioning_service`` falls back to the unscoped list. The
+    # repair below is deliberately narrow: it only touches a seeded plan that has
+    # no allowed panel anywhere, which is exactly the state the bootstrap creates
+    # and never the state an operator reaches on purpose (a deliberate withdrawal
+    # uses ``sale_status``/``is_active``).
+    if _table_present(conn, "plan_panels") and _table_present(conn, "panels"):
+        default_panel = conn.execute(
+            "SELECT id FROM panels WHERE is_default=1 ORDER BY id LIMIT 1").fetchone()
+        if default_panel is None:
+            default_panel = conn.execute(
+                "SELECT id FROM panels WHERE lifecycle='active' ORDER BY id LIMIT 1").fetchone()
+        if default_panel is not None:
+            panel_id = int(default_panel["id"])
+            for plan_code, _name, _gb, _days, _rep, _user, _quick, _order in DEFAULT_PLANS:
+                any_allowed = conn.execute(
+                    "SELECT 1 FROM plan_panels WHERE plan_code=? AND allowed=1 LIMIT 1",
+                    (plan_code,),
+                ).fetchone()
+                if any_allowed is not None:
+                    continue
+                cursor = conn.execute(
+                    "UPDATE plan_panels SET allowed=1 WHERE plan_code=? AND panel_id=? AND allowed=0",
+                    (plan_code, panel_id),
+                )
+                if cursor.rowcount != 1:
+                    cursor = conn.execute(
+                        "INSERT INTO plan_panels(plan_code,panel_id,allowed) VALUES(?,?,1) "
+                        "ON CONFLICT(plan_code,panel_id) DO NOTHING",
+                        (plan_code, panel_id),
+                    )
+                seeded["plan_panels"] += max(cursor.rowcount, 0)
+
+    # 3. Default tier ladder. A tier that already exists is left alone unless it
+    #    is *provably untouched*: every configurable field still sits at its zero
+    #    default (discount, cashback, credit limit, sales floor, test quota) and
+    #    the rank still matches the seeded one. Only then does the seeded title and
+    #    discount land, which is what makes the VIP/Gold ladder testable on a
+    #    deployment whose tiers were never configured. A row an operator has
+    #    touched fails the guard and is preserved exactly as it is.
+    for actor_type, tier_code, title_fa, rank, discount_bps in DEFAULT_TIER_LADDER:
+        if not _table_present(conn, "tier_policies"):
+            break
+        cursor = conn.execute(
+            "INSERT INTO tier_policies(actor_type,tier_code,title_fa,rank,discount_bps,"
+            "cashback_bps,daily_test_quota,default_credit_limit,min_monthly_sales_toman) "
+            "VALUES(?,?,?,?,?,0,1,0,0) ON CONFLICT(actor_type,tier_code) DO NOTHING",
+            (actor_type, tier_code, title_fa, int(rank), int(discount_bps)),
+        )
+        if cursor.rowcount == 1:
+            seeded["tiers"] += 1
+            continue
+        conn.execute(
+            "UPDATE tier_policies SET title_fa=?,discount_bps=? "
+            "WHERE actor_type=? AND tier_code=? AND rank=? AND discount_bps=0 "
+            "AND cashback_bps=0 AND daily_test_quota=1 AND default_credit_limit=0 "
+            "AND min_monthly_sales_toman=0",
+            (title_fa, int(discount_bps), actor_type, tier_code, int(rank)),
+        )
+
+    # 4. Two sample tier-specific plan prices, only while the matrix is untouched.
+    matrix_empty = (
+        _table_present(conn, "tier_plan_prices")
+        and _table_present(conn, "pricing_plans")
+        and int(conn.execute("SELECT COUNT(*) FROM tier_plan_prices").fetchone()[0]) == 0
+    )
+    if matrix_empty:
+        for tier_key, role_scope, plan_code, price in DEFAULT_TIER_PLAN_PRICES:
+            exists = conn.execute(
+                "SELECT 1 FROM pricing_plans WHERE plan_code=?", (plan_code,)).fetchone()
+            if exists is None:
+                continue
+            cursor = conn.execute(
+                "INSERT INTO tier_plan_prices(tier_key,role_scope,plan_code,"
+                "custom_price_toman,updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(tier_key,role_scope,plan_code) DO NOTHING",
+                (tier_key, role_scope, plan_code, int(price), now),
+            )
+            seeded["tier_plan_prices"] += max(cursor.rowcount, 0)
+
+    # 5. Digital store samples, only when the store has no product at all.
+    if all(_table_present(conn, name) for name in
+           ("digital_products", "digital_inventory", "digital_categories")):
+        # A restored/test database may have the migration-owned store tables but
+        # not the lazy post-migration helper column yet. ``init_db`` installs it
+        # before seeding; mirror that sequence for direct, read-only seed callers.
+        ensure_product_usage_guide_column(conn)
+        product_count = int(conn.execute(
+            "SELECT COUNT(*) FROM digital_products").fetchone()[0])
+        # The sample inventory is secret-bearing, so it needs the column master key.
+        # A deployment without one (a CI runner, a plain ``init_db`` smoke test) must
+        # still get a fully provisioned database: the catalogue is sample data, so it
+        # is skipped with a warning instead of aborting the whole bootstrap.
+        if product_count == 0 and not _store_samples_encryptable():
+            logger.warning(
+                "Sample store catalogue skipped: BACKUP_ENCRYPTION_KEY is not configured")
+            product_count = -1
+        if product_count == 0:
+            for (product_code, category_title, title, description, delivery_type,
+                 rep_price, user_price, usage_guide, items) in DEFAULT_STORE_SAMPLES:
+                category_id = _ensure_digital_category(conn, category_title)
+                cursor = conn.execute(
+                    "INSERT INTO digital_products(product_code,category_id,title,description,"
+                    "delivery_type,rep_price,user_price,stock_warning_threshold,is_active,"
+                    "sort_order,usage_guide) VALUES(?,?,?,?,?,?,?,3,1,0,?) "
+                    "ON CONFLICT(product_code) DO NOTHING",
+                    (product_code, category_id, title, description, delivery_type,
+                     int(rep_price), int(user_price), usage_guide),
+                )
+                seeded["store_products"] += max(cursor.rowcount, 0)
+                row = conn.execute(
+                    "SELECT id FROM digital_products WHERE product_code=?", (product_code,)
+                ).fetchone()
+                if row is None:
+                    continue
+                product_id = int(row["id"])
+                for index, secret in enumerate(items):
+                    conn.execute(
+                        "INSERT INTO digital_inventory(product_id,secret_cipher,notes,status,"
+                        "created_at) VALUES(?,?,'','available',?)",
+                        (product_id, encrypt_secret(str(secret), "hstagent/columns/v1"),
+                         now + index),
+                    )
+                    seeded["store_inventory"] += 1
+
+    # 6. One sample coupon, only while no coupon exists.
+    if _table_present(conn, "coupons"):
+        coupon_count = int(conn.execute("SELECT COUNT(*) FROM coupons").fetchone()[0])
+        if coupon_count == 0:
+            cursor = conn.execute(
+                "INSERT INTO coupons(code,issuer_key,discount_toman,budget_toman,used_toman,"
+                "max_uses,expires_at,is_active) VALUES('WELCOME10','root',10000,1000000,0,100,?,1) "
+                "ON CONFLICT(code) DO NOTHING",
+                (now + 90 * 86400,),
+            )
+            seeded["coupons"] += max(cursor.rowcount, 0)
+    return seeded
+
+
+def _store_samples_encryptable() -> bool:
+    """True when the column master key is usable, so sample secrets can be stored."""
+    try:
+        from crypto_store import encrypt_secret
+        encrypt_secret("hstagent-sample-probe", "hstagent/columns/v1")
+    except Exception:
+        return False
+    return True
+
+
+def _ensure_digital_category(conn, title: str) -> int:
+    """Return the id of the store category with this title, creating it once."""
+    row = conn.execute(
+        "SELECT id FROM digital_categories WHERE title=? ORDER BY id LIMIT 1", (title,)
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    cursor = conn.execute(
+        "INSERT INTO digital_categories(title,description,sort_order,is_active) "
+        "VALUES(?,'',0,1)", (title,))
+    return int(cursor.lastrowid)
 
 
 def bootstrap_v52_installation(*, bot_id: int, username: str, token: str) -> dict:
@@ -3240,15 +3617,93 @@ def log_audit(rep_id, account_code, email, action, actor_id, actor_name, details
 # Phase 4: Financial & Dual-Wallet Operations
 # ==========================================
 
+CARD_NUMBER_FALLBACK = "6037-9918-0000-0000"
+
+
+def _decrypt_card_number(cipher) -> str:
+    """Authenticate and decrypt one stored card number; empty on any failure."""
+    try:
+        from crypto_store import decrypt_secret
+        return str(decrypt_secret(str(cipher), "hstagent/columns/v1") or "").strip()
+    except Exception:
+        logger.exception("Stored bank-card number could not be decrypted")
+        return ""
+
+
+def primary_root_card(conn) -> dict | None:
+    """The highest-priority active root card in ``bank_cards``, or ``None``.
+
+    ``bank_cards`` is the store the payment rail actually charges against
+    (``payment_service.select_card``), so it is the authoritative source for the
+    card every surface displays. ``None`` means the table is absent, empty, or
+    holds only a card whose number cannot be authenticated — never a silent
+    empty string.
+    """
+    if not _table_present(conn, "bank_cards"):
+        return None
+    row = conn.execute(
+        "SELECT id,card_number_cipher,card_holder,bank_name FROM bank_cards "
+        "WHERE is_active=1 AND merchant_key='root' ORDER BY priority ASC,id ASC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    number = _decrypt_card_number(row["card_number_cipher"])
+    if not number:
+        return None
+    return {
+        "bank_card_id": int(row["id"]),
+        "card_number": number,
+        "card_holder": str(row["card_holder"] or ""),
+        "bank_name": str(row["bank_name"] or ""),
+    }
+
+
 def get_card_info() -> dict:
+    """The one canonical root card, from ``bank_cards`` with a legacy fallback.
+
+    Two stores used to answer this question independently: ``card_settings`` (the
+    singleton every menu read) and ``bank_cards`` (the table the payment rail
+    charges against). Editing one left the other stale, so the card an operator
+    typed and the card a payer was told to use could differ. ``bank_cards`` now
+    wins, and ``update_card_info`` keeps both in step.
+    """
     with get_db() as conn:
-        cur = conn.cursor()
-        row = cur.execute("SELECT card_number, card_holder, bank_name, updated_at FROM card_settings WHERE id = 1").fetchone()
-        if row:
-            return dict(row)
-    return {"card_number": "6037-9918-0000-0000", "card_holder": "مدیریت حساب", "bank_name": "بانک ملی"}
+        card = primary_root_card(conn)
+        if card is not None:
+            return {**card, "source": "bank_cards"}
+        row = conn.execute(
+            "SELECT card_number, card_holder, bank_name, updated_at "
+            "FROM card_settings WHERE id = 1"
+        ).fetchone()
+        if row is not None:
+            legacy_number = str(row["card_number"] or "").strip()
+            if legacy_number and legacy_number != "[REDACTED]":
+                return {
+                    "bank_card_id": None,
+                    "card_number": legacy_number,
+                    "card_holder": str(row["card_holder"] or ""),
+                    "bank_name": str(row["bank_name"] or ""),
+                    "updated_at": row["updated_at"],
+                    "source": "card_settings",
+                }
+    return {"bank_card_id": None, "card_number": CARD_NUMBER_FALLBACK,
+            "card_holder": "مدیریت حساب", "bank_name": "بانک ملی", "source": "default"}
+
 
 def update_card_info(card_number: str, card_holder: str, bank_name: str):
+    """Write the canonical root card to both stores inside one transaction.
+
+    ``card_settings`` keeps the readable singleton the legacy menus render, while
+    ``bank_cards`` receives the encrypted row the payment rail selects from. A
+    missing root card is created on first save, so editing the card from
+    ``admin:finance`` immediately makes it eligible for card-to-card payment
+    instead of leaving the payer with no selectable card.
+    """
+    number = str(card_number or "").strip()
+    if not number:
+        raise ValueError("card_number is required")
+    holder = str(card_holder or "").strip()
+    bank = str(bank_name or "").strip()
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -3259,7 +3714,25 @@ def update_card_info(card_number: str, card_holder: str, bank_name: str):
             card_holder = excluded.card_holder,
             bank_name = excluded.bank_name,
             updated_at = CURRENT_TIMESTAMP
-        """, (card_number, card_holder, bank_name))
+        """, (number, holder, bank))
+        if _table_present(conn, "bank_cards"):
+            from crypto_store import encrypt_secret
+            cipher = encrypt_secret(number, "hstagent/columns/v1")
+            existing = cur.execute(
+                "SELECT id FROM bank_cards WHERE merchant_key='root' "
+                "ORDER BY priority ASC,id ASC LIMIT 1"
+            ).fetchone()
+            if existing is None:
+                cur.execute(
+                    "INSERT INTO bank_cards(merchant_key,card_number_cipher,card_holder,"
+                    "bank_name,target_scope,priority,daily_limit_toman,is_active) "
+                    "VALUES('root',?,?,?,'all',1,0,1)",
+                    (cipher, holder, bank))
+            else:
+                cur.execute(
+                    "UPDATE bank_cards SET card_number_cipher=?,card_holder=?,bank_name=?,"
+                    "is_active=1 WHERE id=?",
+                    (cipher, holder, bank, int(existing["id"])))
         conn.commit()
 
 def get_user_wallet_balance(user_id: int) -> int:
@@ -3412,10 +3885,25 @@ def begin_user_action_intent(
             "SELECT name, gb, days, user_price, is_active FROM pricing_plans WHERE plan_code = ?",
             (intent["plan_code"],)
         ).fetchone()
+        # The guard exists to prove the plan did not change between the menu and
+        # the confirmation. It used to compare against the raw list price, which
+        # made every tier-discounted purchase fail with «plan_changed»: a VIP user
+        # was shown the tier price and then rejected for not paying the untiered
+        # one. The comparison is therefore against the actor's *effective* price,
+        # computed by the same helper the menu used.
+        expected_amount = int(plan["user_price"]) if plan is not None else 0
+        if plan is not None:
+            import pricing_service
+            try:
+                expected_amount = int(pricing_service.resolve_effective_plan_price(
+                    str(intent["plan_code"]), user_id=int(user_id),
+                    conn=cur.connection)["effective_price"])
+            except (pricing_service.PricingError, sqlite3.OperationalError):
+                expected_amount = int(plan["user_price"])
         if (
             not plan
             or not int(plan["is_active"] or 0)
-            or int(plan["user_price"]) != int(intent["amount"])
+            or int(expected_amount) != int(intent["amount"])
             or str(plan["name"]) != str(intent["plan_name"])
             or float(plan["gb"]) != float(intent["gb"])
             or int(plan["days"]) != int(intent["days"])
@@ -4308,9 +4796,21 @@ def begin_rep_action_intent(intent_id: str, rep_id: int, actor_tg_id: int) -> di
             SELECT name, gb, days, rep_price, is_active FROM pricing_plans
             WHERE plan_code = ?
         """, (intent["plan_code"],)).fetchone()
+        # Same reasoning as the end-user guard: compare against the representative's
+        # effective tier price, not the raw wholesale list price, or a gold/silver
+        # representative is shown their tier rate and then rejected for it.
+        expected_amount = int(plan["rep_price"]) if plan is not None else 0
+        if plan is not None:
+            import pricing_service
+            try:
+                expected_amount = int(pricing_service.resolve_effective_plan_price(
+                    str(intent["plan_code"]), rep_id=int(rep_id),
+                    conn=cur.connection)["effective_price"])
+            except (pricing_service.PricingError, sqlite3.OperationalError):
+                expected_amount = int(plan["rep_price"])
         if (
             not plan or not int(plan["is_active"] or 0)
-            or int(plan["rep_price"]) != int(intent["amount"])
+            or int(expected_amount) != int(intent["amount"])
             or str(plan["name"]) != str(intent["plan_name"])
             or float(plan["gb"]) != float(intent["gb"])
             or int(plan["days"]) != int(intent["days"])

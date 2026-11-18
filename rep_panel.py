@@ -12,6 +12,7 @@ Provides a 100% inline keyboard-driven interface for Representatives:
 import logging
 import asyncio
 import os
+import sqlite3
 import sys
 import time
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -95,7 +96,7 @@ def build_rep_main_keyboard(base_role: str | None = None) -> InlineKeyboardMarku
             [InlineKeyboardButton("📋 سرویس‌های من", callback_data="rep:acc_list:all:1"),
              InlineKeyboardButton("🆕 صدور سرویس", callback_data="rep:new_acc_plans")],
             [InlineKeyboardButton("👤 پروفایل‌ها", callback_data="v52:profiles"),
-             InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
+             InlineKeyboardButton("🛍 فروشگاه محصولات دیجیتال", callback_data="v52:shop")],
             [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets")],
             [InlineKeyboardButton("🌐 مدیریت دامنه‌ها", callback_data="v52:domains")],
             # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
@@ -282,17 +283,53 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 2. New Account: Plan Selection
     elif action == "new_acc_plans":
+        import pricing_service
+        show_all = len(parts) > 2 and parts[2] == "all"
+        # The plan list still comes from this module's own accessor; the v5.2 layer
+        # only adds the category grouping and the representative's own wholesale
+        # price, which depends on their tier. A database that predates the catalogue
+        # (or a partially provisioned one) degrades to one flat, list-priced group.
         plans = database.get_pricing_plans(active_only=True)
+        priced = {}
+        try:
+            with database.get_db() as conn:
+                groups = pricing_service.group_plans_by_category(conn, plans)
+                for group in groups:
+                    for plan in group["plans"]:
+                        priced[plan["plan_code"]] = pricing_service.resolve_effective_plan_price(
+                            plan["plan_code"], rep_id=rep["id"], conn=conn)
+        except (pricing_service.PricingError, sqlite3.OperationalError):
+            groups = [{"category": None, "plans": plans}]
+            priced = {}
         lines = [
             "🆕 **صدور اکانت جدید از استخر آزاد:**\n",
-            "پلن مورد نظر خود را جهت تخصیص انتخاب فرمایید:\n"
         ]
+        if show_all or len(groups) <= 1:
+            lines.append("پلن مورد نظر خود را جهت تخصیص انتخاب فرمایید:\n")
+            ordered_groups = [{"category": None, "plans": [p for g in groups for p in g["plans"]]}]
+        else:
+            lines.append("بسته‌ها بر اساس دسته‌بندی نمایش داده شده‌اند؛ "
+                         "برای دیدن همه بسته‌ها یک‌جا، از دکمهٔ «📦 همه بسته‌ها» استفاده کنید.\n")
+            ordered_groups = groups
         extra_btns = []
-        for p in plans:
+        for group in ordered_groups:
+            category = group["category"]
+            if category is not None:
+                lines.append(f"{category['emoji']} **{category['title_fa']}**")
+            for plan in group["plans"]:
+                resolved = priced.get(plan["plan_code"])
+                amount = int(resolved["effective_price"]) if resolved else int(
+                    plan.get("rep_price") or 0)
+                label = f"{plan['name']} ({amount:,} ت)"
+                if resolved and resolved["effective_price"] != resolved["base_price"]:
+                    label = f"✨ {plan['name']} ({amount:,} ت)"
+                extra_btns.append([InlineKeyboardButton(
+                    label,
+                    callback_data=f"rep:new_plan_chosen:{plan['plan_code']}"
+                )])
+        if len(groups) > 1 and not show_all:
             extra_btns.append([InlineKeyboardButton(
-                f"{p['name']} ({p['rep_price']:,} ت)",
-                callback_data=f"rep:new_plan_chosen:{p['plan_code']}"
-            )])
+                "📦 همه بسته‌ها", callback_data="rep:new_acc_plans:all")])
 
         keyboard = build_back_to_rep_keyboard(extra_btns)
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
@@ -300,17 +337,19 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 2.1 Plan chosen: Ask customer name
     elif action == "new_plan_chosen":
+        import pricing_service
         plan_code = parts[2] if len(parts) > 2 else "20gb_30d"
         plan = database.get_plan(plan_code)
         if not plan or not plan.get("is_active", 1):
             await query.answer("❌ پلن یافت نشد یا غیرفعال است.", show_alert=True)
             return
-
         try:
+            resolved = pricing_service.resolve_effective_plan_price(
+                plan["plan_code"], rep_id=rep["id"])
             intent_id = database.create_rep_action_intent(
                 rep_id=rep["id"], actor_tg_id=user.id,
                 plan_code=plan["plan_code"], plan_name=plan["name"],
-                gb=plan["gb"], days=plan["days"], amount=plan["rep_price"],
+                gb=plan["gb"], days=plan["days"], amount=resolved["effective_price"],
             )
         except ValueError as exc:
             await query.answer(f"⛔️ ایجاد درخواست صدور ممکن نشد: {exc}", show_alert=True)
@@ -328,9 +367,15 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             callback_data=f"rep:issue_acc_direct:{intent_id}:noname"
         )]]
         keyboard = build_back_to_rep_keyboard(extra_btns)
+        price_note = f"• هزینه پلن: **{resolved['effective_price']:,} تومان**"
+        if resolved["effective_price"] != resolved["base_price"]:
+            price_note += (
+                f"\n• قیمت پایه همین تعرفه: {resolved['base_price']:,} تومان "
+                f"(قیمت سطح «{resolved['tier_title_fa'] or resolved['tier_key']}» اعمال شد)"
+            )
         msg = (
             f"👤 **ثبت نام مشتری برای پلن {plan['name']}:**\n\n"
-            f"• هزینه پلن: **{plan['rep_price']:,} تومان**\n\n"
+            f"{price_note}\n\n"
             "لطفاً **نام مشتری** را ارسال فرمایید یا دکمه «بدون نام / رد کردن» را بزنید:\n"
             "این درخواست تا ۱۵ دقیقه معتبر است و فقط یک بار قابل اجراست."
         )
@@ -816,13 +861,25 @@ async def handle_rep_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 7. Wholesale Pricing Plans
     elif action == "pricing":
-        plans = database.get_pricing_plans(active_only=True)
+        import pricing_service
+        with database.get_db() as conn:
+            plans = pricing_service.plan_catalog(conn, audience="rep")
+            priced = {plan["plan_code"]: pricing_service.resolve_effective_plan_price(
+                plan["plan_code"], rep_id=rep["id"], conn=conn) for plan in plans}
         lines = ["🏷 **تعرفه‌ها و نرخ‌های همکاری نمایندگی:**\n"]
         for p in plans:
+            resolved = priced[p["plan_code"]]
             quick_tag = "⚡️ [سریع]" if p["is_quick"] else "📦"
+            price_line = f"قیمت خرید شما: **{resolved['effective_price']:,} تومان**"
+            if resolved["effective_price"] != resolved["base_price"]:
+                if resolved["is_custom_price"]:
+                    tier_note = "نرخ اختصاصی سطح شما"
+                else:
+                    tier_note = f"تخفیف سطح شما: {resolved['discount_percent']:g}%"
+                price_line += f" (قیمت پایه {resolved['base_price']:,} ت — {tier_note})"
             lines.append(
                 f"{quick_tag} **{p['name']}**:\n"
-                f"   • قیمت خرید شما: **{p['rep_price']:,} تومان** | فروش مصوب کاربر: `{p['user_price']:,} تومان`"
+                f"   • {price_line} | فروش مصوب کاربر: `{p['user_price']:,} تومان`"
             )
         keyboard = build_back_to_rep_keyboard()
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)

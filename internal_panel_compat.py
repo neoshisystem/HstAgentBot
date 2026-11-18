@@ -546,6 +546,38 @@ def _account_for_sub_id(sub_id: str):
     return matches[0] if len(matches) == 1 else None
 
 
+def resolve_subscription_base(panel_id, *, ensure_synced: bool = False) -> str:
+    """The subscription base URL for one panel, resolved from its live domain.
+
+    ``sub_manager`` builds a link from ``panels.sub_base_url``. That column is kept
+    in step with the panel's active primary subscription domain by
+    :mod:`domain_service`, but a domain can also be activated directly through the
+    domain service, so this resolver is the authoritative answer: live domain
+    first, then the panel's own column, then ``config.SUB_DOMAIN``.
+
+    ``ensure_synced`` also writes the resolved value back into the panel column, so
+    a caller that is about to build a URL through ``sub_manager`` can first repair a
+    stale column instead of handing out the previous host.
+    """
+    try:
+        selected = int(panel_id)
+    except (TypeError, ValueError):
+        return ""
+    if selected <= 0:
+        return ""
+    try:
+        import domain_service
+        db = _database()
+        with db.get_db() as conn:
+            if ensure_synced:
+                base = domain_service.sync_panel_sub_base_url(conn, selected)
+                conn.commit()
+                return base
+            return domain_service.panel_subscription_base(conn, selected)
+    except Exception:
+        return ""
+
+
 def get_sub_url(sub_id: str, *, account_ref=None, panel_id=None) -> str:
     binding = _account_for_sub_id(sub_id) if account_ref is None and panel_id is None else (
         _resolve_account(None, account_ref=account_ref, panel_id=panel_id)
@@ -557,6 +589,14 @@ def get_sub_url(sub_id: str, *, account_ref=None, panel_id=None) -> str:
         if stored != sub_id:
             return ""
         import sub_manager
+        url = sub_manager.get_subscription_url(stored, account_ref=binding)
+        if url:
+            return url
+        # ``sub_manager`` reads ``panels.sub_base_url``. A domain activated after
+        # that column was last written would be missed, so resolve from the live
+        # domain, repair the column and retry exactly once.
+        if not resolve_subscription_base(binding.get("panel_id"), ensure_synced=True):
+            return ""
         return sub_manager.get_subscription_url(stored, account_ref=binding)
     except Exception:
         return ""
@@ -853,5 +893,6 @@ __all__ = [
     "extract_customer_name", "parse_package_terms", "format_audit_report",
     "allocate_pool_client", "renew_client", "set_client_enable", "set_client_comment",
     "inspect_client", "get_client_links", "get_sub_url", "find_client_by_code",
+    "resolve_subscription_base",
     "update_client_sub_id", "audit_clients_overview", "list_panel_inbounds", "get_panel_adapter",
 ]

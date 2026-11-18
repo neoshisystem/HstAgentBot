@@ -484,7 +484,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
              InlineKeyboardButton("🤖 مدیریت بات‌ها", callback_data="v52:bots")],
             [InlineKeyboardButton("🌐 مدیریت دامنه‌ها", callback_data="v52:domains"),
              InlineKeyboardButton("💳 کارت‌های پرداخت", callback_data="v52:cards")],
-            [InlineKeyboardButton("🏷 ماتریس تعرفه و پنل‌ها", callback_data="v52:plans"),
+            [InlineKeyboardButton("🏷 مدیریت تعرفه‌ها، دسته‌بندی‌ها و پنل‌ها", callback_data="v52:plans"),
              InlineKeyboardButton("🛍 فروشگاه", callback_data="v52:shop")],
             [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="v52:tickets"),
              InlineKeyboardButton("⚙️ تنظیمات تیکت و وضعیت‌ها", callback_data="v52:ticketsettings")],
@@ -496,7 +496,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
              InlineKeyboardButton("👤 مدیریت کاربران", callback_data="admin:users")],
             [InlineKeyboardButton("📦 تخصیص و اسکوپ", callback_data="admin:scope"),
              InlineKeyboardButton("💰 امور مالی و تسویه‌ها", callback_data="admin:finance")],
-            [InlineKeyboardButton("⚙️ مدیریت بسته‌ها و قیمت پایه", callback_data="admin:plans"),
+            [InlineKeyboardButton("🎁 کدهای تخفیف و کوپن‌ها", callback_data="v52:coupons"),
              InlineKeyboardButton("🔄 همگام‌سازی و آمار", callback_data="admin:sync")],
             [InlineKeyboardButton("⚠️ مانیتورینگ اکانت‌های بحرانی", callback_data="admin:audit"),
              InlineKeyboardButton("🏊 استخر آزاد", callback_data="admin:pool")],
@@ -513,7 +513,7 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("👤 مدیریت کاربران", callback_data="admin:users")],
         [InlineKeyboardButton("📦 تخصیص و اسکوپ", callback_data="admin:scope"),
          InlineKeyboardButton("💰 امور مالی و تسویه‌ها", callback_data="admin:finance")],
-        [InlineKeyboardButton("⚙️ مدیریت بسته‌ها و قیمت پایه", callback_data="admin:plans"),
+        [InlineKeyboardButton("🏷 مدیریت تعرفه‌ها، دسته‌بندی‌ها و پنل‌ها", callback_data="admin:plans"),
          InlineKeyboardButton("🔄 همگام‌سازی و آمار", callback_data="admin:sync")],
         [InlineKeyboardButton("⚠️ مانیتورینگ اکانت‌های بحرانی", callback_data="admin:audit"),
          InlineKeyboardButton("🏊 استخر آزاد", callback_data="admin:pool")],
@@ -1109,6 +1109,8 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         extra_btns = [
             [InlineKeyboardButton(f"⏳ فیش‌های منتظر تایید ({len(pending_rcps)})", callback_data="admin:pending_receipts")],
             [InlineKeyboardButton("💳 تنظیمات شماره کارت و حساب", callback_data="admin:prompt_card_settings")],
+            [InlineKeyboardButton("🎁 کدهای تخفیف و کوپن‌ها", callback_data="v52:coupons")],
+            [InlineKeyboardButton("↩️ لغو و عودت وجه سفارش", callback_data="v52:refunds")],
             [InlineKeyboardButton("📑 تاریخچه کل فیش‌ها و تراکنش‌ها", callback_data="admin:recent_tx:all")]
         ]
         keyboard = build_back_to_admin_keyboard(extra_btns)
@@ -1155,28 +1157,21 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("فیش‌های در انتظار بررسی")
 
-    # 6. Pricing Plans Management (Complete CRUD)
+    # 6. Pricing Plans Management — one unified tariff & category hub.
+    #
+    # ``admin:plans`` and ``v52:plans`` used to render two disconnected menus: this
+    # one had CRUD but ignored the category, the tariff kind, the audience and the
+    # panel bindings, while the v5.2 menu toggled panel bindings only. Both routes
+    # now render the single hub in ``finance_admin_ui``, so an operator can never
+    # again edit half of a tariff from one menu and the other half from another.
     elif action == "plans":
-        plans = database.get_pricing_plans()
-        lines = ["⚙️ **مدیریت کامل تعرفه‌ها و پلن‌های سیستم:**\n"]
-        extra_btns = []
-        for p in plans:
-            quick_tag = "⚡️ [سریع]" if p["is_quick"] else "📦"
-            active_tag = "🟢" if p.get("is_active", 1) else "🔴 [غیرفعال]"
-            plan_name = escape_markdown(p.get("name") or "")
-            plan_code = escape_markdown_code(p.get("plan_code") or "")
-            lines.append(
-                f"{active_tag} {quick_tag} **{plan_name}** (`{plan_code}`):\n"
-                f"   • خرید نماینده: **{p['rep_price']:,} ت** | فروش کاربر: **{p['user_price']:,} ت**"
-            )
-            extra_btns.append([
-                InlineKeyboardButton(f"⚙️ مدیریت {p['name']}", callback_data=f"admin:plan_detail:{p['plan_code']}")
-            ])
-            
-        extra_btns.append([InlineKeyboardButton("➕ تعریف پلن جدید", callback_data="admin:prompt_add_plan")])
-        keyboard = build_back_to_admin_keyboard(extra_btns)
-        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        await query.answer("تعرفه‌ها و پلن‌ها")
+        import finance_admin_ui
+        page = finance_admin_ui.tariff_hub(
+            {"actor_tg_id": user.id, "telegram_id": user.id, "is_root": True,
+             "chat_type": getattr(chat, "type", "private"), "persona": "admin"},
+            parent_callback="admin:main")
+        await query.edit_message_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+        await query.answer("مدیریت تعرفه‌ها، دسته‌بندی‌ها و پنل‌ها")
 
     elif action == "plan_detail":
         plan_code = sub_action
@@ -1247,7 +1242,8 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         ]
         active_button = "⏸ غیرفعال‌سازی موقت تعرفه" if plan.get("is_active", 1) else "🟢 فعال‌سازی تعرفه"
         keyboard = build_back_to_admin_keyboard([
-            [InlineKeyboardButton("✏️ ویرایش قیمت‌ها", callback_data=f"admin:prompt_edit_plan:{plan_code}")],
+            [InlineKeyboardButton("✏️ ویرایش قیمت‌ها", callback_data=f"admin:prompt_edit_plan:{plan_code}"),
+             InlineKeyboardButton("📐 ویرایش حجم/زمان", callback_data=f"admin:prompt_edit_plan_specs:{plan_code}")],
             [InlineKeyboardButton(
                 "⚡️ تغییر حالت سریع/عادی",
                 callback_data=f"admin:set_plan_quick:{plan_code}:{0 if plan.get('is_quick') else 1}"
@@ -1397,21 +1393,75 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
             parse_mode=ParseMode.HTML, reply_markup=keyboard)
         await query.answer("گزارش اکانت‌های بحرانی")
 
-    # 9. Free Pool Accounts Watchdog — read-only through the selected root-scoped adapter.
+    # 9. Free Pool Accounts — the real unassigned pool, shown separately from the
+    # panel's total client list. The previous version printed only the panel client
+    # count and built its text with double-escaped ``\\n``, so the operator saw a
+    # literal backslash-n in the message and never saw the pool at all.
     elif action == "pool":
+        try:
+            with database.get_db() as conn:
+                unassigned_total = int(conn.execute(
+                    "SELECT COUNT(*) FROM accounts WHERE rep_id IS NULL "
+                    "AND owner_tg_id IS NULL AND deleted_at IS NULL").fetchone()[0])
+                unassigned_rows = conn.execute(
+                    "SELECT account_code, email, enable FROM accounts "
+                    "WHERE rep_id IS NULL AND owner_tg_id IS NULL AND deleted_at IS NULL "
+                    "ORDER BY id LIMIT 10").fetchall()
+                registered_total = int(conn.execute(
+                    "SELECT COUNT(*) FROM accounts WHERE deleted_at IS NULL").fetchone()[0])
+                manual_available = 0
+                manual_rows = []
+                try:
+                    manual_available = int(conn.execute(
+                        "SELECT COUNT(*) FROM manual_pool_clients "
+                        "WHERE status='available' AND enabled=1").fetchone()[0])
+                    manual_rows = conn.execute(
+                        "SELECT p.name AS panel_name, m.external_identifier "
+                        "FROM manual_pool_clients m JOIN panels p ON p.id=m.panel_id "
+                        "WHERE m.status='available' AND m.enabled=1 "
+                        "ORDER BY m.id LIMIT 10").fetchall()
+                except Exception:
+                    logger.debug("manual pool table is unavailable in the pool view", exc_info=True)
+            lines = [
+                "🏊 **استخر آزاد و اکانت‌های تخصیص‌نیافته:**",
+                "",
+                f"• اکانت‌های بدون نماینده و بدون مالک تلگرام: **{unassigned_total}**",
+                f"• اکانت‌های آماده در استخر دستی پنل‌ها: **{manual_available}**",
+                f"• کل اکانت‌های ثبت‌شده در سامانه: **{registered_total}**",
+                "",
+                "نمونه اکانت‌های تخصیص‌نیافته (بدون نماینده و بدون مالک):",
+            ]
+            if not unassigned_rows:
+                lines.append("• هیچ اکانت تخصیص‌نیافته‌ای وجود ندارد.")
+            for row in unassigned_rows:
+                state = "🟢" if row["enable"] else "🛑"
+                lines.append(
+                    f"{state} `{escape_markdown_code(row['account_code'])}` | "
+                    f"`{escape_markdown_code(row['email'])}`"
+                )
+            lines.append("")
+            lines.append("نمونه اکانت‌های آماده استخر دستی:")
+            if not manual_rows:
+                lines.append("• هیچ اکانت آماده‌ای در استخر دستی ثبت نشده است.")
+            for row in manual_rows:
+                lines.append(
+                    f"• پنل **{escape_markdown(row['panel_name'])}** | "
+                    f"`{escape_markdown_code(row['external_identifier'])}`"
+                )
+            text = "\n".join(lines)
+        except Exception:
+            logger.exception("Free-pool view could not read the local pool tables")
+            text = "⚠️ خواندن جداول استخر آزاد ممکن نشد؛ هیچ fallback مستقیمی اجرا نشد."
         try:
             adapter = _get_admin_panel_adapter(context=context)
             clients = await adapter.list_clients(scope_filter="all")
-            labels = [str(getattr(client, "email", "")) for client in clients if getattr(client, "email", None)]
-            text = ("🏊 **نمای کلی حساب‌های پنل انتخاب‌شده:**\\n\\n"
-                    f"• تعداد حساب‌های قابل مشاهده در اسکوپ root: **{len(clients)}**\\n"
-                    "• نمونه شناسه‌ها:\\n" + "\\n".join(f"• {item}" for item in labels[:6]))
+            text += f"\n\n• تعداد کل کلاینت‌های پنل انتخاب‌شده: **{len(clients)}**"
         except Exception:
             logger.exception("Scoped panel adapter read failed in admin pool view")
-            text = "⚠️ خواندن پنل انتخاب‌شده در اسکوپ root ممکن نشد؛ هیچ fallback مستقیمی اجرا نشد."
+            text += "\n\n⚠️ خواندن پنل انتخاب‌شده در اسکوپ root ممکن نشد."
         keyboard = build_back_to_admin_keyboard()
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        await query.answer("نمای پنل")
+        await query.answer("استخر آزاد")
 
     # 10. Instant Backup & Download
     elif action == "backup":

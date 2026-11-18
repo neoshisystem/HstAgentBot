@@ -27,6 +27,10 @@ def test_non_destructive_seed(tmp_path, monkeypatch):
     with helpers.make_db(database, monkeypatch, tmp_path, filename="w05-policy-defaults.sqlite3"):
         with database.get_db() as conn:
             assert apply_migrations(conn, root / "migrations", now=1794237000)
+            # The staging sample ecosystem is part of the seeded baseline. It is run
+            # explicitly here so the expectation below does not depend on whether
+            # ``init_db`` could already see the migration-owned tables.
+            database._seed_default_sample_ecosystem(conn)
             # init_db has already seeded the approved 2.0/2.0 rollover caps.
             assert conn.execute(
                 "SELECT value FROM system_settings WHERE key='rollover_max_gb'"
@@ -55,11 +59,21 @@ def test_non_destructive_seed(tmp_path, monkeypatch):
                 "daily_test_quota,default_credit_limit,min_monthly_sales_toman "
                 "FROM tier_policies ORDER BY actor_type,rank"
             ).fetchall()
-            assert len(tiers) == 7
+            # ``init_db`` seeds the staging tier ladder before this test runs, so the
+            # catalogue is the seven approved rows plus the two representative rungs
+            # the sample ecosystem adds (``rep/silver`` and ``rep/gold``).
+            assert len(tiers) == 9
             expected_ranks = {
-                ("rep", "normal"): 0, ("rep", "vip"): 1, ("rep", "vvip"): 2,
+                ("rep", "normal"): 0, ("rep", "silver"): 1, ("rep", "vip"): 1,
+                ("rep", "vvip"): 2, ("rep", "gold"): 2,
                 ("end_user", "normal"): 0, ("end_user", "silver"): 1,
                 ("end_user", "gold"): 2, ("end_user", "vip"): 3,
+            }
+            #: The rungs the sample ecosystem seeds with a real discount, so the tier
+            #: price matrix is testable end to end. Every other row keeps its zero
+            #: default, which is what proves the seed is non-destructive.
+            seeded_discounts = {
+                ("rep", "silver"): 1000, ("rep", "gold"): 2000, ("end_user", "vip"): 1500,
             }
             for row in tiers:
                 key = (row["actor_type"], row["tier_code"])
@@ -71,7 +85,7 @@ def test_non_destructive_seed(tmp_path, monkeypatch):
                         "Custom VIP", 375, 125, 4, 7654321, 990000
                     )
                 else:
-                    assert row["discount_bps"] == 0
+                    assert row["discount_bps"] == seeded_discounts.get(key, 0)
                     assert row["cashback_bps"] == 0
                     assert row["daily_test_quota"] == 1
             flags = dict(conn.execute("SELECT name,enabled FROM feature_flags").fetchall())
@@ -83,6 +97,6 @@ def test_non_destructive_seed(tmp_path, monkeypatch):
             assert settings["rollover_max_gb"] == "2.0"
             assert settings["rollover_max_days"] == "2.0"
             assert settings["sub_profile_limit"] == "9"
-            assert conn.execute("SELECT COUNT(*) FROM tier_policies").fetchone()[0] == 7
+            assert conn.execute("SELECT COUNT(*) FROM tier_policies").fetchone()[0] == 9
             assert network_attempts == []
             assert not Path(sentinel).exists()

@@ -396,6 +396,306 @@ def _integer_price(value, label: str) -> int:
     return result
 
 
+# --------------------------------------------------------------------------- #
+# Advanced panel settings
+#
+# ``panels`` already carries capacity, naming, subscription-domain, test-account
+# and add-on columns, but the panel card exposed none of them: an operator could
+# create a panel and then had no way to set its capacity, its username strategy,
+# its subscription host, its test account or its add-on prices from the bot. This
+# page is that missing surface. Every field is written with a compare-and-swap on
+# ``revision`` so a concurrent editor cannot be silently overwritten.
+# --------------------------------------------------------------------------- #
+
+ADVANCED_FIELDS: tuple[str, ...] = ("capacity", "naming", "suburl", "test", "addons")
+
+ADVANCED_FIELD_FA: dict[str, str] = {
+    "capacity": "🔢 سقف ظرفیت پنل",
+    "naming": "🏷 پیشوند و الگوی نام‌گذاری",
+    "suburl": "🌐 دامنهٔ لینک اشتراک",
+    "test": "🧪 اکانت تست",
+    "addons": "➕ تعرفهٔ حجم و روز اضافه",
+}
+
+#: Persian names for the six approved naming strategies in :mod:`naming_service`.
+STRATEGY_FA: dict[str, str] = {
+    "pool_preallocated": "استخر پیش‌تخصیص",
+    "rep_prefix_sequential": "پیشوند نماینده + شماره ترتیبی",
+    "rep_prefix_random": "پیشوند نماینده + رشته تصادفی",
+    "custom_text_sequential": "متن دلخواه + شماره ترتیبی",
+    "numeric_id_random": "شناسه عددی تصادفی",
+    "custom_username": "نام کاربری دلخواه",
+}
+
+ADVANCED_FORMATS: dict[str, str] = {
+    "capacity": (
+        "سقف تعداد کاربر این پنل را ارسال کنید.\n"
+        "مثال:\n"
+        "500\n\n"
+        "• عدد ۰ یعنی بدون محدودیت ظرفیت."
+    ),
+    "naming": (
+        "قالب:\n"
+        "پیشوند | الگوی نام‌گذاری\n"
+        "مثال:\n"
+        "hst | rep_prefix_sequential\n\n"
+        "• پیشوند حداکثر ۱۲ نویسه و فقط شامل حروف لاتین، رقم، خط تیره و زیرخط.\n"
+        "• الگوهای مجاز:\n"
+        + "\n".join(f"   ◦ {code} = {title}" for code, title in STRATEGY_FA.items())
+    ),
+    "suburl": (
+        "نشانی پایهٔ لینک اشتراک این پنل را ارسال کنید.\n"
+        "مثال:\n"
+        "https://sub.example.com/hsubx\n\n"
+        "• باید با https شروع شود و نام میزبان داشته باشد.\n"
+        "• پرس‌وجو (query) و بخش (#) در این نشانی پذیرفته نمی‌شود.\n"
+        "• دامنهٔ فعال و اصلی هر پنل، این مقدار را خودکار به‌روز می‌کند."
+    ),
+    "test": (
+        "قالب:\n"
+        "اجازه اکانت تست (۰/۱) | مدت (ساعت) | حجم (مگابایت)\n"
+        "مثال:\n"
+        "1 | 24 | 1024\n\n"
+        "• هر بخش را می‌توانید خالی بگذارید تا تغییر نکند."
+    ),
+    "addons": (
+        "قالب:\n"
+        "اجازه افزودن حجم/روز (۰/۱) | قیمت هر گیگ اضافه برای کاربر (تومان) | "
+        "قیمت هر روز اضافه برای کاربر (تومان)\n"
+        "مثال:\n"
+        "1 | 18000 | 8000\n\n"
+        "• هر بخش را می‌توانید خالی بگذارید تا تغییر نکند."
+    ),
+}
+
+
+def _advanced_int(chunk: str, label: str, *, minimum: int = 0, maximum: int | None = None):
+    """Parse one optional integer field; an empty chunk means «leave unchanged»."""
+    if not str(chunk).strip():
+        return None
+    try:
+        number = int(str(chunk).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} باید یک عدد صحیح باشد.") from exc
+    if number < minimum or (maximum is not None and number > maximum):
+        bound = f"بین {minimum} و {maximum}" if maximum is not None else f"حداقل {minimum}"
+        raise ValueError(f"{label} باید {bound} باشد.")
+    return number
+
+
+def _clean_strategy(value: Any) -> str:
+    import naming_service
+    selected = str(value or "").strip().lower()
+    if selected not in naming_service.STRATEGIES:
+        raise ValueError(
+            "الگوی نام‌گذاری نامعتبر است. الگوهای مجاز: "
+            + ", ".join(sorted(naming_service.STRATEGIES))
+        )
+    return selected
+
+
+def _clean_prefix(value: Any) -> str:
+    prefix = "".join(
+        ch for ch in str(value or "").strip() if ch.isalnum() or ch in "-_")
+    if len(prefix) > 12:
+        raise ValueError("پیشوند نام‌گذاری حداکثر ۱۲ نویسه است.")
+    return prefix
+
+
+def _clean_sub_base_url(value: Any) -> str:
+    from urllib.parse import urlsplit
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError as exc:
+        raise ValueError("نشانی لینک اشتراک معتبر نیست.") from exc
+    if (parsed.scheme.lower() != "https" or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment
+            or any(ord(ch) <= 32 or ord(ch) == 127 for ch in parsed.netloc)):
+        raise ValueError(
+            "نشانی لینک اشتراک باید یک نشانی https با نام میزبان و بدون پرس‌وجو یا بخش باشد."
+        )
+    return raw
+
+
+def _panel_row(conn, panel_id: int):
+    row = conn.execute("SELECT * FROM panels WHERE id=?", (int(panel_id),)).fetchone()
+    return None if row is None else dict(row)
+
+
+def panel_advanced_settings(ctx, panel_id, *, parent_callback: str | None = None):
+    """Show every advanced panel column with a control for each group."""
+    try:
+        if not _is_root(ctx):
+            raise PermissionError("تنظیمات پیشرفتهٔ پنل فقط در اختیار root است.")
+        import naming_service
+        pid = _positive(panel_id, "panel_id")
+        import database
+        with database.get_db() as conn:
+            panel = _panel_row(conn, pid)
+        if panel is None:
+            raise ValueError("پنل موردنظر وجود ندارد.")
+        strategy = str(panel.get("username_strategy") or "")
+        lines = [
+            f"پنل: {panel.get('name')} ({panel.get('panel_code')})",
+            f"وضعیت: {panel.get('lifecycle')}",
+            "",
+            f"• سقف ظرفیت: "
+            f"{'بدون محدودیت' if not int(panel.get('max_clients') or 0) else int(panel['max_clients'])}",
+            f"• پیشوند نام‌گذاری: {panel.get('custom_prefix') or '—'}",
+            f"• الگوی نام‌گذاری: {STRATEGY_FA.get(strategy, strategy or '—')}",
+            f"• دامنهٔ لینک اشتراک: {panel.get('sub_base_url') or 'تنظیم نشده'}",
+            f"• اکانت تست: "
+            f"{'مجاز' if int(panel.get('allow_test_account') or 0) else 'غیرمجاز'} · "
+            f"{int(panel.get('test_duration_hours') or 0)} ساعت · "
+            f"{int(panel.get('test_volume_mib') or 0)} مگابایت",
+            f"• افزودن حجم/روز: "
+            f"{'مجاز' if int(panel.get('allow_addons') or 0) else 'غیرمجاز'} · "
+            f"هر گیگ {int(panel.get('extra_gib_user_price') or 0):,} تومان · "
+            f"هر روز {int(panel.get('extra_day_user_price') or 0):,} تومان",
+            "",
+            "برای تغییر هر گروه روی همان دکمه بزنید. هر تغییر با کنترل هم‌زمانی روی شمارهٔ "
+            "نسخهٔ پنل ثبت می‌شود، بنابراین ویرایش هم‌زمان دو اپراتور مقدار یکی را پاک نمی‌کند.",
+        ]
+        rows = [[button(ADVANCED_FIELD_FA[field], f"v52:paneladvset:{pid}:{field}")]
+                for field in ADVANCED_FIELDS]
+        rows.append([button("بازگشت به جزئیات پنل", f"v52:panel:{pid}")])
+        return render_page(
+            "⚙️ تنظیمات پیشرفتهٔ پنل", "\n".join(lines),
+            persona="admin", rows=rows, parent_callback=parent_callback or f"v52:panel:{pid}",
+        )
+    except (TypeError, ValueError, PermissionError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+
+
+def begin_panel_advanced(ctx, panel_id, field, *, parent_callback: str | None = None):
+    """Arm the text input for one advanced panel field group."""
+    try:
+        if not _is_root(ctx):
+            raise PermissionError("تنظیمات پیشرفتهٔ پنل فقط در اختیار root است.")
+        chat_type = (
+            ctx.get("chat_type", "private") if isinstance(ctx, Mapping)
+            else getattr(ctx, "chat_type", "private")
+        )
+        if str(chat_type).lower() != "private":
+            raise PermissionError("تنظیمات پیشرفتهٔ پنل فقط در پیوی مدیریت انجام می‌شود.")
+        selected = str(field or "").strip().lower()
+        if selected not in ADVANCED_FIELDS:
+            raise ValueError("گروه تنظیمات درخواستی معتبر نیست.")
+        pid = _positive(panel_id, "panel_id")
+        import database
+        with database.get_db() as conn:
+            panel = _panel_row(conn, pid)
+        if panel is None:
+            raise ValueError("پنل موردنظر وجود ندارد.")
+        import time
+        import v52_router
+        page_callback = f"v52:paneladv:{pid}"
+        v52_router.DEFAULT_FSM.set(
+            ctx, "panel_advanced", payload={"panel_id": pid, "field": selected},
+            parent_callback=page_callback, now=int(time.time()))
+        return render_page(
+            ADVANCED_FIELD_FA[selected], ADVANCED_FORMATS[selected],
+            persona="admin", page_kind="form",
+            rows=[[button("بازگشت به تنظیمات پیشرفته", page_callback)]],
+            parent_callback=page_callback,
+        )
+    except (TypeError, ValueError, PermissionError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+
+
+def apply_panel_advanced(ctx, payload, value, *, parent_callback: str | None = None):
+    """Persist one advanced panel field group under a revision compare-and-swap."""
+    try:
+        if not _is_root(ctx):
+            raise PermissionError("تنظیمات پیشرفتهٔ پنل فقط در اختیار root است.")
+        state = dict(payload or {})
+        pid = _positive(state.get("panel_id"), "panel_id")
+        field = str(state.get("field") or "").strip().lower()
+        if field not in ADVANCED_FIELDS:
+            raise ValueError("گروه تنظیمات درخواستی معتبر نیست.")
+        parts = [chunk.strip() for chunk in str(value or "").split("|")]
+        assignments: list[str] = []
+        params: list = []
+        if field == "capacity":
+            maximum = _advanced_int(parts[0] if parts else "", "سقف ظرفیت")
+            if maximum is None:
+                raise ValueError("سقف ظرفیت نمی‌تواند خالی باشد.")
+            assignments.append("max_clients=?")
+            params.append(maximum)
+        elif field == "naming":
+            while len(parts) < 2:
+                parts.append("")
+            prefix, strategy = parts[0], parts[1]
+            if not prefix and not strategy:
+                raise ValueError("هیچ تغییری ارسال نشد.")
+            if prefix:
+                assignments.append("custom_prefix=?")
+                params.append(_clean_prefix(prefix))
+            if strategy:
+                assignments.append("username_strategy=?")
+                params.append(_clean_strategy(strategy))
+        elif field == "suburl":
+            assignments.append("sub_base_url=?")
+            params.append(_clean_sub_base_url(parts[0] if parts else ""))
+        elif field == "test":
+            while len(parts) < 3:
+                parts.append("")
+            allow, hours, volume = parts[:3]
+            if allow:
+                parsed = _advanced_int(allow, "اجازهٔ اکانت تست", maximum=1)
+                assignments.append("allow_test_account=?")
+                params.append(parsed)
+            hours_value = _advanced_int(hours, "مدت اکانت تست", minimum=1, maximum=720)
+            if hours_value is not None:
+                assignments.append("test_duration_hours=?")
+                params.append(hours_value)
+            volume_value = _advanced_int(volume, "حجم اکانت تست", minimum=1, maximum=1048576)
+            if volume_value is not None:
+                assignments.append("test_volume_mib=?")
+                params.append(volume_value)
+        else:
+            while len(parts) < 3:
+                parts.append("")
+            allow, gib_price, day_price = parts[:3]
+            if allow:
+                parsed = _advanced_int(allow, "اجازهٔ افزودن حجم/روز", maximum=1)
+                assignments.append("allow_addons=?")
+                params.append(parsed)
+            gib_value = _advanced_int(gib_price, "قیمت هر گیگ اضافه")
+            if gib_value is not None:
+                assignments.append("extra_gib_user_price=?")
+                params.append(gib_value)
+            day_value = _advanced_int(day_price, "قیمت هر روز اضافه")
+            if day_value is not None:
+                assignments.append("extra_day_user_price=?")
+                params.append(day_value)
+        if not assignments:
+            raise ValueError("هیچ تغییری ارسال نشد.")
+        import database
+        with database.get_db() as conn:
+            current = _panel_row(conn, pid)
+            if current is None:
+                raise ValueError("پنل موردنظر وجود ندارد.")
+            revision = int(current.get("revision") or 1)
+            cursor = conn.execute(
+                "UPDATE panels SET " + ",".join(assignments) + ",revision=revision+1 "
+                "WHERE id=? AND revision=?",
+                (*params, pid, revision),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "این پنل هم‌زمان توسط اپراتور دیگری تغییر کرده است؛ صفحه را دوباره باز کنید."
+                )
+            conn.commit()
+        return panel_advanced_settings(ctx, pid, parent_callback=parent_callback)
+    except (TypeError, ValueError, PermissionError) as exc:
+        return render_error(str(exc), persona="admin", parent_callback=parent_callback)
+
+
 def edit_panel_policy(
     ctx,
     panel_id: int,
@@ -495,8 +795,11 @@ def edit_panel_policy(
         return render_error(str(exc), persona="admin", parent_callback=parent_callback)
 
 
-__all__ = ["PANEL_TYPES", "PANEL_LIFECYCLES", "PANEL_CORE_TYPES", "PANEL_CORE_TYPE_SLUGS",
-           "PANEL_TYPE_LABELS", "begin_add_panel", "render_panel_type_step",
+__all__ = ["ADVANCED_FIELDS", "ADVANCED_FIELD_FA", "ADVANCED_FORMATS",
+           "PANEL_TYPES", "PANEL_LIFECYCLES", "PANEL_CORE_TYPES", "PANEL_CORE_TYPE_SLUGS",
+           "PANEL_TYPE_LABELS", "STRATEGY_FA", "apply_panel_advanced",
+           "begin_add_panel", "begin_panel_advanced", "render_panel_type_step",
            "render_panel_name_step", "render_panel_url_step", "render_panel_credential_step",
            "render_panel_connection_result", "render_panel_connection_saved",
+           "panel_advanced_settings",
            "preview_panel_config", "lifecycle_flags", "preview_lifecycle", "edit_panel_policy"]
