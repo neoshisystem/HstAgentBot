@@ -4,8 +4,21 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import database
 
-sys.path.append("/root/.hermes/scripts")
-import xui_manager
+from server_integrations import load_integration
+xui_manager = load_integration("xui_manager")
+
+
+def _v52_ui_enabled(capabilities=None, explicit=None) -> bool:
+    if explicit is not None:
+        return bool(explicit)
+    if isinstance(capabilities, dict) and any(bool(capabilities.get(k)) for k in ("v52", "v5_2", "profiles", "config_delivery")):
+        return True
+    try:
+        value = database.get_setting("v52_ui_enabled", "0")
+    except Exception:
+        value = "0"
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -127,7 +140,7 @@ def detect_intent(text: str) -> tuple[str, dict]:
 
     return "unknown", {}
 
-def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_connect: bool = False, role: str = "rep", pending_res: dict = None) -> InlineKeyboardMarkup:
+def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_connect: bool = False, role: str = "rep", pending_res: dict = None, rollover_enabled: bool = True, account_id: int | None = None, persona: str | None = None, capabilities: dict | None = None, v52_enabled: bool | None = None) -> InlineKeyboardMarkup:
     """
     Dynamic interactive account card:
     - Pending reservation status buttons (if any in queue)
@@ -136,7 +149,15 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
     """
     toggle_conn_text = "🛑 قطع موقت" if is_enabled else "✅ فعال‌سازی مجدد"
     toggle_conn_action = "suspend" if is_enabled else "activate"
-    mode_text = "⏱ شروع: با اولین اتصال" if on_first_connect else "⏱ شروع: استاندارد (رول‌اوور)"
+    mode_text = "⏱ شروع: با اولین اتصال" if on_first_connect else "⏱ شروع: از زمان تمدید"
+    rollover_text = "🔄 رول‌اوور: فعال" if rollover_enabled else "⏹ رول‌اوور: غیرفعال"
+    bridge_enabled = _v52_ui_enabled(capabilities, v52_enabled)
+    if account_id is None and bridge_enabled:
+        try:
+            account = database.get_account_by_code_or_email(account_code)
+            account_id = account.get("id") if isinstance(account, dict) else account["id"] if account is not None else None
+        except Exception:
+            account_id = None
     
     keyboard = [
         [
@@ -153,13 +174,34 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
 
     if pending_res and role in ("super_admin", "rep"):
         res_id = pending_res["id"]
-        keyboard.append([
-            InlineKeyboardButton("🚀 فعال‌سازی فوری رزرو (سوزاندن فعلی)", callback_data=f"force_res:{res_id}:{account_code}"),
-            InlineKeyboardButton("🗑 لغو رزرو و عودت وجه", callback_data=f"cancel_res:{res_id}:{account_code}")
-        ])
+        if role == "rep":
+            # Representative activation/cancellation is explicitly two-step.
+            keyboard.append([
+                InlineKeyboardButton(
+                    "🚀 فعال‌سازی فوری رزرو (تأیید دوم)",
+                    callback_data=f"rep:confirm_force_res:{res_id}:{account_code}"
+                ),
+                InlineKeyboardButton(
+                    "🗑 لغو رزرو و عودت (تأیید دوم)",
+                    callback_data=f"rep:confirm_cancel_res:{res_id}:{account_code}"
+                )
+            ])
+        else:
+            # Super Admin account cards use the same two-step confirmation flow
+            # as the dedicated admin reservation queue.
+            keyboard.append([
+                InlineKeyboardButton(
+                    "🚀 فعال‌سازی فوری رزرو (تأیید دوم)",
+                    callback_data=f"admin:confirm_force_res:{res_id}:{account_code}"
+                ),
+                InlineKeyboardButton(
+                    "🗑 لغو رزرو و عودت (تأیید دوم)",
+                    callback_data=f"admin:confirm_cancel_res:{res_id}:{account_code}"
+                )
+            ])
     
     if role in ("super_admin", "rep"):
-        quick_plans = database.get_pricing_plans(quick_only=True)
+        quick_plans = database.get_pricing_plans(quick_only=True, active_only=True)
         # Pair quick plans dynamically
         row = []
         for p in quick_plans:
@@ -176,35 +218,53 @@ def build_account_keyboard(account_code: str, is_enabled: bool = True, on_first_
         # Controls Row
         keyboard.append([
             InlineKeyboardButton(toggle_conn_text, callback_data=f"{toggle_conn_action}:{account_code}"),
-            InlineKeyboardButton(mode_text, callback_data=f"toggle_mode:{account_code}")
+            InlineKeyboardButton(mode_text, callback_data=f"set_mode:{account_code}:{0 if on_first_connect else 1}")
+        ])
+        keyboard.append([
+            InlineKeyboardButton(
+                rollover_text,
+                callback_data=f"set_rollover:{account_code}:{0 if rollover_enabled else 1}"
+            )
         ])
     
-    # Fixed Deliverables Row
+    # Two balanced deliverable actions. Legacy deliv_sub remains backend-compatible.
+    if bridge_enabled and account_id:
+        keyboard.append([InlineKeyboardButton("👥 پروفایل‌ها و دسترسی‌ها", callback_data=f"v52:sub:{int(account_id)}")])
     keyboard.append([
-        InlineKeyboardButton("🔗 لینک ساب", callback_data=f"deliv_sub:{account_code}"),
-        InlineKeyboardButton("📱 QR ساب", callback_data=f"deliv_qr:{account_code}"),
-        InlineKeyboardButton("🔀 QR کانفیگ‌ها", callback_data=f"deliv_conf_qr:{account_code}")
+        InlineKeyboardButton("📱 سابسکریپشن + QR", callback_data=f"deliv_qr:{account_code}"),
+        InlineKeyboardButton("⚡ کانفیگ‌ها + QR", callback_data=f"deliv_cfg:{account_code}")
     ])
-    
+    reset_callback = f"confirm_reset_sub:{account_code}" if bridge_enabled else f"reset_sub:{account_code}"
+    keyboard.append([
+        InlineKeyboardButton("🔄 بازنشانی لینک ساب (ابطال قبلی)", callback_data=reset_callback)
+    ])
+    if role == "super_admin":
+        keyboard.append([
+            InlineKeyboardButton("🏠 بازگشت به پنل مدیریت ادمین", callback_data="admin:main")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton("🏠 بازگشت به پیشخوان نماینده", callback_data="rep:main")
+        ])
+
     return InlineKeyboardMarkup(keyboard)
 
 def build_more_plans_keyboard(account_code: str) -> InlineKeyboardMarkup:
     """
     Submenu for expanded pricing plans loaded dynamically from database (is_quick=0).
     """
-    all_plans = database.get_pricing_plans(quick_only=False)
+    all_plans = database.get_pricing_plans(quick_only=False, active_only=True)
     more_plans = [p for p in all_plans if not p.get("is_quick")]
     
     keyboard = []
-    row = []
     for p in more_plans:
-        row.append(InlineKeyboardButton(f"⚡️ {p['name']}", callback_data=f"qrenew:{account_code}:{p['plan_code']}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-        
+        keyboard.append([
+            InlineKeyboardButton(
+                f"⚡️ {p['name']}",
+                callback_data=f"qrenew:{account_code}:{p['plan_code']}"
+            )
+        ])
+
     keyboard.append([
         InlineKeyboardButton("↩️ بازگشت به منوی اصلی", callback_data=f"main_menu:{account_code}")
     ])
