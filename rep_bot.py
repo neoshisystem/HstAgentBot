@@ -4047,7 +4047,7 @@ def _v52_ticket_page(ctx, persona: str, ticket_id: str, *,
     """
     import support_service
     import support_ui
-    from ui_v52 import render_page
+    from ui_v52 import button as _button, render_page
     ticket = _ticket_row(ticket_id)
     if ticket is None:
         raise ValueError("این تیکت دیگر در دسترس نیست.")
@@ -4056,18 +4056,33 @@ def _v52_ticket_page(ctx, persona: str, ticket_id: str, *,
         f"{item.get('visibility', 'customer')}: {str(item.get('body') or '')[:180]}"
         for item in messages[-4:]
     ) or "هنوز پیامی برای این تیکت ثبت نشده است."
-    v52_router.DEFAULT_FSM.set(
-        ctx, "support_reply", payload={"ticket_id": ticket_id},
-        parent_callback=fsm_parent, now=int(time.time()),
-    )
     is_author = int(ticket.get("sender_tg_id") or 0) == int(ctx.get("actor_tg_id") or 0)
+    is_operator = persona in ("admin", "rep")
+    status = str(ticket.get("status") or "").strip().lower()
+    is_closed = status == "closed"
     rows = support_ui.ticket_page_rows(
         ticket_id, ticket.get("status"),
-        is_operator=(persona in ("admin", "rep")), is_author=is_author,
+        is_operator=is_operator, is_author=is_author,
         sender_tg_id=int(ticket.get("sender_tg_id") or 0) or None)
     if page_parent:
         rows = _v52_retarget_back_row(rows, "v52:tickets", page_parent,
                                       "🔙 بازگشت به پروفایل ۳۶۰ درجه")
+    if is_closed and not is_operator:
+        # Closed ticket for an end-user: the reply FSM would dead-end, so show a
+        # new-ticket door instead. The reopen button is already in lifecycle_rows.
+        body = support_ui.ticket_status_header(ticket.get("status"), ticket_id)
+        body += "\n\n" + summary
+        body += "\n\nاین تیکت بسته شده است. در صورت نیاز یک تیکت جدید ثبت کنید."
+        rows.append([_button("➕ ثبت تیکت جدید", "v52:newticket")])
+        return render_page(
+            "🎫 تیکت " + support_service.ticket_code_label(ticket_id),
+            body, persona=persona, page_kind="page", parent_callback=page_parent,
+            rows=rows,
+        )
+    v52_router.DEFAULT_FSM.set(
+        ctx, "support_reply", payload={"ticket_id": ticket_id},
+        parent_callback=fsm_parent, now=int(time.time()),
+    )
     return render_page(
         "🎫 تیکت " + support_service.ticket_code_label(ticket_id),
         support_ui.ticket_status_header(ticket.get("status"), ticket_id)
