@@ -41,6 +41,8 @@ TEXT_STATES: frozenset[str] = frozenset({
     # "send me the token" form was a dead end — the state was never settable, so the
     # operator's token fell through to the ordinary text handlers.
     "bot_register_token",
+    # S62: the subscription-domain wizard step for panels.
+    "panel_connection_suburl",
 })
 
 #: Draft states that also accept a photo attachment.
@@ -107,6 +109,7 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:panelname:([1-9][0-9]{0,17})$"), "begin_panel_name", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:panelurl:([1-9][0-9]{0,17})$"), "begin_panel_url", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:panelcred:([1-9][0-9]{0,17})$"), "begin_panel_credential", "root", lambda m: {"panel_id": int(m[1])}),
+    (re.compile(r"^v52:panelsuburl:([1-9][0-9]{0,17})$"), "begin_panel_suburl", "root", lambda m: {"panel_id": int(m[1])}),
     (re.compile(r"^v52:panelnew:(test|confirm)$"), "confirm_panel_draft", "root", lambda m: {"step": m[1]}),
     (re.compile(r"^v52:panelpolicy:([1-9][0-9]{0,17})$"), "preview_panel_policy", "root", lambda m: {"panel_id": int(m[1])}),
     # S57 advanced panel settings: capacity, naming, subscription host, test

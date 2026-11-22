@@ -339,8 +339,15 @@ def test_panel_credential_save_answers_with_the_next_step_buttons(s49):
     assert asyncio.run(rep_bot._route_v52_fsm_text(token_update, token_context)) is True
 
     text, kwargs = token_message.replies[0]
-    assert "ذخیره شد" in text
-    callbacks = _callbacks(kwargs["reply_markup"])
+    assert "دامنه" in text  # Step 5: subscription domain
+    # Send /skip to bypass suburl and trigger connection probe
+    skip_update, _q3, skip_message = make_update(text="/skip")
+    skip_context = make_context()
+    assert asyncio.run(rep_bot._route_v52_fsm_text(skip_update, skip_context)) is True
+
+    text2, kwargs2 = skip_message.replies[0]
+    assert "ذخیره شد" in text2
+    callbacks = _callbacks(kwargs2["reply_markup"])
     assert f"v52:paneltest:{panel_id}" in callbacks
     assert f"v52:panelauto:{panel_id}" in callbacks
     assert f"v52:life:{panel_id}:active" in callbacks
@@ -369,7 +376,11 @@ def test_panel_credential_wizard_accepts_a_bare_api_token(s49):
     token_update, _q2, token_message = make_update(text="S49BareApiTokenValue")
     asyncio.run(rep_bot._route_v52_fsm_text(token_update, make_context()))
 
-    assert f"v52:paneltest:{panel_id}" in _callbacks(token_message.replies[0][1]["reply_markup"])
+    # Step 5: /skip suburl
+    skip_update, _q2bis, skip_message = make_update(text="/skip")
+    asyncio.run(rep_bot._route_v52_fsm_text(skip_update, make_context()))
+
+    assert f"v52:paneltest:{panel_id}" in _callbacks(skip_message.replies[0][1]["reply_markup"])
     with database.get_db() as conn:
         auth_type = conn.execute(
             "SELECT auth_type FROM panels WHERE id=?", (panel_id,)

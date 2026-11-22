@@ -336,6 +336,28 @@ def _checkbox_label(text: str, state: bool) -> str:
     return f"{CHECKBOX_ON if state else CHECKBOX_OFF} {str(text)[:48]}"
 
 
+def _get_tier_fa(tier_code: str) -> str:
+    """Resolve a tier_code (from tier_policies) to its title_fa, or a generic fallback."""
+    try:
+        import database
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT title_fa FROM tier_policies WHERE tier_code=? LIMIT 1",
+                (tier_code,)).fetchone()
+        return str(row["title_fa"]) if row else tier_code
+    except Exception:
+        return tier_code
+
+
+def _get_tier_label(plan: dict) -> str:
+    """Build the tier button label for a plan card."""
+    tc = str(plan.get("tier_code") or "").strip()
+    if not tc:
+        return "🎖 سطح: عمومی"
+    fa = _get_tier_fa(tc)
+    return f"🎖 سطح: {fa}"
+
+
 def _split(value) -> list[str]:
     return [chunk.strip() for chunk in str(value or "").split("|")]
 
@@ -459,12 +481,15 @@ def plan_detail(ctx, plan_code, *, parent_callback: str | None = None):
         kind = str(plan.get("plan_kind") or "fixed")
         kind_fa = catalog.PLAN_KIND_FA.get(kind, kind)
         allowed_panels = [b for b in bindings if int(b["allowed"])]
+        current_tier = str(plan.get("tier_code") or "").strip()
+        tier_fa = _get_tier_fa(current_tier) if current_tier else "🌐 عمومی (همه)"
         lines = [
             f"• کد تعرفه: {code}",
             f"• حجم و مدت: {float(plan['gb']):g} گیگابایت / {int(plan['days'])} روز",
             f"• قیمت خرید نمایندگی: {_money(plan['rep_price'])} تومان",
             f"• قیمت فروش به کاربر: {_money(plan['user_price'])} تومان",
             f"• نوع تعرفه: {kind_fa}",
+            f"• سطح کاربری: {tier_fa}",
             f"• وضعیت فروش: {'🟢 فعال' if int(plan.get('is_active', 1) or 0) else '🔴 غیرفعال'}",
             f"• نمایش سریع در منو: {'⚡️ بله' if int(plan.get('is_quick') or 0) else '📦 خیر'}",
             f"• مخاطب مجاز: 👤 کاربران نهایی "
@@ -488,6 +513,7 @@ def plan_detail(ctx, plan_code, *, parent_callback: str | None = None):
              button("🟢 فعال‌سازی تعرفه" if not int(plan.get("is_active", 1) or 0)
                     else "⏸ غیرفعال‌سازی موقت تعرفه",
                     f"admin:set_plan_active:{code}:{0 if int(plan.get('is_active', 1) or 0) else 1}")],
+            [button(_get_tier_label(plan), f"admin:set_plan_tier:{code}")],
         ]
         rows.extend(plan_control_rows(ctx, code))
         rows.append([button("🗑 حذف این تعرفه", f"admin:confirm_del_plan:{code}")])

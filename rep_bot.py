@@ -1701,9 +1701,11 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                     panel = dict(row)
                     url = panel.get("raw_url") or panel.get("base_url") or "تنظیم نشده"
                     has_secret = bool(panel.get("auth_cipher") or panel.get("api_token_cipher"))
+                    sub_url = str(panel.get("sub_base_url") or "").strip()
                     body = (f"کد: {panel.get('panel_code', panel_id)}\nنام: {panel.get('name', '')}\n"
                             f"نوع: {panel.get('panel_type', '')}\nوضعیت: {panel.get('lifecycle', '')}\n"
-                            f"نشانی: {url}\nاعتبارنامه: {'ثبت شده (محرمانه)' if has_secret else 'ثبت نشده'}")
+                            f"نشانی: {url}\nاعتبارنامه: {'ثبت شده (محرمانه)' if has_secret else 'ثبت نشده'}\n"
+                            f"دامنهٔ سابسکریپشن: {sub_url if sub_url else 'ثبت نشده'}")
                     page = render_page("جزئیات پنل", body, persona="admin", rows=[
                         [button("ویرایش اتصال", f"v52:panelconfig:{panel_id}")],
                         [button("⚙️ تنظیمات پیشرفته پنل (ظرفیت، نام‌گذاری، تست، افزودنی)", f"v52:paneladv:{panel_id}")],
@@ -1711,8 +1713,10 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                         [button("⚡ تست اتصال و فعال‌سازی خودکار", f"v52:panelauto:{panel_id}")],
                         [button("🧩 انتخاب Inbound پیش‌فرض ساخت اکانت", f"v52:panelinbound:{panel_id}")],
                         [button("🟢 فعال‌سازی پس از آزمایش", f"v52:life:{panel_id}:active")],
-                        [button("بازگشت به فهرست", "v52:panels")],
-                    ])
+                        [button("⬅️ بازگشت به فهرست", "v52:panels"),
+                         button("🏠 بازگشت به پیشخوان", "v52:home:admin")],
+                    ],
+                    parent_callback="v52:panels")
             elif name == "choose_panel_inbound":
                 if persona != "admin" or not ctx.get("is_root"):
                     raise PermissionError("انتخاب inbound پیش‌فرض فقط در اختیار root است.")
@@ -2395,6 +2399,16 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 if persona != "admin" or not ctx.get("is_root"):
                     raise PermissionError("افزودن/ویرایش پنل فقط در اختیار root است.")
                 page = _v52_begin_panel_credential(ctx, int(params["panel_id"]))
+            elif name == "begin_panel_suburl":
+                if persona != "admin" or not ctx.get("is_root"):
+                    raise PermissionError("افزودن/ویرایش پنل فقط در اختیار root است.")
+                from panel_adapters.url_parser import parse_panel_url
+                pid = int(params["panel_id"])
+                v52_router.DEFAULT_FSM.set(
+                    ctx, "panel_connection_suburl", payload={"panel_id": pid},
+                    parent_callback=f"v52:panelcred:{pid}", now=int(time.time()))
+                import panel_admin_ui
+                page = panel_admin_ui.render_panel_suburl_step(ctx, pid)
             elif name == "confirm_panel_draft":
                 page = _v52_confirm_panel_draft(ctx, str(params["step"]))
             elif name == "preview_panel_policy":
@@ -2947,6 +2961,55 @@ async def _route_v52_fsm_text(update, context):
                     ctx, pid, error=str(exc) or "اعتبارنامه نامعتبر است.")
                 await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
                 return True
+            # Step 5: subscription domain (after credential, before probe)
+            v52_router.DEFAULT_FSM.set(
+                ctx, "panel_connection_suburl",
+                payload={"panel_id": pid},
+                parent_callback=f"v52:panelcred:{pid}", now=int(time.time()),
+            )
+            page = panel_admin_ui.render_panel_suburl_step(ctx, pid)
+            await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+            return True
+        if route.name == "panel_connection_suburl":
+            import panel_admin_ui
+            pid = int(payload["panel_id"])
+            raw = text_value.strip()
+            if raw.lower() in ("/skip", "لغو", "skip", "-"):
+                # Skip suburl — go straight to probe
+                pass
+            else:
+                from panel_adapters.url_parser import urlsplit
+                try:
+                    parsed = urlsplit(raw)
+                except Exception:
+                    v52_router.DEFAULT_FSM.set(
+                        ctx, "panel_connection_suburl", payload={"panel_id": pid},
+                        parent_callback=f"v52:panelcred:{pid}", now=int(time.time()))
+                    page = panel_admin_ui.render_panel_suburl_step(
+                        ctx, pid, error="نشانی نامعتبر است. یک URL معتبر با https بفرستید یا /skip را بزنید.")
+                    await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+                    return True
+                if parsed.scheme and parsed.scheme != "https" and parsed.scheme != "http":
+                    v52_router.DEFAULT_FSM.set(
+                        ctx, "panel_connection_suburl", payload={"panel_id": pid},
+                        parent_callback=f"v52:panelcred:{pid}", now=int(time.time()))
+                    page = panel_admin_ui.render_panel_suburl_step(
+                        ctx, pid, error="فقط نشانی https یا http معتبر است.")
+                    await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+                    return True
+                if not parsed.hostname:
+                    v52_router.DEFAULT_FSM.set(
+                        ctx, "panel_connection_suburl", payload={"panel_id": pid},
+                        parent_callback=f"v52:panelcred:{pid}", now=int(time.time()))
+                    page = panel_admin_ui.render_panel_suburl_step(
+                        ctx, pid, error="نشانی باید شامل نام میزبان باشد.")
+                    await message.reply_text(page.text, reply_markup=page.reply_markup, parse_mode="HTML")
+                    return True
+                with database.get_db() as conn:
+                    conn.execute("UPDATE panels SET sub_base_url=? WHERE id=?",
+                                 (raw, pid))
+                    conn.commit()
+            # After suburl (or skip), run the connection probe
             with database.get_db() as conn:
                 type_row = conn.execute("SELECT panel_type FROM panels WHERE id=?", (pid,)).fetchone()
             panel_type = str(type_row["panel_type"]) if type_row is not None else ""

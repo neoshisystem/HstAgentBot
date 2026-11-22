@@ -183,7 +183,7 @@ def render_panel_url_step(ctx, panel_id, *, error: str | None = None,
 
 def render_panel_credential_step(ctx, panel_id, *, error: str | None = None,
                                  parent_callback: str = "v52:panels"):
-    """Step 4 of 4 — the credential, then the live login probe."""
+    """Step 4 of 5 — the credential, then the live login probe."""
     if not _is_root(ctx):
         return render_error("افزودن/ویرایش پنل فقط در اختیار root است.", persona="admin",
                             parent_callback=parent_callback)
@@ -193,7 +193,28 @@ def render_panel_credential_step(ctx, panel_id, *, error: str | None = None,
     body = credential_help_text()
     if error:
         body = f"❌ {error}\n\n{body}"
-    body += "\nمرحله ۴ از ۴: اعتبارنامه"
+    body += "\nمرحله ۴ از ۵: اعتبارنامه"
+    return render_page("افزودن/ویرایش پنل", body, persona="admin", page_kind="form",
+                       root=True, rows=rows)
+
+
+def render_panel_suburl_step(ctx, panel_id, *, error: str | None = None,
+                             parent_callback: str = "v52:panels"):
+    """Step 5 of 5 — the subscription domain (optional)."""
+    if not _is_root(ctx):
+        return render_error("ثبت دامنهٔ اشتراک فقط در اختیار root است.", persona="admin",
+                            parent_callback=parent_callback)
+    pid = int(panel_id)
+    rows = _wizard_nav(f"v52:panelcred:{pid}", f"v52:panel:{pid}")
+    body = (
+        "دامنه مستقیم سابسکریپشن این پنل را وارد کنید.\n\n"
+        "مثال:\n"
+        "https://sub.example.com:2096\n\n"
+        "اگر ندارد /skip را بزنید."
+    )
+    if error:
+        body = f"❌ {error}\n\n{body}"
+    body += "\nمرحله ۵ از ۵: دامنهٔ سابسکریپشن (اختیاری)"
     return render_page("افزودن/ویرایش پنل", body, persona="admin", page_kind="form",
                        root=True, rows=rows)
 

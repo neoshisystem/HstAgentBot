@@ -1343,6 +1343,51 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         return
 
+    elif action == "set_plan_tier":
+        plan_code = sub_action
+        with database.get_db() as conn:
+            tiers = conn.execute(
+                "SELECT tier_code, title_fa, actor_type FROM tier_policies ORDER BY actor_type,rank"
+            ).fetchall()
+        rows = [[InlineKeyboardButton("🌐 عمومی (همه)", callback_data=f"admin:set_plan_tier_val:{plan_code}:__none__")]]
+        for tier in tiers:
+            emoji = "👤" if tier["actor_type"] == "end_user" else "🧑‍💼"
+            rows.append([InlineKeyboardButton(
+                f"{emoji} {tier['title_fa']} ({tier['tier_code']})",
+                callback_data=f"admin:set_plan_tier_val:{plan_code}:{tier['tier_code']}")])
+        rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data=f"admin:plan_detail:{plan_code}")])
+        text = f"🎖 **انتخاب سطح کاربری برای تعرفه:** `{plan_code}`\n\nسطح فعلی تعیین می‌کند کدام کاربران می‌توانند این تعرفه را ببینند و بخرند."
+        keyboard = InlineKeyboardMarkup(rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await query.answer()
+
+    elif action == "set_plan_tier_val":
+        # Format: admin:set_plan_tier_val:{plan_code}:{tier_code_or_none}
+        plan_code = parts[3] if len(parts) > 3 else ""
+        tier_val = parts[4] if len(parts) > 4 else ""
+        if tier_val == "__none__":
+            tier_val = ""
+        with database.get_db() as conn:
+            conn.execute("UPDATE pricing_plans SET tier_code=? WHERE plan_code=?", (tier_val or None, plan_code))
+            conn.commit()
+        plan = database.get_plan(plan_code)
+        tag = "عمومی" if not tier_val else tier_val
+        await query.answer(f"✅ سطح تعرفه به {tag} تغییر یافت.", show_alert=True)
+        # Re-render the plan detail card (admin_panel.py's own plan_detail)
+        if not plan:
+            await query.answer("❌ پلن یافت نشد.", show_alert=True)
+            return
+        lines = [
+            f"⚙️ **مشخصات و مدیریت پلن: {escape_markdown(plan.get('name') or '')}**\n",
+            f"• کد پلن: `{escape_markdown_code(plan['plan_code'])}`",
+            f"• مشخصات: **{plan['gb']} گیگابایت / {plan['days']} روز**",
+            f"• قیمت نماینده: **{plan['rep_price']:,} تومان**",
+            f"• قیمت کاربر نهایی: **{plan['user_price']:,} تومان**",
+            f"• سطح کاربری: **{'🌐 عمومی' if not tier_val else f'🎖 {tier_val}'}**",
+        ]
+        keyboard = _plan_card_keyboard(plan, plan_code, user, chat)
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+
     elif action == "confirm_del_plan":
         plan_code = sub_action
         keyboard = build_back_to_admin_keyboard([
@@ -1355,11 +1400,23 @@ async def _handle_admin_callbacks_impl(update: Update, context: ContextTypes.DEF
     elif action == "do_del_plan":
         plan_code = sub_action
         try:
-            deleted = database.delete_plan(plan_code)
+            with database.get_db() as conn:
+                cur = conn.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                pending = cur.execute(
+                    "SELECT 1 FROM reserved_packages WHERE plan_code = ? AND status = 'pending' LIMIT 1",
+                    (plan_code,)
+                ).fetchone()
+                if pending:
+                    raise ValueError("امکان غیرفعال‌سازی تعرفه در حالی که سفارش‌های در انتظار دارند وجود ندارد.")
+                cur.execute(
+                    "UPDATE pricing_plans SET is_active=0 WHERE plan_code=?",
+                    (plan_code,))
+                conn.commit()
         except ValueError as exc:
             await query.answer(str(exc), show_alert=True)
             return
-        await query.answer("🗑 تعرفه حذف شد." if deleted else "تعرفه یافت نشد.", show_alert=True)
+        await query.answer("⏸ تعرفه غیرفعال (سافت‌دلیت) شد." if cur.rowcount else "تعرفه یافت نشد.", show_alert=True)
         # S59 — return to the unified hub, not the legacy v4 list. The old list had no
         # categories, no tariff kind, no audience and no panel bindings, so deleting a
         # plan dropped the operator onto a menu that could not finish the job.
