@@ -2446,6 +2446,29 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                 from ui_v52 import render_page
                 text, rows = goods_ui.admin_product_detail(ctx, int(params["product_id"]))
                 page = render_page("📦 جزئیات محصول", text, persona="admin", rows=rows)
+            elif name == "admin_catalog_page":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.show_admin_product_catalog_page(
+                    ctx, int(params["page"]))
+                page = render_page("📋 کاتالوگ مدیریت کالا", text, persona="admin", rows=rows)
+            elif name == "shop_categories":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.show_category_management(ctx)
+                page = render_page("🏷 مدیریت دسته‌بندی‌ها", text, persona="admin", rows=rows)
+            elif name == "shop_sales_report":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.show_sales_report(
+                    ctx, int(params["product_id"]), int(params["page"]))
+                page = render_page("🛍 گزارش فروش", text, persona="admin", rows=rows)
+            elif name == "product_wizard_category":
+                import goods_ui
+                from ui_v52 import render_page
+                text, rows = goods_ui.handle_product_wizard_choice(
+                    ctx, "category", str(params["value"]))
+                page = render_page("➕ افزودن محصول", text, persona="admin", rows=rows)
             elif name == "begin_product_stock":
                 import goods_ui
                 from ui_v52 import render_page

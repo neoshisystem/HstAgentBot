@@ -187,6 +187,11 @@ _CALLBACK_PATTERNS: tuple[tuple[re.Pattern[str], str, str, Callable[[re.Match[st
     (re.compile(r"^v52:shop:guideclear:([1-9][0-9]{0,17})$"), "clear_product_guide", "root DM", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:delete:([1-9][0-9]{0,17}):confirm$"), "confirm_product_delete", "root", lambda m: {"product_id": int(m[1])}),
     (re.compile(r"^v52:shop:delete:([1-9][0-9]{0,17})$"), "preview_product_delete", "root", lambda m: {"product_id": int(m[1])}),
+    # S61 Part 2 — paginated admin catalog, sales report, categories, wizard category choices
+    (re.compile(r"^v52:shop:catalog:([1-9][0-9]{0,17})$"), "admin_catalog_page", "root", lambda m: {"page": int(m[1])}),
+    (re.compile(r"^v52:shop:categories$"), "shop_categories", "root", lambda m: {}),
+    (re.compile(r"^v52:shop:sales:([1-9][0-9]{0,17}):([1-9][0-9]{0,17})$"), "shop_sales_report", "root", lambda m: {"product_id": int(m[1]), "page": int(m[2])}),
+    (re.compile(r"^v52:shop:wiz:category:([a-z_0-9]+)$"), "product_wizard_category", "root", lambda m: {"value": m[1]}),
     (re.compile(r"^v52:tickets$"), "list_tickets", "actor", lambda m: {}),
     (re.compile(r"^v52:ticketsettings$"), "ticket_status_settings", "root", lambda m: {}),
     (re.compile(r"^v52:ticketstatus:new$"), "begin_ticket_status_new", "root DM", lambda m: {}),

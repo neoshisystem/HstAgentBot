@@ -6,6 +6,7 @@ allocation while rendering a resend action.
 """
 from __future__ import annotations
 
+import random
 from collections.abc import Mapping, Sequence
 import re
 import time
@@ -121,9 +122,31 @@ def _stock(product: Mapping[str, Any], stock_count: int | None = None) -> int | 
     return value
 
 
-def _price(product: Mapping[str, Any], persona: str) -> int:
+def _price(product: Mapping[str, Any], persona: str, *, ctx: Any = None) -> int:
     field = "user_price" if persona == "user" else "rep_price"
-    return _money(product.get(field, product.get("price_toman", 0)), field)
+    base = _money(product.get(field, product.get("price_toman", 0)), field)
+    if ctx is not None and persona in ("rep", "representative"):
+        return _apply_tier_discount(ctx, base)
+    return base
+
+
+def _apply_tier_discount(ctx: Any, price_toman: int) -> int:
+    """Apply the actor's tier discount (discount_bps) to the given price."""
+    try:
+        import tier_service, database
+        tg_id = _actor(ctx)
+        with database.get_db() as conn:
+            actor_type, tier_code = tier_service._actor_tier(conn, tg_id)
+            tier = tier_service.get_tier(conn, actor_type, tier_code)
+            if tier is None:
+                return price_toman
+            discount_bps = int(tier.get("discount_bps") or 0)
+            if discount_bps <= 0:
+                return price_toman
+            discounted = price_toman - (price_toman * discount_bps // 10000)
+            return max(discounted, 0)
+    except Exception:
+        return price_toman
 
 
 def show_catalog(
@@ -151,7 +174,7 @@ def show_catalog(
                 continue
             count = _stock(product, (stock_counts or {}).get(product_id))
             title = str(product.get("title") or product.get("product_code") or f"کالا {product_id}")
-            price = _price(product, persona)
+            price = _price(product, persona, ctx=ctx)
             if price <= 0:
                 # The add-product wizard encodes "allowed audience" in the price
                 # fields: a zero price on this persona's side means the product is
@@ -161,10 +184,9 @@ def show_catalog(
             if delivery == "file_document" and product.get("file_bot_id") is not None:
                 unavailable = _bot_id(ctx) != _positive(product["file_bot_id"], "file_bot_id")
             stock_label = "نامشخص" if count is None else str(count)
-            lines.append(f"{title} | {price:,} تومان | موجودی: {stock_label} | {delivery}")
-            if unavailable:
-                lines.append(f"{product_id}: فعلاً قابل خرید نیست")
-            else:
+            display_title = f"{title} [🔴 ناموجود]" if unavailable else title
+            lines.append(f"{display_title} | {price:,} تومان | موجودی: {stock_label} | {delivery}")
+            if not unavailable:
                 rows.append([button(title[:32], f"v52:goods:{product_id}")])
             visible.append(product_id)
         if not visible:
@@ -384,10 +406,7 @@ def _audience_prices(audience: str, base: int) -> tuple[int, int]:
 
 
 def admin_shop_page(ctx: Any, *, parent_callback: str | None = "v52:home:admin"):
-    """Admin catalogue manager: every product plus the add-product entry.
-
-    Returns ``(text, rows)``; the dispatcher wraps it in ``render_page``.
-    """
+    """Admin dashboard: stats + paginated catalog link + category management."""
     try:
         _require_root(ctx)
         with database.get_db() as conn:
@@ -396,37 +415,36 @@ def admin_shop_page(ctx: Any, *, parent_callback: str | None = "v52:home:admin")
                 "LEFT JOIN digital_categories c ON c.id=p.category_id "
                 "ORDER BY p.sort_order, p.id"
             ).fetchall()
-            stock_map = {
-                int(row["product_id"]): int(row["count"])
-                for row in conn.execute(
-                    "SELECT product_id, COUNT(*) AS count FROM digital_inventory "
-                    "WHERE status='available' GROUP BY product_id"
-                ).fetchall()
-            }
-        lines = ["مدیریت کالاهای دیجیتال فروشگاه.", ""]
-        buttons = [[button("➕ افزودن محصول / کالای جدید", "v52:shop:new")]]
-        if not product_rows:
-            lines.append("هنوز هیچ محصولی ثبت نشده است؛ با دکمهٔ بالا اولین کالا را بسازید.")
-        else:
-            lines.append(f"تعداد محصولات: {len(product_rows)}")
-            for row in product_rows:
-                product_id = int(row["id"])
-                title = str(row["title"])
-                category = str(row["category_title"] or "بدون دسته")
-                delivery = str(row["delivery_type"])
-                price = int(row["user_price"])
-                stock = stock_map.get(product_id, 0)
-                enabled = "فعال" if row["is_active"] else "غیرفعال"
-                lines.append(
-                    f"#{product_id} · {title} | دسته: {category} | "
-                    f"{_DELIVERY_LABELS.get(delivery, delivery)} | قیمت: {price:,} تومان | "
-                    f"موجودی: {stock} | {enabled}"
-                )
-                buttons.append([button(
-                    f"#{product_id} {title[:24]} · {price:,}ت · موجودی {stock} · {enabled}",
-                    f"v52:shop:product:{product_id}",
-                )])
-        buttons.append([button("🛒 مشاهده فروشگاه مشتریان", "v52:shop:catalog")])
+            cat_count = conn.execute(
+                "SELECT COUNT(*) FROM digital_categories WHERE is_active=1"
+            ).fetchone()[0]
+            low_stock = conn.execute(
+                "SELECT di.product_id, COUNT(*) AS cnt, dp.title "
+                "FROM digital_inventory di "
+                "JOIN digital_products dp ON dp.id=di.product_id "
+                "WHERE di.status='available' AND dp.is_active=1 "
+                "GROUP BY di.product_id HAVING cnt <= 3 ORDER BY cnt "
+                "LIMIT 3"
+            ).fetchall()
+        total = len(product_rows)
+        lines = [
+            "🛍 **داشبورد مدیریت فروشگاه**",
+            "",
+            f"📊 **آمار**",
+            f"• تعداد محصولات فعال: {total}",
+            f"• تعداد دسته‌بندی‌ها: {cat_count}",
+        ]
+        if low_stock:
+            lines.append("")
+            lines.append("⚠️ **هشدار کمبود موجودی:**")
+            for row in low_stock:
+                lines.append(f"• #{row['product_id']} {row['title']} — {row['cnt']} عدد باقی‌مانده")
+        buttons = [
+            [button("➕ افزودن محصول / کالای جدید", "v52:shop:new")],
+            [button("📋 مدیریت کالاها و انبار", "v52:shop:catalog:1")],
+            [button("🏷 مدیریت دسته‌بندی‌ها", "v52:shop:categories")],
+            [button("🛒 مشاهده فروشگاه مشتریان", "v52:shop:catalog")],
+        ]
         return "\n".join(lines), buttons
     except (TypeError, ValueError, PermissionError) as exc:
         return str(exc), [[button("بازگشت", parent_callback or "v52:home:admin")]]
@@ -461,6 +479,7 @@ def admin_product_detail(ctx: Any, product_id: int, *, parent_callback: str | No
         buttons = [
             [button("📦 مدیریت موجودی و افزودن کد/آیتم به انبار محصول", f"v52:shop:stock:{pid}")],
             [button("✏️ ویرایش قیمت و وضعیت (فعال/غیرفعال)", f"v52:shop:edit:{pid}")],
+            [button("🛍 گزارش فروش این کالا", f"v52:shop:sales:{pid}:1")],
             [button("🗑 حذف محصول", f"v52:shop:delete:{pid}")],
             [button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")],
         ]
@@ -500,10 +519,23 @@ def _render_wizard_step(ctx: Any, step: str, answers: Mapping[str, Any],
     cancel = [[button("لغو", parent_callback or "v52:shop")]]
     prompts = {
         "title": "گام ۱ از ۶ — نام محصول را در پیام بعدی ارسال کنید.",
-        "category": "گام ۲ از ۶ — نام دسته‌بندی را ارسال کنید (اگر نباشد ساخته می‌شود).",
         "price": "گام ۵ از ۶ — قیمت پایه به تومان را ارسال کنید (فقط عدد).",
         "description": "گام ۶ از ۶ — راهنمای استفاده/توضیحات را ارسال کنید یا رد کنید.",
     }
+    if step == "title":
+        return prompts["title"] + summary, cancel
+    if step == "category":
+        if answers.get("_wz_cat_pending_new"):
+            # User clicked "➕ جدید" — now prompt for the new name
+            return ("گام ۲ از ۶ — نام دسته‌بندی جدید را در پیام بعدی ارسال کنید.\n"
+                    "اگر منقضی شد از دکمهٔ لغو استفاده کنید.") + summary, cancel
+        # Show existing categories as inline choices
+        with database.get_db() as conn:
+            choices = _wz_goods_category_choices(conn)
+        cat_rows = []
+        for title, val in choices:
+            cat_rows.append([button(title, f"v52:shop:wiz:category:{val}")])
+        return "گام ۲ از ۶ — دسته‌بندی را انتخاب کنید یا یک دستهٔ جدید بسازید." + summary, cat_rows
     if step in prompts:
         rows = cancel
         if step == "description":
@@ -559,7 +591,7 @@ def _persist_wizard_product(ctx: Any, answers: Mapping[str, Any], parent_callbac
         category_id = _category_id(conn, category_title)
         conn.commit()
     saved = goods_service.save_product({
-        "product_code": "SKU-" + uuid.uuid4().hex[:12].upper(),
+        "product_code": "PRD-" + str(random.randint(1000, 9999)),
         "category_id": category_id,
         "title": title,
         "description": description,
@@ -630,10 +662,28 @@ def build_product_wizard_step(ctx: Any, payload: Mapping[str, Any], *, value: An
                     raise ValueError("نام محصول باید بین ۱ تا ۲۰۰ نویسه باشد.")
                 answers["title"] = title
             elif current == "category":
-                category = str(value).strip()
-                if not category or len(category) > 120:
-                    raise ValueError("نام دسته‌بندی باید بین ۱ تا ۱۲۰ نویسه باشد.")
-                answers["category_title"] = category
+                raw = str(value).strip()
+                # If it's a digit — existing category selected via button
+                if raw.isdigit():
+                    with database.get_db() as conn:
+                        row = conn.execute(
+                            "SELECT id, title FROM digital_categories WHERE id=? AND is_active=1",
+                            (int(raw),),
+                        ).fetchone()
+                        if row is None:
+                            raise ValueError("دسته‌بندی انتخاب‌شده یافت نشد یا غیرفعال است.")
+                        answers["category_title"] = str(row["title"])
+                    answers.pop("_wz_cat_pending_new", None)
+                elif raw == "__new__":
+                    # User clicked "➕ جدید" — keep step, show text prompt
+                    answers["_wz_cat_pending_new"] = True
+                    return _render_wizard_step(ctx, "category", answers, parent_callback)
+                else:
+                    # Free-text category name (entered after clicking "➕ جدید")
+                    if not raw or len(raw) > 120:
+                        raise ValueError("نام دسته‌بندی باید بین ۱ تا ۱۲۰ نویسه باشد.")
+                    answers["category_title"] = raw
+                    answers.pop("_wz_cat_pending_new", None)
             elif current == "delivery":
                 if str(value) not in {"auto_inventory", "manual_fulfill"}:
                     raise ValueError("نوع تحویل نامعتبر است.")
@@ -989,33 +1039,187 @@ def preview_product_delete(ctx: Any, product_id: int, *, parent_callback: str | 
 
 
 def confirm_product_delete(ctx: Any, product_id: int, *, parent_callback: str | None = "v52:shop"):
-    """Second delete step: remove the product, refusing when inventory still references it."""
+    """Second delete step: archive (set is_active=0) instead of hard-delete."""
     try:
         _require_root(ctx)
         pid = _positive(product_id, "product_id")
         with database.get_db() as conn:
             row = conn.execute(
-                "SELECT id,title FROM digital_products WHERE id=?", (pid,)).fetchone()
+                "SELECT id,title,is_active FROM digital_products WHERE id=?", (pid,)).fetchone()
             if row is None:
                 raise ValueError("محصول موردنظر یافت نشد.")
-            stock = _available_stock(conn, pid)
-            total_stock = conn.execute(
-                "SELECT COUNT(*) FROM digital_inventory WHERE product_id=?", (pid,)).fetchone()[0]
-            if int(total_stock) > 0:
-                raise ValueError(
-                    "این محصول رکورد انبار دارد و حذف آن مجاز نیست؛ ابتدا آن را غیرفعال کنید.")
-            conn.execute("DELETE FROM digital_products WHERE id=?", (pid,))
+            conn.execute("UPDATE digital_products SET is_active=0 WHERE id=?", (pid,))
             conn.commit()
-        text = (f"🗑 محصول #{pid} · {row['title']} حذف شد.\n"
-                f"موجودی باقی‌ماندهٔ حذف‌شده: {stock}")
+        text = (f"🗑 محصول #{pid} · {row['title']} بایگانی شد (is_active=0).\n"
+                "برای بازیابی از دکمهٔ فعال/غیرفعال در کارت محصول استفاده کنید.")
         rows = [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
         return text, rows
     except (TypeError, ValueError, PermissionError) as exc:
         return str(exc), [[button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")]]
 
 
+# ── Paginated admin product catalog ──────────────────────────────────────────
+
+def show_admin_product_catalog_page(ctx: Any, page: int, *,
+                                    parent_callback: str | None = "v52:shop"):
+    """Paginated admin catalog (10 per page). Returns ``(text, rows)``."""
+    try:
+        _require_root(ctx)
+        page = max(1, int(page))
+        per_page = 10
+        offset = (page - 1) * per_page
+        with database.get_db() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM digital_products"
+            ).fetchone()[0]
+            product_rows = conn.execute(
+                "SELECT p.*, c.title AS category_title FROM digital_products p "
+                "LEFT JOIN digital_categories c ON c.id=p.category_id "
+                "ORDER BY p.sort_order, p.id LIMIT ? OFFSET ?",
+                (per_page, offset),
+            ).fetchall()
+            stock_map = {
+                int(row["product_id"]): int(row["count"])
+                for row in conn.execute(
+                    "SELECT product_id, COUNT(*) AS count FROM digital_inventory "
+                    "WHERE status='available' GROUP BY product_id"
+                ).fetchall()
+            }
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        lines = [f"📋 کاتالوگ مدیریت کالا — صفحهٔ {page} از {total_pages}", ""]
+        buttons = []
+        for row in product_rows:
+            pid = int(row["id"])
+            title = str(row["title"])
+            category = str(row["category_title"] or "بدون دسته")
+            delivery = str(row["delivery_type"])
+            price = int(row["user_price"])
+            stock = stock_map.get(pid, 0)
+            enabled = "فعال" if row["is_active"] else "غیرفعال"
+            lines.append(
+                f"#{pid} · {title} | {_DELIVERY_LABELS.get(delivery, delivery)} | "
+                f"{price:,}ت | موجودی {stock} | {enabled} | {category}"
+            )
+            buttons.append([button(
+                f"#{pid} {title[:24]} · {price:,}ت · {stock} · {enabled}",
+                f"v52:shop:product:{pid}",
+            )])
+        if not product_rows:
+            lines.append("هیچ محصولی در این صفحه وجود ندارد.")
+        # Pagination row
+        nav = []
+        if page > 1:
+            nav.append(button("◀️ صفحهٔ قبل", f"v52:shop:catalog:{page - 1}"))
+        nav.append(button(f"📄 {page}/{total_pages}", "v52:shop"))
+        if page < total_pages:
+            nav.append(button("صفحهٔ بعد ▶️", f"v52:shop:catalog:{page + 1}"))
+        if nav:
+            buttons.append(nav)
+        return "\n".join(lines), buttons
+    except (TypeError, ValueError, PermissionError) as exc:
+        return str(exc), [[button("بازگشت", parent_callback or "v52:shop")]]
+
+
+# ── Sales report per product ────────────────────────────────────────────────
+
+def show_sales_report(ctx: Any, product_id: int, page: int = 1, *,
+                      parent_callback: str | None = "v52:shop"):
+    """Paginated buyers list for a product. Returns ``(text, rows)``."""
+    try:
+        _require_root(ctx)
+        pid = _positive(product_id, "product_id")
+        page = max(1, int(page))
+        per_page = 10
+        offset = (page - 1) * per_page
+        with database.get_db() as conn:
+            product = conn.execute(
+                "SELECT id,title FROM digital_products WHERE id=?", (pid,)).fetchone()
+            if product is None:
+                raise ValueError("محصول موردنظر یافت نشد.")
+            total = conn.execute(
+                "SELECT COUNT(*) FROM digital_inventory "
+                "WHERE product_id=? AND sold_to_tg_id IS NOT NULL",
+                (pid,),
+            ).fetchone()[0]
+            sales = conn.execute(
+                "SELECT sold_to_tg_id, sold_at FROM digital_inventory "
+                "WHERE product_id=? AND sold_to_tg_id IS NOT NULL "
+                "ORDER BY sold_at DESC LIMIT ? OFFSET ?",
+                (pid, per_page, offset),
+            ).fetchall()
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        lines = [
+            f"🛍 گزارش فروش: #{pid} · {product['title']}",
+            f"تعداد کل فروش: {total}",
+            f"صفحهٔ {page} از {total_pages}",
+            "",
+        ]
+        if not sales:
+            lines.append("هنوز هیچ فروشی برای این کالا ثبت نشده است.")
+        for s in sales:
+            sold_at_str = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(int(s["sold_at"]))
+            ) if s.get("sold_at") else "نامشخص"
+            lines.append(f"• خریدار: `{s['sold_to_tg_id']}` در {sold_at_str}")
+        buttons = []
+        nav = []
+        if page > 1:
+            nav.append(button("◀️ قبل", f"v52:shop:sales:{pid}:{page - 1}"))
+        nav.append(button(f"📄 {page}/{total_pages}", f"v52:shop:product:{pid}"))
+        if page < total_pages:
+            nav.append(button("بعد ▶️", f"v52:shop:sales:{pid}:{page + 1}"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([button("بازگشت به محصول", f"v52:shop:product:{pid}")])
+        return "\n".join(lines), buttons
+    except (TypeError, ValueError, PermissionError) as exc:
+        return str(exc), [[button("بازگشت", parent_callback or "v52:shop")]]
+
+
+# ── Category management dashboard ───────────────────────────────────────────
+
+def show_category_management(ctx: Any, *,
+                             parent_callback: str | None = "v52:shop"):
+    """List all categories with back button."""
+    try:
+        _require_root(ctx)
+        with database.get_db() as conn:
+            cats = conn.execute(
+                "SELECT c.*, (SELECT COUNT(*) FROM digital_products p "
+                "WHERE p.category_id=c.id AND p.is_active=1) AS product_count "
+                "FROM digital_categories c ORDER BY c.sort_order, c.id"
+            ).fetchall()
+        lines = ["🏷 مدیریت دسته‌بندی‌ها", ""]
+        if not cats:
+            lines.append("هیچ دسته‌بندی‌ای ثبت نشده است.")
+        for c in cats:
+            status = "فعال" if c["is_active"] else "غیرفعال"
+            lines.append(
+                f"#{c['id']} · {c['title']} | {c['product_count']} محصول | {status}"
+            )
+        return "\n".join(lines), [
+            [button("بازگشت به مدیریت فروشگاه", parent_callback or "v52:shop")],
+        ]
+    except (TypeError, ValueError, PermissionError) as exc:
+        return str(exc), [[button("بازگشت", parent_callback or "v52:shop")]]
+
+
+# ── Category choices helper for the wizard ──────────────────────────────────
+
+def _wz_goods_category_choices(conn) -> list[tuple[str, str]]:
+    """Return [(title, callback_value)] for existing active categories."""
+    rows = conn.execute(
+        "SELECT id, title FROM digital_categories WHERE is_active=1 ORDER BY sort_order, id"
+    ).fetchall()
+    choices = [(str(row["title"]), str(row["id"])) for row in rows]
+    choices.append(("➕ دسته‌بندی جدید", "__new__"))
+    return choices
+
+
 __all__ = ["show_catalog", "preview_product", "prepare_manual_delivery",
            "admin_shop_page", "admin_product_detail", "build_product_wizard_step",
            "begin_product_wizard", "handle_product_wizard_choice", "begin_stock_import",
            "begin_product_edit", "toggle_product_active", "begin_product_price",
-           "apply_product_price", "preview_product_delete", "confirm_product_delete"]
+           "apply_product_price", "preview_product_delete", "confirm_product_delete",
+           "show_admin_product_catalog_page", "show_sales_report",
+           "show_category_management"]
