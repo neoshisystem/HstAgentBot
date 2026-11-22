@@ -6036,35 +6036,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         raw_id = data.replace("admin_reject_rcp_", "")
         target_rcp = int(raw_id) if raw_id.isdigit() else raw_id
-        try:
-            rcp = database.reject_payment_receipt(target_rcp, user.id, "عدم تطابق با گردش حساب")
-            if rcp.get("status") != "rejected":
-                status = rcp.get("status", "unknown")
-                await _settle_receipt_message(query, rcp, status, user)
-                await query.answer(
-                    f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {status}",
-                    show_alert=True
-                )
-                return
-            await _settle_receipt_message(query, rcp, "rejected", user)
-            await query.answer(f"❌ فیش {rcp['tracking_code']} رد شد.")
-            
-            try:
-                notify_txt = (
-                    f"⚠️ **رد فیش پرداختی:**\n\n"
-                    f"• کد رهگیری: `{rcp['tracking_code']}`\n"
-                    f"• مبلغ: **{rcp['amount_toman']:,} تومان**\n"
-                    f"• وضعیت: **رد شد** (علت: عدم تطابق با تراکنش‌های بانکی)"
-                )
-                await context.bot.send_message(
-                    chat_id=rcp["user_id"], text=notify_txt, parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=build_actor_navigation_keyboard(
-                        "rep" if rcp["role"] == "rep" else "end_user"),
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify user of receipt rejection: {e}")
-        except Exception as e:
-            await query.answer(f"❌ خطا در رد فیش: {e}", show_alert=True)
+        # First check if receipt is still pending
+        rcp = database.get_payment_receipt(target_rcp)
+        if not rcp:
+            await query.answer("❌ فیش یافت نشد.", show_alert=True)
+            return
+        if rcp.get("status") != "pending":
+            await query.answer(f"⚠️ این فیش قبلاً بررسی شده است؛ وضعیت فعلی: {rcp.get('status', 'نامشخص')}", show_alert=True)
+            await _settle_receipt_message(query, rcp, rcp["status"], user)
+            return
+        # Store pending rejection state and ask for reason
+        context.user_data["admin_state"] = {
+            "action": "receipt_reject_reason",
+            "receipt_id": target_rcp,
+            "receipt_code": rcp.get("tracking_code", "?"),
+            "ts": time.time(),
+            "return_callback": f"admin_detail_rcp_{raw_id}",
+        }
+        await query.edit_message_text(
+            "❌ **رد فیش**\n\n"
+            f"• کد رهگیری: `{rcp.get('tracking_code', '?')}`\n"
+            f"• مبلغ: **{int(rcp.get('amount_toman', 0)):,} تومان**\n\n"
+            "لطفاً دلیل رد فیش را در پیام بعدی ارسال کنید.\n"
+            "مثال: تصویر ناخواناست، مبلغ مغایرت دارد، شماره کارت اشتباه است\n\n"
+            "💡 برای انصراف، «لغو» را ارسال کنید.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await query.answer("لطفاً دلیل رد را ارسال کنید.")
         return
 
     if data.startswith("admin_detail_rcp_"):

@@ -2987,6 +2987,54 @@ async def _process_admin_text_input_impl(update: Update, context: ContextTypes.D
         context.user_data.pop("admin_state",None)
         return True
 
+    elif action == "receipt_reject_reason":
+        from rep_bot import build_actor_navigation_keyboard
+        receipt_id = admin_state.get("receipt_id")
+        reason = text.strip()
+        if not reason or len(reason) > 500:
+            return await _reply_fsm_validation_error(
+                update, context, admin_state,
+                "دلیل رد باید بین ۱ تا ۵۰۰ نویسه باشد.")
+        try:
+            rcp = database.reject_payment_receipt(receipt_id, update.effective_user.id, reason)
+        except Exception as exc:
+            return await _reply_fsm_validation_error(
+                update, context, admin_state,
+                f"خطا در رد فیش: {exc}")
+        if rcp.get("status") != "rejected":
+            await update.message.reply_text(
+                f"⚠️ فیش قبلاً بررسی شده است؛ وضعیت فعلی: {rcp.get('status', 'نامشخص')}")
+            context.user_data.pop("admin_state", None)
+            return True
+        from rep_bot import _settle_receipt_message
+        # Simulate callback query for _settle_receipt_message
+        from types import SimpleNamespace
+        fake_query = SimpleNamespace(
+            message=update.message,
+            answer=lambda *a, **kw: None,
+            data=f"admin_reject_rcp_{receipt_id}",
+        )
+        await _settle_receipt_message(fake_query, rcp, "rejected", update.effective_user)
+        notify_txt = (
+            f"⚠️ **رد فیش پرداختی:**\n\n"
+            f"• کد رهگیری: `{rcp['tracking_code']}`\n"
+            f"• مبلغ: **{int(rcp['amount_toman']):,} تومان**\n"
+            f"• وضعیت: **رد شد** (علت: {reason})"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=rcp["user_id"], text=notify_txt, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_actor_navigation_keyboard(
+                    "rep" if rcp["role"] == "rep" else "end_user"),
+            )
+        except Exception as e:
+            logger.warning("Failed to notify user of receipt rejection: %s", e)
+        context.user_data.pop("admin_state", None)
+        await update.message.reply_text(
+            f"✅ فیش {rcp.get('tracking_code', '?')} با موفقیت رد شد.\n"
+            f"علت ثبت‌شده: {reason}")
+        return True
+
     return False
 
 
@@ -4152,7 +4200,7 @@ async def process_admin_text_input(update: Update, context: ContextTypes.DEFAULT
         "pay", "add_rep", "edit_plan", "transfer", "transfer_user_target",
         "inspect", "add_plan", "link_user", "search_user", "edit_user_id",
         "link_user_account", "unlink_user_account", "edit_rep", "edit_plan_specs",
-        "profile_note",
+        "profile_note", "receipt_reject_reason",
     }
     state = context.user_data.get("admin_state")
     attempts_before = state.get("attempts", 0) if isinstance(state, dict) else 0

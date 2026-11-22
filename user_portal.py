@@ -180,7 +180,8 @@ def build_user_portal_keyboard(base_role: str | None = None) -> InlineKeyboardMa
             [InlineKeyboardButton("👤 پروفایل‌های اشتراک", callback_data="v52:profiles"),
              InlineKeyboardButton("💳 کیف پول", callback_data="user:wallet")],
             [InlineKeyboardButton("🎫 تیکت‌های من", callback_data="v52:tickets"),
-             InlineKeyboardButton("🚨 گزارش تخلف", callback_data="v52:abuse")],
+             InlineKeyboardButton("📦 محصولات خریداری‌شده من", callback_data="user:digital_goods:1")],
+            [InlineKeyboardButton("🚨 گزارش تخلف", callback_data="v52:abuse")],
             [InlineKeyboardButton("🎁 دعوت از دوستان (کد معرف)", callback_data="user:referral")],
             # --- بخش‌های عملیاتی: ادغام‌شده با منوی قدیمی (نه حذف‌شده) ---
             [InlineKeyboardButton("🛒 خرید سرویس جدید", callback_data="user:buy_service"),
@@ -416,37 +417,26 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("لیست سرویس‌ها")
 
-    # 2.1 View Specific Service
+    # 2.1 View Specific Service — beautiful Account Card
     elif action == "view_acc":
-        acc_code = parts[2] if len(parts) > 2 else ""
-        insp = await asyncio.to_thread(xui_manager.inspect_client, acc_code, scope="all", by_code_only=True)
-        if insp.get("status") == "ok":
-            client_info = insp["data"]
-            report_text = xui_manager.format_status_report(client_info, is_admin=False)
-            
-            # Custom end-user service keyboard
-            keyboard_btns = [
-                [
-                    InlineKeyboardButton("📊 بروزرسانی وضعیت", callback_data=f"user:view_acc:{acc_code}"),
-                    InlineKeyboardButton("⚡️ تمدید با کیف پول", callback_data=f"user:renew_plans:{acc_code}")
-                ],
-                [
-                    InlineKeyboardButton("🔗 دریافت لینک ساب", callback_data=f"user:get_sub_link:{acc_code}"),
-                    InlineKeyboardButton("📱 QR کد ساب", callback_data=f"user:get_qr:{acc_code}:sub")
-                ],
-                [
-                    InlineKeyboardButton("🔄 بازنشانی لینک ساب", callback_data=f"user:reset_sub:{acc_code}"),
-                    InlineKeyboardButton("❌ قطع اتصال از تلگرام", callback_data=f"user:unlink_confirm:{acc_code}")
-                ],
-                [
-                    InlineKeyboardButton("↩️ بازگشت به سرویس‌های من", callback_data="user:services"),
-                    InlineKeyboardButton("🏠 منوی اصلی کاربری", callback_data="user:main")
-                ]
-            ]
-            await query.edit_message_text(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard_btns))
-            await query.answer()
-        else:
+        if not owned_account:
             await query.answer("⚠️ اطلاعات این سرویس در دسترس نیست.", show_alert=True)
+            return
+        import account_card_service
+        import admin_panel
+        card_ctx = {"actor_tg_id": user.id, "persona": "user", "telegram_id": user.id}
+        try:
+            card = await account_card_service.build_account_card(
+                card_ctx, int(owned_account["id"]),
+                adapter_factory=admin_panel._get_admin_panel_adapter_factory(context),
+                parent_callback="user:services")
+            await query.edit_message_text(
+                card.text, parse_mode=ParseMode.HTML, reply_markup=card.reply_markup)
+            await query.answer()
+        except account_card_service.AccountCardDenied as exc:
+            await query.answer(f"⛔️ {exc}", show_alert=True)
+        except account_card_service.AccountCardError as exc:
+            await query.answer(f"⚠️ {exc}", show_alert=True)
 
     # 2.2 Sub Link Delivery
     elif action == "get_sub_link":
@@ -1139,6 +1129,90 @@ async def _handle_user_callbacks_impl(update: Update, context: ContextTypes.DEFA
         ])
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         await query.answer("تعرفه‌ها")
+
+    # 6.1 Digital Purchases History
+    elif action == "digital_goods":
+        page = max(1, int(parts[3])) if len(parts) > 3 else 1
+        per_page = 10
+        offset_val = (page - 1) * per_page
+        with database.get_db() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM digital_inventory WHERE sold_to_tg_id=? AND status='sold'",
+                (user.id,)).fetchone()[0]
+            items = conn.execute(
+                "SELECT di.id,di.product_id,di.secret_cipher,di.sold_at,"
+                "dp.title,dp.usage_guide "
+                "FROM digital_inventory di "
+                "JOIN digital_products dp ON dp.id=di.product_id "
+                "WHERE di.sold_to_tg_id=? AND di.status='sold' "
+                "ORDER BY di.sold_at DESC LIMIT ? OFFSET ?",
+                (user.id, per_page, offset_val)).fetchall()
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        lines = ["📦 **محصولات خریداری‌شده من:**\n"]
+        extra_btns = []
+        if not items:
+            lines.append("شما تاکنون محصول دیجیتالی از فروشگاه خریداری نکرده‌اید.")
+        else:
+            lines.append(f"تعداد کل: {total} | صفحهٔ {page} از {total_pages}\n")
+            for item in items:
+                pid = int(item["id"])
+                title = str(item["title"] or "بدون نام")
+                sold_at = time.strftime("%Y-%m-%d", time.localtime(
+                    int(item["sold_at"]))) if item.get("sold_at") else "?"
+                lines.append(f"• `#{pid}` {title} ({sold_at})")
+                extra_btns.append([InlineKeyboardButton(
+                    f"🔐 {title[:30]}", callback_data=f"user:digital_goods_detail:{pid}")])
+            # Pagination
+            nav = []
+            if page > 1:
+                nav.append(InlineKeyboardButton("◀️ قبل", callback_data=f"user:digital_goods:{page-1}"))
+            if page < total_pages:
+                nav.append(InlineKeyboardButton("بعد ▶️", callback_data=f"user:digital_goods:{page+1}"))
+            if nav:
+                extra_btns.append(nav)
+        extra_btns.append([InlineKeyboardButton("🏠 منوی اصلی کاربری", callback_data="user:main")])
+        keyboard = build_back_to_user_keyboard(extra_btns, back_callback="user:main")
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await query.answer()
+
+    elif action == "digital_goods_detail":
+        inv_id = int(parts[3]) if len(parts) > 3 else 0
+        from crypto_store import decrypt_secret
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT di.*, dp.title, dp.usage_guide FROM digital_inventory di "
+                "JOIN digital_products dp ON dp.id=di.product_id "
+                "WHERE di.id=? AND di.sold_to_tg_id=? AND di.status='sold'",
+                (inv_id, user.id)).fetchone()
+        if not row:
+            await query.answer("⛔️ این کالا متعلق به شما نیست یا یافت نشد.", show_alert=True)
+            return
+        try:
+            payload = decrypt_secret(row["secret_cipher"], "hstagent/columns/v1")
+            import json
+            try:
+                data = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                data = {"محتوای تحویل": payload}
+        except Exception:
+            data = {"error": "رمزگشایی ممکن نشد."}
+        from goods_service import compose_delivery_text
+        if isinstance(data, dict):
+            block = "\n".join(f"{k}: {v}" for k, v in data.items())
+        else:
+            block = str(data)
+        html_text = compose_delivery_text(
+            str(row["title"] or "محصول"), block,
+            usage_guide=str(row.get("usage_guide") or ""),
+        )
+        extra_btns = [
+            [InlineKeyboardButton("🏠 منوی اصلی کاربری", callback_data="user:main"),
+             InlineKeyboardButton("↩️ بازگشت به لیست", callback_data="user:digital_goods:1")]
+        ]
+        keyboard = build_back_to_user_keyboard(extra_btns, back_callback="user:digital_goods:1")
+        await query.edit_message_text(
+            html_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await query.answer()
 
     # 7. Renew Account Via Wallet Selection
     elif action == "renew_plans":
