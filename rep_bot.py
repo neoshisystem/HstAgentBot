@@ -840,8 +840,9 @@ def _v52_quote_page(ctx, persona: str, *, plan_code: str, account_id: int | None
                 price_edges=list(chain.get("price_edges") or []), account_id=account_id,
                 plan_code=str(plan_code), now=now)
     except Exception as exc:
+        fallback = f"v52:account:{account_id}" if account_id else "v52:shop"
         return render_error(f"ساخت پیشنهاد قیمت ممکن نشد: {exc}", persona=persona,
-                            parent_callback="v52:shop")
+                            parent_callback=fallback)
     if account_id:
         return checkout_ui.preview_renew(ctx, int(account_id), str(plan_code), quote=quote)
     return checkout_ui.preview_buy(ctx, str(plan_code), quote=quote)

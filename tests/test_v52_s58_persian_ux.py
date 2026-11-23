@@ -251,7 +251,7 @@ def test_the_action_pages_name_each_operation_in_persian(pages):
     unlimited = _plain(dict(pages)["account_actions.begin_traffic.unlimited"])
     assert "نامحدود (انتخاب صریح)" in unlimited
     rotation = _plain(dict(pages)["account_actions.preview_rotation.sub"])
-    assert "عملیات: چرخش لینک اشتراک" in rotation
+    assert "عملیات: تغییر لینک سابسکریپشن" in rotation
     assert "لینک اشتراک فعلی باطل" in rotation
 
 

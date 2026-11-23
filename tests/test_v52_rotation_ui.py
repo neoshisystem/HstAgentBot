@@ -37,7 +37,7 @@ def test_distinct_warnings_and_confirmation(monkeypatch):
     # renders the confirmation wall with warning text.
     assert "غیرقابل بازگشت" in sub.text
     assert cred.text.count("غیرقابل بازگشت") == 1
-    assert "کانفیگ" in sub.text and "اعتبارنامه" in cred.text
+    assert "کانفیگ" in sub.text and "UUID" in cred.text
     callbacks = [b.callback_data for row in cred.reply_markup.inline_keyboard for b in row]
     assert confirmation["callback_ok"] in callbacks
     assert confirmation["callback_no"] in callbacks
