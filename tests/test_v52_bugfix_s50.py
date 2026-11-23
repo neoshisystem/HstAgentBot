@@ -484,15 +484,16 @@ def test_provisioning_creates_the_five_standard_topics_and_persists_thread_ids(s
         result = forum_manager.provision_standard_topics(
             conn, api, bot_id=BOT_ID, group_chat_id=group_id, now=NOW,
         )
-    assert result["total"] == 5
-    assert result["active"] == 5
-    assert len(api.created) == 5
+    assert result["total"] == 6
+    assert result["active"] == 6
+    assert len(api.created) == 6
     assert set(result["settings"]) == {
         "operational_logs_topic_id", "pending_receipts_topic_id",
         "backups_topic_id", "rep_logs_topic_id", "support_tickets_topic_id",
+        "error_logs_topic_id",
     }
     written = database.apply_forum_topic_settings(result["settings"])
-    assert written == 5
+    assert written == 6
     for key, value in result["settings"].items():
         assert database.get_setting(key) == value
 

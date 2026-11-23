@@ -33,7 +33,7 @@ _V52_ADMIN_ADAPTER_FACTORY = None
 SETTINGS_CATEGORIES = (
     ("group", "📢 تنظیمات سوپرگروه و تاپیک‌های گزارش",
      ("main_group_id", "operational_logs_topic_id", "pending_receipts_topic_id",
-      "backups_topic_id", "rep_logs_topic_id", "support_tickets_topic_id", "admin_dm_topic_id")),
+      "backups_topic_id", "rep_logs_topic_id", "support_tickets_topic_id", "admin_dm_topic_id", "error_logs_topic_id")),
     ("registration", "🔐 سیاست‌های ثبت‌نام، عضویت و کد معرف",
      ("registration_mode", "referral_requires_approval", "referral_signup_bonus",
       "referral_first_purchase_bonus", "referral_purchase_reward_percent",
@@ -41,7 +41,7 @@ SETTINGS_CATEGORIES = (
     ("finance", "💰 آستانه‌های مالی، رزرو و قوانین تمدید (Rollover)",
      ("rollover_max_gb", "rollover_max_days", "reserve_trigger_gb", "renewal_lock_ttl_sec")),
     ("monitoring", "🔍 تنظیمات مانیتورینگ، دیده‌بان (Watchdog) و استخر آزاد",
-     ("watchdog_interval_sec", "pool_warning_threshold", "critical_audit_gb", "critical_audit_days")),
+     ("watchdog_interval_sec", "pool_warning_threshold", "critical_audit_gb", "critical_audit_days", "dm_alert_new_ticket", "dm_alert_new_receipt")),
     ("features", "🎛 قابلیت‌های رابط کاربری و چندباتی (v5.2 Features)",
      ("v52_ui_enabled", "v52_persona_switcher_enabled", "admin_telegram_id")),
 )
@@ -70,6 +70,7 @@ def is_hidden_setting(key) -> bool:
 # these render as فعال/غیرفعال: a topic id of 0 is a real identifier, not "off".
 BOOLEAN_SETTINGS = frozenset({
     "v52_ui_enabled", "v52_persona_switcher_enabled", "referral_requires_approval",
+    "dm_alert_new_ticket", "dm_alert_new_receipt",
 })
 BOOLEAN_ON, BOOLEAN_OFF = "🟢 فعال (1)", "🔴 غیرفعال (0)"
 

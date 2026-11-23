@@ -24,6 +24,7 @@ TOPIC_TITLES = {
     "reportcron": "گزارش زمان‌بندی",
     "reportnight": "گزارش شبانه",
     "backupfile": "💾 پشتیبان‌گیری دیتابیس",
+    "errorlogs": "🚨 رادار خطاهای سیستمی",
 }
 
 
@@ -34,6 +35,7 @@ STANDARD_TOPICS: tuple[tuple[str, str, str], ...] = (
     ("backupfile", "💾 پشتیبان‌گیری دیتابیس", "backups_topic_id"),
     ("rep_activity", "👥 فعالیت نمایندگان", "rep_logs_topic_id"),
     ("supportreport", "🎫 تیکت‌ها و گزارش تخلف", "support_tickets_topic_id"),
+    ("errorlogs", "🚨 رادار خطاهای سیستمی", "error_logs_topic_id"),
 )
 
 STANDARD_TOPIC_KEYS = tuple(key for key, _title, _setting in STANDARD_TOPICS)

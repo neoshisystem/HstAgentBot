@@ -161,8 +161,12 @@ DEFAULT_SETTINGS = [
      "حداکثر تعداد پروفایل (کاربر) قابل ایجاد روی هر اکانت سرویس؛ مقدار ۰ یعنی بدون محدودیت"),
     ("pending_receipts_topic_id", "0", "تاپیک فیش‌ها و امور مالی", "شناسه تاپیک تایید فیش‌ها و عملیات مالی"),
     ("support_tickets_topic_id", "0", "تاپیک تیکت‌ها و گزارش تخلف", "شناسه تاپیک تیکت‌ها و گزارش تخلف"),
-    ("admin_telegram_id", str(ADMIN_TELEGRAM_ID), "شناسه تلگرام ادمین کل", "شناسه عددی ادمین اصلی سیستم")
+    ("admin_telegram_id", str(ADMIN_TELEGRAM_ID), "شناسه تلگرام ادمین کل", "شناسه عددی ادمین اصلی سیستم"),
+    ("error_logs_topic_id", "0", "تاپیک رادار خطاهای سیستمی", "شناسه تاپیک رادار خطاهای سیستمی — خطاهای پیش‌بینی‌نشده اینجا ثبت می‌شوند"),
+    ("dm_alert_new_ticket", "0", "ارسال اعلان تیکت جدید به پی‌وی (DM)", "اگر ۱ باشد، هنگام ثبت تیکت جدید یک کپی به پی‌وی ادمین ارسال می‌شود"),
+    ("dm_alert_new_receipt", "0", "ارسال اعلان فیش واریزی به پی‌وی (DM)", "اگر ۱ باشد، هنگام ثبت فیش واریزی یک کپی به پی‌وی ادمین ارسال می‌شود"),
 ]
+
 
 def _insert_audit(cur, rep_id, account_code, email, action, actor_id, actor_name, details, result_status):
     """Delegate encrypted audit writes; legacy schemas receive redacted metadata only."""

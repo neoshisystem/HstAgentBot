@@ -6,6 +6,7 @@ import asyncio
 import time
 import re
 import html
+import traceback
 from types import SimpleNamespace
 from datetime import datetime, timezone
 
@@ -257,6 +258,55 @@ def _onboard_v52_start(user, bot_id: int) -> tuple[str, dict | None]:
         return "end_user", None
 
 
+async def _v52_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error radar — route unhandled exceptions to the error_logs topic.
+
+    Never sends to Admin's DM. Errors land in the \"🚨 رادار خطاهای سیستمی\" topic
+    of the main supergroup, or fall back to logging if the topic is not configured.
+    """
+    exc = context.error
+    if exc is None:
+        return
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    # Keep the alert bounded (Telegram max 4096 per message).
+    short_tb = tb[-3500:] if len(tb) > 3500 else tb
+
+    actor_id = 0
+    route = ""
+    if update is not None:
+        user = update.effective_user
+        if user is not None:
+            actor_id = user.id
+        if update.callback_query:
+            route = str(update.callback_query.data or "")[:120]
+        elif update.message:
+            route = str(update.message.text or "")[:120]
+
+    alert = (
+        f"🚨 <b>خطای پیش‌بینی‌نشده</b>\n\n"
+        f"• Actor ID: <code>{actor_id}</code>\n"
+        f"• Route: <code>{html.escape(route)}</code>\n"
+        f"• Exception: <code>{html.escape(str(exc)[:300])}</code>\n\n"
+        f"<pre>{html.escape(short_tb)}</pre>"
+    )
+
+    try:
+        import forum_manager
+        chat_id, thread_id = forum_manager.resolve_topic_destination("errorlogs")
+        if chat_id and thread_id:
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                message_thread_id=int(thread_id),
+                text=alert,
+                parse_mode="HTML",
+            )
+            return
+    except Exception as log_exc:
+        logger.debug("Error-radar topic delivery failed: %s", log_exc)
+
+    logger.error("Unhandled exception (no error topic configured):\n%s", tb)
+
+
 def _register_application_handlers(application: Application, bot_id: int | None = None):
     """Attach the exact same command/message/callback surface to each isolated bot."""
     application.add_handler(CommandHandler("start", start_cmd))
@@ -286,6 +336,7 @@ def _register_application_handlers(application: Application, bot_id: int | None 
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_error_handler(_v52_error_handler)
 
 
 async def _run_multi_bot_runtime():

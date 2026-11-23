@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from collections.abc import Mapping
+import html
 import json
 import logging
 import secrets
@@ -852,4 +853,75 @@ __all__ = [
     "reopen_ticket", "migrate_legacy_ticket_codes", "ensure_ticket_codes",
     "ticket_code_label", "ticket_status_label", "TICKET_STATUS_LABELS",
     "TICKET_OPEN_STATUSES", "TICKET_CODE_FLOOR",
+    "notify_ticket_created",
 ]
+
+
+# --- DM alert for new tickets (opt-in, off by default) ---
+
+
+def notify_ticket_created(bot, ticket: dict, *, sender_name: str = "") -> dict:
+    """Notify the admin about a new ticket.
+
+    Always sends to the support_tickets_topic_id topic.
+    Only sends a DM copy if dm_alert_new_ticket is strictly '1'.
+    Returns a dict with delivery outcomes.
+    """
+    import forum_manager
+    from config import ADMIN_TELEGRAM_ID
+
+    outcomes: dict[str, str] = {}
+
+    ticket_id = str(ticket.get("ticket_id", ""))
+    sender_tg = str(ticket.get("sender_tg_id", ""))
+    ticket_type = str(ticket.get("ticket_type", "general"))
+    ticket_types_fa = {"general": "عمومی", "finance": "مالی", "disorder": "مشکل", "delete_request": "حذف"}
+    type_fa = ticket_types_fa.get(ticket_type, ticket_type)
+
+    text = (
+        f"🎫 <b>تیکت جدید</b>\n\n"
+        f"• کد تیکت: <code>{html.escape(ticket_id)}</code>\n"
+        f"• نوع: {type_fa}\n"
+        f"• فرستنده: <code>{html.escape(sender_tg)}</code>"
+    )
+    if sender_name:
+        text += f" ({html.escape(sender_name)})"
+
+    # 1. Always send to the support_tickets_topic_id topic.
+    try:
+        chat_id, thread_id = forum_manager.resolve_topic_destination("supportreport")
+        if chat_id and thread_id:
+            bot.send_message(
+                chat_id=int(chat_id),
+                message_thread_id=int(thread_id),
+                text=text,
+                parse_mode="HTML",
+            )
+            outcomes["topic"] = "sent"
+        else:
+            outcomes["topic"] = "unconfigured"
+    except Exception as exc:
+        logger.debug("Support-topic notification failed: %s", exc)
+        outcomes["topic"] = f"failed:{type(exc).__name__}"
+
+    # 2. Conditionally send to admin DM.
+    dm_setting = database.get_setting("dm_alert_new_ticket", default="0", cast_type=str)
+    if str(dm_setting or "0").strip() == "1":
+        try:
+            admin_id = int(ADMIN_TELEGRAM_ID or 0)
+            if admin_id > 0:
+                bot.send_message(
+                    chat_id=admin_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+                outcomes["dm"] = "sent"
+            else:
+                outcomes["dm"] = "unconfigured"
+        except Exception as exc:
+            logger.debug("Ticket DM alert failed: %s", exc)
+            outcomes["dm"] = f"failed:{type(exc).__name__}"
+    else:
+        outcomes["dm"] = "silenced"
+
+    return outcomes

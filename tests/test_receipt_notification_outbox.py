@@ -144,7 +144,9 @@ class FakeBot:
         return object()
 
 
-def test_photo_failure_text_fallback_success_marks_outbox_sent(isolated_db):
+def test_photo_failure_text_fallback_success_marks_outbox_sent(isolated_db, monkeypatch):
+    monkeypatch.setattr(database, "get_setting",
+                        lambda key, default=None, cast_type=str: "1" if key == "dm_alert_new_receipt" else database.get_setting(key, default, cast_type))
     receipt = submit_existing_receipt()
     bot = FakeBot(photo_error=RuntimeError("photo unavailable"))
     result = asyncio.run(process_receipt_notification_outbox(bot, limit=1))
@@ -157,7 +159,9 @@ def test_photo_failure_text_fallback_success_marks_outbox_sent(isolated_db):
     assert outbox["delivered_at"] is not None
 
 
-def test_photo_and_text_failure_schedule_durable_retry_without_financial_effects(isolated_db):
+def test_photo_and_text_failure_schedule_durable_retry_without_financial_effects(isolated_db, monkeypatch):
+    monkeypatch.setattr(database, "get_setting",
+                        lambda key, default=None, cast_type=str: "1" if key == "dm_alert_new_receipt" else database.get_setting(key, default, cast_type))
     receipt = submit_existing_receipt()
     bot = FakeBot(
         photo_error=RuntimeError("photo unavailable"),
@@ -235,7 +239,9 @@ def _submit_receipt_to_destination(chat_id, thread_id=None, user_id=91020):
     )
 
 
-def test_private_admin_chat_ignores_configured_thread_id(isolated_db):
+def test_private_admin_chat_ignores_configured_thread_id(isolated_db, monkeypatch):
+    monkeypatch.setattr(database, "get_setting",
+                        lambda key, default=None, cast_type=str: "1" if key == "dm_alert_new_receipt" else database.get_setting(key, default, cast_type))
     receipt = submit_existing_receipt()
     bot = FakeBot()
 
@@ -303,7 +309,9 @@ def test_thread_not_found_falls_back_to_admin_dm_after_same_chat_retry_fails(
         ).fetchone()[0] == 0
 
 
-def test_non_topic_bad_request_keeps_standard_text_fallback(isolated_db):
+def test_non_topic_bad_request_keeps_standard_text_fallback(isolated_db, monkeypatch):
+    monkeypatch.setattr(database, "get_setting",
+                        lambda key, default=None, cast_type=str: "1" if key == "dm_alert_new_receipt" else database.get_setting(key, default, cast_type))
     receipt = submit_existing_receipt()
     bot = FakeBot(photo_errors=[BadRequest("Photo file is too large")])
 
@@ -317,6 +325,8 @@ def test_non_topic_bad_request_keeps_standard_text_fallback(isolated_db):
 
 
 def test_admin_dm_fallback_is_skipped_when_it_is_the_same_chat(isolated_db, monkeypatch):
+    monkeypatch.setattr(database, "get_setting",
+                        lambda key, default=None, cast_type=str: "1" if key == "dm_alert_new_receipt" else database.get_setting(key, default, cast_type))
     receipt = submit_existing_receipt()
     monkeypatch.setattr(config, "ADMIN_TELEGRAM_ID", 9000)
     bot = FakeBot(

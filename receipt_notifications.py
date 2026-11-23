@@ -22,6 +22,15 @@ async def _deliver_admin_receipt_notification(bot, item: dict) -> str:
         raise RuntimeError("Super Admin Telegram destination is not configured")
 
     chat_id = int(chat_id)
+
+    # DM silencing: if the target is a private chat (admin DM), check
+    # dm_alert_new_receipt setting. If 0 or unset, skip DM delivery — the
+    # receipt still goes to the finance topic via mirror_receipt_to_finance_topic.
+    if chat_id > 0:
+        dm_setting = database.get_setting("dm_alert_new_receipt", default="0", cast_type=str)
+        if str(dm_setting or "0").strip() != "1":
+            logger.info("Receipt DM alert silenced (dm_alert_new_receipt=0), delivery skipped")
+            return "dm_silenced"
     thread_id = item.get("recipient_thread_id")
     if thread_id:
         thread_id = int(thread_id)
