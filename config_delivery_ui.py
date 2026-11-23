@@ -10,8 +10,13 @@ from typing import Any, Callable, Mapping
 import access_service
 import database
 import qrcode
+import re
+
+from telegram import InlineKeyboardMarkup
 
 from ui_v52 import button, render_page, render_uri
+
+from account_card_service import _format_bytes, _format_epoch
 
 TELEGRAM_TEXT_LIMIT = 3800
 
@@ -202,6 +207,52 @@ async def show_configs(
     return result
 
 
+def _escape_markdown_v2(text: str) -> str:
+    """Escape MarkdownV2 special characters outside triple-backtick code blocks."""
+    parts = re.split(r'(```)', text)
+    escaped: list[str] = []
+    inside_code = False
+    special = r'_*[]()~`>#+-=|{}.!'
+    for part in parts:
+        if part == '```':
+            escaped.append(part)
+            inside_code = not inside_code
+        elif inside_code:
+            escaped.append(part)
+        else:
+            result = []
+            for ch in part:
+                if ch in special:
+                    result.append('\\' + ch)
+                else:
+                    result.append(ch)
+            escaped.append(''.join(result))
+    return ''.join(escaped)
+
+
+def _account_status_text(account: Mapping[str, Any]) -> str:
+    enable = account.get("enable")
+    return "فعال" if enable else "غیرفعال"
+
+
+def _quota_text(account: Mapping[str, Any]) -> str:
+    total_gb = account.get("total_gb")
+    if total_gb is None:
+        return "نامعلوم"
+    return _format_bytes(int(float(total_gb) * 1024 ** 3))
+
+
+def _expiry_text(account: Mapping[str, Any]) -> str:
+    raw = account.get("expiry_time")
+    if raw is None:
+        return "نامعلوم"
+    epoch = int(raw)
+    if epoch < 1_000_000_000:
+        return "نامحدود"
+    formatted = _format_epoch(epoch)
+    return formatted if formatted else "نامعلوم"
+
+
 async def deliver_config_qr(
     ctx: Any,
     account_id: int,
@@ -213,29 +264,59 @@ async def deliver_config_qr(
     qr_factory: Callable[[str], Any] | None = None,
     message: Any = None,
 ) -> QRDelivery:
-    """Build QR from exactly one freshly fetched URI; invalid indexes retain navigation."""
+    """Build a unified photo message with QR code, account info, config code block and self-service buttons."""
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         index = -1
     try:
-        _, items, _ = await _fetch(
+        account, items, _ = await _fetch(
             int(account_id), adapter_factory=adapter_factory, account_loader=account_loader,
             authorizer=authorizer, ctx=ctx,
         )
     except PermissionError:
         raise
+    aid = int(account_id)
+    persona = str(_actor_value(ctx, "persona") or "user")
     page = render_page(
         "QR کانفیگ", "این شماره کانفیگ معتبر نیست؛ فهرست را دوباره باز کنید.",
-        persona=str(_actor_value(ctx, "persona") or "user"),
-        parent_callback=f"v52:cfg:{int(account_id)}",
+        persona=persona,
+        parent_callback=f"v52:cfg:{aid}",
     )
     if index < 0 or index >= len(items):
-        return QRDelivery(int(account_id), index, None, None, None, page.reply_markup, "invalid_index")
+        return QRDelivery(aid, index, None, None, None, page.reply_markup, "invalid_index")
+
     uri = _uri(items[index])
     image = _qr_bytes(uri, qr_factory)
-    result = QRDelivery(int(account_id), index, uri, uri, image, page.reply_markup, "ok")
+
+    # --- Caption (MarkdownV2) ---
+    label = account.get("account_code") or f"#{aid}"
+    status = _account_status_text(account)
+    quota = _quota_text(account)
+    expiry = _expiry_text(account)
+    raw_caption = (
+        f"*حساب:* {label}\n"
+        f"*وضعیت:* {status}\n"
+        f"*حجم:* {quota}\n"
+        f"*انقضا:* {expiry}\n\n"
+        f"کانفیگ {index + 1}:\n"
+        f"```\n{uri}\n```"
+    )
+    caption = _escape_markdown_v2(raw_caption)
+
+    # --- Inline buttons ---
+    rows: list[list[Any]] = [
+        [button("🔄 تغییر UUID", f"v52:rotate:cred:{aid}")],
+        [button("🔄 بازنشانی لینک", f"v52:rotate:sub:{aid}")],
+        [button("🔋 تمدید سرویس", f"v52:account:{aid}")],
+        [button("⬅️ بازگشت", f"v52:cfg:{aid}"),
+         button("🏠 خانه", f"v52:home:{persona}")],
+    ]
+    markup = InlineKeyboardMarkup(rows)
+    result = QRDelivery(aid, index, uri, uri, image, markup, "ok")
+
     if message is not None:
         await _await(message.reply_photo(
-            photo=BytesIO(image), caption=f"QR کانفیگ {index + 1}",
+            photo=BytesIO(image), caption=caption,
+            reply_markup=markup, parse_mode="MarkdownV2",
         ))
     return result
 

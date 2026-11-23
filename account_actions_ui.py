@@ -104,9 +104,17 @@ def preview_rotation(
     confirmation: Mapping | None = None,
     disconnect_evidence: Mapping | None = None,
     parent_callback: str | None = None,
+    next_callback: str | None = None,
     persona: str | None = None,
 ):
-    """Preview subscription-link or connection-credential rotation, never dispatch it."""
+    """Preview subscription-link or connection-credential rotation, never dispatch it.
+
+    When *confirmation* carries both ``callback_ok`` and ``callback_no``, render
+    a two‑step confirmation wall (warning + Yes/No buttons) instead of the
+    informational preview.  Without *confirmation* the page shows the preview
+    with an ``ادامه`` button that routes to *next_callback* (or falls back to
+    the confirmation route derived from the rotation type).
+    """
     try:
         aid = _positive(account_id, "account_id")
         kind = str(rotation_type or "").strip().lower()
@@ -144,12 +152,34 @@ def preview_rotation(
         if isinstance(confirmation, Mapping):
             ok = str(confirmation.get("callback_ok") or "")
             no = str(confirmation.get("callback_no") or "")
+            if ok and no:
+                # Two‑step confirmation wall — replace title and body with warning.
+                action_label = _action_label(action)
+                title = f"⚠️ تأیید نهایی {action_label}"
+                body = (
+                    f"حساب: {aid}\n"
+                    f"عملیات: {action_label}\n\n"
+                    "⚠️ <b>هشدار: این عملیات غیرقابل بازگشت است</b>\n\n"
+                    "پس از تأیید:\n"
+                    f"• {'لینک اشتراک فعلی باطل می‌شود و لینک تازه‌ای صادر می‌شود' if kind == 'sub' else 'اعتبارنامه اتصال تغییر می‌کند'}\n"
+                    "• کانفیگ‌های قبلی ممکن است کار نکنند\n"
+                    "• دریافت کانفیگ تازه الزامی است\n\n"
+                    "آیا از انجام این عملیات اطمینان دارید؟"
+                )
+                rows = [
+                    [button("✅ بله، تایید می‌کنم", ok)],
+                    [button("❌ انصراف", no)],
+                ]
+                return render_page(title, persona=persona or _persona(ctx),
+                                   page_kind="preview", parent_callback=parent_callback, rows=rows,
+                                   body_html=body)
             if ok:
                 rows.append([button("تأیید و اجرای عملیات", ok)])
             if no:
                 rows.append([button("لغو", no)])
         else:
-            rows.append([button("بازگشت", f"v52:account:{aid}")])
+            next_cb = next_callback or f"v52:rotate:confirm:{kind}:{aid}"
+            rows.append([button("ادامه", next_cb)])
         return render_page(title, body, persona=persona or _persona(ctx),
                            page_kind="preview", parent_callback=parent_callback, rows=rows)
     except (TypeError, ValueError, PermissionError) as exc:

@@ -234,13 +234,19 @@ def preview_renew(
     plan_code: str,
     *,
     quote: Mapping[str, Any],
+    wallet_balance: int | None = None,
     before: Mapping[str, Any] | None = None,
     after: Mapping[str, Any] | None = None,
     redirect_callback: str | None = None,
     parent_callback: str | None = None,
     persona: str | None = None,
 ):
-    """Show the before/after renewal values from the same frozen quote used by execution."""
+    """Show the before/after renewal values from the same frozen quote used by execution.
+
+    When *wallet_balance* is provided the page appends a line comparing the
+    quote amount against the wallet balance and replaces the default ``ادامه``
+    button with a conditional deduction or top-up button.
+    """
     try:
         aid = _positive(account_id, "account_id")
         code = str(plan_code or "").strip()
@@ -267,10 +273,19 @@ def preview_renew(
                  *_renewal_side_fa("وضعیت پیش از تمدید", selected_before),
                  *_renewal_side_fa("وضعیت پس از تمدید", selected_after)]
         callback = redirect_callback or f"v52:renew:{aid}:{code}"
+        if wallet_balance is not None:
+            balance = _money(wallet_balance, "wallet_balance")
+            lines.append(f"مبلغ پلن: {amount:,} تومان | موجودی شما: {balance:,} تومان")
+            if balance >= amount:
+                rows = [[button("✅ کسر از کیف پول", callback)]]
+            else:
+                rows = [[button("💳 شارژ سریع کیف پول", callback)]]
+        else:
+            rows = [[button("ادامه", callback)]]
         return render_page("پیش‌نمایش تمدید", "\n".join(lines),
                            persona=persona or _persona(ctx), page_kind="preview",
                            parent_callback=parent_callback,
-                           rows=[[button("ادامه", callback)]])
+                           rows=rows)
     except (TypeError, ValueError) as exc:
         return render_error(service_errors_fa.translate(exc), persona=persona or _persona(ctx), parent_callback=parent_callback)
 

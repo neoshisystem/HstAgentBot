@@ -847,6 +847,82 @@ def _v52_quote_page(ctx, persona: str, *, plan_code: str, account_id: int | None
     return checkout_ui.preview_buy(ctx, str(plan_code), quote=quote)
 
 
+def _v52_show_renewal_menu(ctx, persona: str, account_id: int):
+    """Show the renewal plan selection menu with tier-discounted prices."""
+    import time
+    import pricing_service
+    from ui_v52 import render_page, button, render_error
+    actor_id = int(ctx.get("actor_tg_id") or 0)
+    rep_id = ctx.get("rep_id")
+    now = int(time.time())
+
+    with database.get_db() as conn:
+        # Confirm the account exists.
+        account = conn.execute(
+            "SELECT id,account_code FROM accounts WHERE id=? AND deleted_at IS NULL",
+            (account_id,),
+        ).fetchone()
+        if account is None:
+            return render_error("اکانت موردنظر یافت نشد.", persona=persona,
+                                parent_callback="v52:home:" + persona)
+
+        # Determine the actor's type and tier code.
+        role_scope, tier_code = pricing_service._actor_tier_and_scope(
+            conn, user_id=(actor_id if rep_id is None else None), rep_id=rep_id)
+
+        # Look up the tier's discount (bps → percent).
+        discount_pct = 0
+        tier_row = conn.execute(
+            "SELECT discount_bps,title_fa FROM tier_policies "
+            "WHERE actor_type=? AND tier_code=?",
+            (role_scope, tier_code),
+        ).fetchone()
+        if tier_row is not None:
+            discount_pct = int(tier_row["discount_bps"]) // 100  # bps → percent
+
+        # Load all active plans.
+        plan_rows = conn.execute(
+            "SELECT * FROM pricing_plans WHERE is_active=1 ORDER BY sort_order,plan_code"
+        ).fetchall()
+
+    lines = [f"حساب: {int(account['id'])} · {str(account['account_code'])}"]
+    if tier_row is not None:
+        lines.append(f"تخفیف رتبه ({str(tier_row['title_fa'])}): {discount_pct}٪")
+    else:
+        lines.append("تخفیف رتبه: بدون تخفیف (رتبه: عادی)")
+    body = "\n".join(lines)
+
+    # Separate quick plans from the rest.
+    base_price_col = "rep_price" if persona == "rep" else "user_price"
+    quick_plans = []
+    other_plans = []
+    for p in plan_rows:
+        plan = dict(p)
+        price = int(plan.get(base_price_col) or plan.get("rep_price") or plan.get("user_price") or 0)
+        if discount_pct > 0:
+            price = price - (price * discount_pct // 100)
+        plan["_effective_price"] = price
+        if plan.get("is_quick"):
+            quick_plans.append(plan)
+        else:
+            other_plans.append(plan)
+
+    buttons = []
+
+    # Quick-access rows (up to 5).
+    for plan in quick_plans[:5]:
+        price_str = f"{plan['_effective_price']:,}"
+        label = f"⚡ {plan['name']} · {price_str} تومان"
+        buttons.append([button(label, f"v52:renew:{account_id}:{plan['plan_code']}")])
+
+    # "All plans" button.
+    parent = f"v52:sub:{account_id}" if persona == "rep" else f"v52:home:{persona}"
+    buttons.append([button("📁 سایر تعرفه‌ها / کاتالوگ کامل", f"v52:renew:{account_id}:catalog")])
+
+    return render_page("تمدید سرویس", body, persona=persona,
+                       rows=buttons, parent_callback=parent)
+
+
 def _v52_begin_order(ctx, persona: str, quote_id: str):
     """Create (or reuse) the payment order for a locked quote and offer the enabled rail."""
     import order_service
@@ -2278,11 +2354,53 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
                     page = checkout_ui.preview_receipt(ctx, attempt, order=order)
             elif name == "preview_rotation":
                 import account_actions_ui
-                page = account_actions_ui.preview_rotation(ctx, params["account_id"], params["rotation_type"],
-                                                           parent_callback=f"v52:sub:{params['account_id']}")
+                aid = params["account_id"]
+                rtype = params["rotation_type"]
+                page = account_actions_ui.preview_rotation(
+                    ctx, aid, rtype,
+                    parent_callback=f"v52:sub:{aid}",
+                    next_callback=f"v52:rotate:confirm:{rtype}:{aid}",
+                )
             elif name == "show_grants":
                 import access_ui
                 page = access_ui.show_grants(ctx, params["account_id"], persona=persona)
+            elif name == "confirm_rotation":
+                import account_actions_ui
+                import confirmation_service
+                import time
+                aid = int(params["account_id"])
+                rtype = str(params["rotation_type"])
+                actor_id = int(ctx.get("actor_tg_id") or 0)
+                bot_id = int(ctx.get("bot_id") or 0)
+                now = int(time.time())
+                action = "rotate_subscription_url" if rtype == "sub" else "rotate_connection_credentials"
+                with database.get_db() as conn:
+                    row = conn.execute(
+                        "SELECT revision FROM accounts WHERE id=? AND deleted_at IS NULL",
+                        (aid,),
+                    ).fetchone()
+                    if row is None:
+                        raise ValueError("حساب برای چرخش پیدا نشد.")
+                    revision = int(row["revision"])
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        nonce_data = confirmation_service.create_confirmation(
+                            conn, actor_tg_id=actor_id, bot_id=bot_id,
+                            action=action, target_type=rtype, target_id=str(aid),
+                            expected_revision=revision, payload={}, now=now)
+                        conn.commit()
+                    except Exception:
+                        if conn.in_transaction:
+                            conn.rollback()
+                        raise
+                confirmation = {
+                    "callback_ok": nonce_data["callback_ok"],
+                    "callback_no": nonce_data["callback_no"],
+                }
+                page = account_actions_ui.preview_rotation(
+                    ctx, aid, rtype, confirmation=confirmation,
+                    parent_callback=f"v52:sub:{aid}",
+                )
             elif name == "preview_revoke":
                 import access_ui
                 page = access_ui.preview_revoke(ctx, params["account_id"], params["grantee_tg_id"], persona=persona)
@@ -2598,6 +2716,8 @@ async def _dispatch_v52_callback(update, context, *, role=None, rep=None):
             elif name == "preview_renew":
                 page = _v52_quote_page(ctx, persona, plan_code=str(params["plan_code"]),
                                        account_id=int(params["account_id"]))
+            elif name == "show_renewal_menu":
+                page = _v52_show_renewal_menu(ctx, persona, int(params["account_id"]))
             elif name == "begin_order":
                 page = _v52_begin_order(ctx, persona, str(params["quote_id"]))
             elif name == "begin_addon":
