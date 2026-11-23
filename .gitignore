@@ -28,8 +28,15 @@ backups/
 *.zip
 *.bak
 
+# Runtime reports and logs
+INSTALL_REPORT.txt
+logs/
+
 # IDE & OS
 .vscode/
 .idea/
 .DS_Store
 *.log
+
+# Runtime build metadata
+.build_info
